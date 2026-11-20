@@ -269,8 +269,10 @@ def test_cuda_step_fused_preamble_parity(n: int, ssm_dtype: torch.dtype):
         torch.testing.assert_close(a.float(), b.float(), atol=2e-2, rtol=2e-2)
 
 @requires_cuda
-@pytest.mark.parametrize("m", [1, 2, 9, 16, 33, 64])
-@pytest.mark.parametrize("n,k", [(7344, 1536), (1536, 4608), (1920, 1536)])
+@pytest.mark.parametrize("m", [1, 2, 9, 16, 32, 33, 64])
+@pytest.mark.parametrize(
+    "n,k", [(7344, 1536), (1536, 4608), (1920, 1536), (1536, 1920)]
+)
 def test_decode_gemv_skinny_parity(m: int, n: int, k: int):
     """1..64-row decode projections (skinny kernel / GEMV) match F.linear, also on a
     row-strided input such as a slice of a wider projection output."""

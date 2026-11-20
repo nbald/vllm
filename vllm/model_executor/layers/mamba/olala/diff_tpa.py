@@ -426,10 +426,10 @@ class OlalaDiffTPAAttention(PluggableLayer):
             # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
             w_all = self._decode_proj_weight()
-            if n <= SKINNY_MAX_M and gpu_family() not in (GpuFamily.SM100, GpuFamily.SM120):
+            if n <= SKINNY_MAX_M and gpu_family() is not GpuFamily.SM100:
                 allp = decode_gemv(hidden_states, w_all)
             else:
-                # also batch 1 on Blackwell: cuBLAS streams the aligned width
+                # also batch 1 on datacenter Blackwell: cuBLAS streams the aligned width
                 # faster than the Triton GEMV (5.8 vs 6.3 us; 9.1 unaligned)
                 allp = F.linear(hidden_states, self._decode_proj_w_padded)[:, : w_all.shape[0]]
             parts = torch.split(allp, self._decode_proj_sizes, dim=-1)

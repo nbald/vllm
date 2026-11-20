@@ -142,27 +142,57 @@ SKINNY_MAX_M = 64
 _SKINNY = os.environ.get("OLALA_SKINNY", "1") == "1"
 
 
+def _skinny_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _SKINNY and x.dtype == torch.bfloat16 and weight.shape[1] % 128 == 0
+        and x.stride(-1) == 1 and weight.stride(-1) == 1
+    )
+
+
+def _decode_gemv_sm120(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """RTX 5090 sweep of the decode shapes (graphed, weights from DRAM). One row: the full-K
+    GEMV on narrow outputs (latent MoE 4.7 vs 5.8-6.7 us cuBLAS, mixer_proj 6.7 vs 8.3 us), the
+    K-loop GEMV on wide ones (in_proj 14.7 vs 16.2 us). 2..32 rows, and up to 64 on wide
+    outputs: the skinny kernel, where cuBLAS picks sm80 wmma kernels (mixer_proj 8.0 vs
+    17.2 us, latent MoE 5.2 vs 11.3 us); beyond, cuBLAS."""
+    M = x.shape[0]
+    N, K = weight.shape
+    if M == 1:
+        if N < 4096 and triton.next_power_of_2(K) <= 8192:
+            return _decode_gemv_blackwell(x, weight)
+        if K % 128 == 0:
+            return _gemv_m1(x, weight)
+    elif (M <= 32 or (M <= SKINNY_MAX_M and N >= 4096)) and _skinny_ok(x, weight):
+        return skinny_linear(x, weight)
+    return F.linear(x, weight)
+
+
 def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` for ``x: (M, K)``, ``weight: (N, K)``: the skinny kernel up to
     SKINNY_MAX_M rows (bf16), except single rows with K <= 1536 (triton GEMV, as fast there);
     F.linear otherwise. At one row the GEMV's 128-wide K blocks are slow for K = 1920 (w_out:
-    53 % of the copy bandwidth vs 89 % on an A4500). Blackwell keeps its own dispatch: the full-K
-    GEMV at one row, F.linear otherwise."""
+    53 % of the copy bandwidth vs 89 % on an A4500). Datacenter Blackwell keeps its own dispatch
+    (the full-K GEMV at one row, F.linear otherwise), and so does consumer Blackwell."""
     M = x.shape[0]
-    if x.is_cuda and gpu_family() in (GpuFamily.SM100, GpuFamily.SM120):
-        if M != 1 or x.dtype != weight.dtype or _DISABLED:
+    family = gpu_family() if x.is_cuda else None
+    if family in (GpuFamily.SM100, GpuFamily.SM120):
+        if x.dtype != weight.dtype or _DISABLED:
             return F.linear(x, weight)
-        return _decode_gemv_blackwell(x, weight)
+        if family is GpuFamily.SM120:
+            return _decode_gemv_sm120(x, weight)
+        return _decode_gemv_blackwell(x, weight) if M == 1 else F.linear(x, weight)
     N, K = weight.shape
     if _DISABLED or not x.is_cuda or x.dtype != weight.dtype or K % 128 != 0 or M > SKINNY_MAX_M:
         return F.linear(x, weight)
-    if (
-        (M != 1 or K > 1536) and _SKINNY and x.dtype == torch.bfloat16
-        and x.stride(-1) == 1 and weight.stride(-1) == 1
-    ):
+    if (M != 1 or K > 1536) and _skinny_ok(x, weight):
         return skinny_linear(x, weight)
     if M != 1:
         return F.linear(x, weight)
+    return _gemv_m1(x, weight)
+
+
+def _gemv_m1(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    N, K = weight.shape
     y = torch.empty(1, N, dtype=x.dtype, device=x.device)
     # HBM-streaming configs measured on GH200 (36 distinct weights, graphed):
     # wide outputs like 8 rows/program; narrow outputs want more programs.
