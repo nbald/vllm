@@ -71,3 +71,10 @@ def gencode(device=None, arch_specific: bool = False) -> str:
     (wgmma, tcgen05, hardware cvt.rs need the arch-specific target)."""
     a = sm_arch(device) + ("a" if arch_specific else "")
     return f"-gencode=arch=compute_{a},code=sm_{a}"
+
+
+def mma_sync_class(device=None) -> bool:
+    """Ampere / Ada and consumer Blackwell: mma.sync + ldmatrix + cp.async kernels, no wgmma /
+    tcgen05, ~100 KB of smem per SM (sm_86 / 89 / 120). The sm80 kernels build for the running
+    arch and run unchanged on both."""
+    return gpu_family(device) in (GpuFamily.SM80, GpuFamily.SM120)

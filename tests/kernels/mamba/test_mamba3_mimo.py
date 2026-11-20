@@ -321,10 +321,15 @@ def _hybrid_ref(args: list, a: int, b: int):
     return out, st.transpose(1, 2)
 
 
-def _hybrid_run(args: list, lens: list[int], init: list[bool], tc: bool, monkeypatch):
+def _hybrid_run(
+    args: list, lens: list[int], init: list[bool], tc: bool, monkeypatch, sm80=None
+):
     from vllm.model_executor.layers.mamba.ops.mamba3 import mimo_ssd
 
     monkeypatch.setattr(mimo_ssd, "_SCAN_TC", tc)
+    if sm80 is not None:
+        monkeypatch.setattr(mimo_ssd, "_CS_CUDA", sm80)
+        monkeypatch.setattr(mimo_ssd, "_SCAN_SM80", sm80)
     T, ns = sum(lens), len(lens)
     g = torch.Generator(device="cuda").manual_seed(7)
     pools = [
@@ -375,4 +380,37 @@ def test_hybrid_prefill_tcgen05_vs_fp64(monkeypatch):
     o_tc, p_tc = _hybrid_run(args, lens, init, True, monkeypatch)
     assert _rel(o_tc, o_tl.double()) < 2e-2
     for x, y in zip(p_tc, p_tl):
+        assert _rel(x.float(), y.double()) < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or current_platform.get_device_capability().major not in (8, 12),
+    reason="mma.sync prefill kernels (sm80 path) target sm_8x / sm_12x",
+)
+@torch.inference_mode()
+def test_hybrid_prefill_mma_sync_vs_fp64(monkeypatch):
+    """The mma.sync chunk-local states and output pass (Ampere / Ada / consumer
+    Blackwell) are at least as close to the fp64 recurrence as the TileLang /
+    Triton path they replace, and agree with it when sequences resume from
+    pool states."""
+    lens = [77, 300, 161]
+    args = _hybrid_inputs(sum(lens))
+    errs = {}
+    for sm80 in (False, True):
+        out, pools = _hybrid_run(args, lens, [False] * 3, False, monkeypatch, sm80)
+        eo = es = 0.0
+        for i, (a, b) in enumerate(zip([0, 77, 377], [77, 377, 538])):
+            ro, rs = _hybrid_ref(args, a, b)
+            eo, es = max(eo, _rel(out[a:b], ro)), max(es, _rel(pools[1][i], rs))
+        errs[sm80] = (eo, es)
+    assert errs[True][0] < 1e-2 and errs[True][1] < 1e-2, errs
+    assert errs[True][0] < 1.25 * errs[False][0] + 1e-3, errs
+    assert errs[True][1] < 1.25 * errs[False][1] + 1e-3, errs
+
+    init = [True, False, True]
+    o_tl, p_tl = _hybrid_run(args, lens, init, False, monkeypatch, False)
+    o_mma, p_mma = _hybrid_run(args, lens, init, False, monkeypatch, True)
+    assert _rel(o_mma, o_tl.double()) < 2e-2
+    for x, y in zip(p_mma, p_tl):
         assert _rel(x.float(), y.double()) < 2e-2

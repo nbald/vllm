@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family, mma_sync_class
 
 from vllm.triton_utils import tl, triton
 
@@ -77,16 +77,16 @@ def _scan_tc_ext():
     return _SCAN_TC_EXT
 
 def _cs_sm80_ok(dev) -> bool:
-    return _CS_CUDA and gpu_family(dev) is GpuFamily.SM80
+    return _CS_CUDA and mma_sync_class(dev)
 
 
 def _scan_sm80_ok(dev, tune: dict) -> bool:
     use = tune.get("scan", "sm80" if _SCAN_SM80 else None) == "sm80"
-    return use and gpu_family(dev) is GpuFamily.SM80
+    return use and mma_sync_class(dev)
 
 
 def _scan_sm80_ext(dev):
-    """CUDA output pass for sm80 / sm86 / sm89 (olala/csrc/mamba3_scan_prefill_sm80.cu), built JIT."""
+    """CUDA output pass for sm_8x / sm_12x (olala/csrc/mamba3_scan_prefill_sm80.cu), built JIT."""
     global _SCAN_SM80_EXT
     if _SCAN_SM80_EXT is None:
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
@@ -96,13 +96,13 @@ def _scan_sm80_ext(dev):
 
 
 def xz_strided_ok(dev) -> bool:
-    """The sm8x chunk-state and output-pass kernels read x / z through row and head strides: the prefill can
+    """The mma.sync chunk-state and output-pass kernels read x / z through row and head strides: the prefill can
     hand them the head-interleaved in_proj output instead of contiguous copies."""
     return not _scan_cuda_ok(dev) and _cs_sm80_ok(dev) and _scan_sm80_ok(dev, {})
 
 
 def _cs_sm80_ext(dev):
-    """CUDA chunk-local states for sm80 / sm86 / sm89 (olala/csrc/mamba3_chunk_state_sm80.cu), built JIT."""
+    """CUDA chunk-local states for sm_8x / sm_12x (olala/csrc/mamba3_chunk_state_sm80.cu), built JIT."""
     global _CS_SM80_EXT
     if _CS_SM80_EXT is None:
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
