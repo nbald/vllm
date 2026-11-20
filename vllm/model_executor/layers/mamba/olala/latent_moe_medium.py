@@ -24,6 +24,8 @@ import functools
 
 import torch
 
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     _latent_moe_epilogue_kernel,
 )
@@ -437,8 +439,11 @@ def olala_moe_medium(
     D1 = w13.shape[2]
     D2 = w2.shape[1]
     S = w_in.shape[0] - D1
+    # sm_120: the skinny kernel up to 32 rows, where cuBLAS picks sm80 wmma kernels (5.5 vs 17 us
+    # in, 5.2 vs 11.2 us out on an RTX 5090)
+    linear = decode_gemv if gpu_family() is GpuFamily.SM120 else torch.nn.functional.linear
     if x_in is None:
-        x_in = torch.nn.functional.linear(hidden, w_in)  # [M, D1 + S]
+        x_in = linear(hidden, w_in)  # [M, D1 + S]
     part = moe_routed_medium(x_in[:, :D1], router_logits, e_score_bias, w13, w2, top_k)
     cat = torch.empty(M, D2 + S, dtype=hidden.dtype, device=hidden.device)
     _latent_moe_epilogue_kernel[(M, (D2 + S) // 128)](
@@ -454,4 +459,4 @@ def olala_moe_medium(
         num_warps=1,
         **pdl_kwargs(),
     )
-    return torch.nn.functional.linear(cat, w_out)
+    return linear(cat, w_out)
