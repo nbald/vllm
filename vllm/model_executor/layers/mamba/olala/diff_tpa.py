@@ -33,8 +33,8 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     SKINNY_MAX_M,
     cat_rows_shared,
     decode_gemv,
-    is_blackwell,
 )
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
@@ -426,7 +426,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
             # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
             w_all = self._decode_proj_weight()
-            if n <= SKINNY_MAX_M and not is_blackwell():
+            if n <= SKINNY_MAX_M and gpu_family() not in (GpuFamily.SM100, GpuFamily.SM120):
                 allp = decode_gemv(hidden_states, w_all)
             else:
                 # also batch 1 on Blackwell: cuBLAS streams the aligned width

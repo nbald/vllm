@@ -32,9 +32,9 @@ Rotary columns are four NQ = N/4 wide groups: g0/g2 rotate together, g1/g3 do no
 
 from __future__ import annotations
 
-import functools
-
 import torch
+
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family
 
 from vllm.triton_utils import tl, triton
 
@@ -55,15 +55,8 @@ _CS_SM80_EXT = None
 _SCAN_SM80_EXT = None
 
 
-@functools.cache
-def _cc(dev) -> tuple[int, int]:
-    """Compute capability of ``dev``. The path checks below run several times per layer
-    and step, and torch.cuda.get_device_capability costs ~10 us of host time."""
-    return torch.cuda.get_device_capability(dev)
-
-
 def _scan_cuda_ok(dev) -> bool:
-    return _SCAN_CUDA and _cc(dev) == (9, 0)
+    return _SCAN_CUDA and gpu_family(dev) is GpuFamily.SM90
 
 
 # sm_100 / sm_103 output pass (tcgen05, olala/csrc/mamba3_scan_prefill_tc.cu); OLALA_SCAN_TC=0: TileLang
@@ -72,27 +65,24 @@ _SCAN_TC_EXT = None
 
 
 def _scan_tc_ok(dev) -> bool:
-    return _SCAN_TC and _cc(dev) in ((10, 0), (10, 3))
+    return _SCAN_TC and gpu_family(dev) is GpuFamily.SM100
 
 
 def _scan_tc_ext():
     global _SCAN_TC_EXT
     if _SCAN_TC_EXT is None:
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
-        major, minor = torch.cuda.get_device_capability()
-        arch = f"{major}{minor}a"
         _SCAN_TC_EXT = load_extension("olala_mamba3_scan_prefill_tc", "mamba3_scan_prefill_tc.cu",
-                                      ["-O3", "-std=c++20", "--use_fast_math",
-                                       f"-gencode=arch=compute_{arch},code=sm_{arch}"])
+                                      ["-O3", "-std=c++20", "--use_fast_math", gencode(arch_specific=True)])
     return _SCAN_TC_EXT
 
 def _cs_sm80_ok(dev) -> bool:
-    return _CS_CUDA and _cc(dev)[0] == 8
+    return _CS_CUDA and gpu_family(dev) is GpuFamily.SM80
 
 
 def _scan_sm80_ok(dev, tune: dict) -> bool:
     use = tune.get("scan", "sm80" if _SCAN_SM80 else None) == "sm80"
-    return use and _cc(dev)[0] == 8
+    return use and gpu_family(dev) is GpuFamily.SM80
 
 
 def _scan_sm80_ext(dev):
@@ -100,9 +90,8 @@ def _scan_sm80_ext(dev):
     global _SCAN_SM80_EXT
     if _SCAN_SM80_EXT is None:
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
-        cc = "".join(map(str, torch.cuda.get_device_capability(dev)))
         _SCAN_SM80_EXT = load_extension("olala_mamba3_scan_prefill_sm80", "mamba3_scan_prefill_sm80.cu",
-                                        ["-O3", "-std=c++20", "--use_fast_math", f"-gencode=arch=compute_{cc},code=sm_{cc}"])
+                                        ["-O3", "-std=c++20", "--use_fast_math", gencode(dev)])
     return _SCAN_SM80_EXT
 
 
@@ -117,9 +106,8 @@ def _cs_sm80_ext(dev):
     global _CS_SM80_EXT
     if _CS_SM80_EXT is None:
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
-        cc = "".join(map(str, torch.cuda.get_device_capability(dev)))
         _CS_SM80_EXT = load_extension("olala_mamba3_chunk_state_sm80", "mamba3_chunk_state_sm80.cu",
-                                      ["-O3", "-std=c++20", "--use_fast_math", f"-gencode=arch=compute_{cc},code=sm_{cc}"])
+                                      ["-O3", "-std=c++20", "--use_fast_math", gencode(dev)])
     return _CS_SM80_EXT
 
 

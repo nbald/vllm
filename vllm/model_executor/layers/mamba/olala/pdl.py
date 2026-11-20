@@ -16,15 +16,14 @@ of the cuBLAS entry GEMM, and Inductor cannot analyze ``gdc_wait``.
 import os
 from functools import cache
 
-import torch
+from vllm.model_executor.layers.mamba.olala.arch import has_pdl
 
 
 @cache
 def pdl_enabled() -> bool:
     return (
         os.environ.get("OLALA_PDL", "1") != "0"
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] >= 9
+        and has_pdl()
     )
 
 

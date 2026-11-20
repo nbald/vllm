@@ -22,6 +22,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family
 from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
 from vllm.forward_context import get_forward_context
@@ -50,7 +51,7 @@ _SMALL_EXT = None
 @functools.cache
 def _small_cuda_arch() -> bool:
     # Ampere / Ada / Hopper (mma.sync); Blackwell keeps the Triton small path tuned for it
-    return 8 <= torch.cuda.get_device_capability()[0] < 10
+    return gpu_family() in (GpuFamily.SM80, GpuFamily.SM90)
 
 
 def small_path_max_tokens(w13: torch.Tensor) -> int:
@@ -64,11 +65,10 @@ def _small_ext():
     if _SMALL_EXT is None:
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-        cc = "".join(map(str, torch.cuda.get_device_capability()))
         _SMALL_EXT = load_extension(
             "olala_moe_small_int8",
             "moe_small_int8.cu",
-            ["-O3", "-std=c++20", f"-gencode=arch=compute_{cc},code=sm_{cc}"],
+            ["-O3", "-std=c++20", gencode()],
         )
     return _SMALL_EXT
 

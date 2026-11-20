@@ -13,11 +13,11 @@ copy bandwidth there on an A4500, the skinny kernel 80-97 %).
 """
 
 import os
-from functools import cache
 
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -64,11 +64,6 @@ def _gemv_m1_full_kernel(
     x = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0)
     acc = tl.sum(w.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)
     tl.store(y_ptr + offs_n, acc.to(y_ptr.dtype.element_ty), mask=n_mask)
-
-
-@cache
-def is_blackwell() -> bool:
-    return torch.cuda.get_device_capability()[0] >= 10
 
 
 def _decode_gemv_blackwell(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -154,7 +149,7 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     53 % of the copy bandwidth vs 89 % on an A4500). Blackwell keeps its own dispatch: the full-K
     GEMV at one row, F.linear otherwise."""
     M = x.shape[0]
-    if x.is_cuda and is_blackwell():
+    if x.is_cuda and gpu_family() in (GpuFamily.SM100, GpuFamily.SM120):
         if M != 1 or x.dtype != weight.dtype or _DISABLED:
             return F.linear(x, weight)
         return _decode_gemv_blackwell(x, weight)

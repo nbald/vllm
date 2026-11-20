@@ -21,6 +21,14 @@ from functools import lru_cache
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.olala.arch import (
+    GpuFamily,
+    gencode,
+    gpu_family,
+    has_bf16_mma,
+    has_fp8_cvt,
+    sm_arch,
+)
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.pdl import pdl_enabled
 
@@ -37,7 +45,7 @@ def cuda_step_enabled() -> bool:
     if os.environ.get(_ENV, "cuda") != "cuda":
         logger.info("Olala: CUDA Mamba-3 step disabled by %s.", _ENV)
         return False
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+    if not has_bf16_mma():
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         warn_slow_path(
             "CUDA Mamba-3 decode step disabled",
@@ -64,15 +72,14 @@ def cuda_step_enabled() -> bool:
 def _load():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    major, minor = torch.cuda.get_device_capability()
-    sm = f"{major}{minor}"
+    sm = sm_arch()
     # One build per arch: the build directory is shared (e.g. a cache volume
     # mounted on H100 and A4500 nodes alike); sm_90 keeps its historical name.
     name = "olala_mamba3_step" if sm == "90" else f"olala_mamba3_step_sm{sm}"
     return load_extension(
         name,
         "mamba3_step.cu",
-        ["-O3", "-std=c++20", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
+        ["-O3", "-std=c++20", gencode()],
     )
 
 
@@ -148,13 +155,11 @@ def mamba3_step_cuda_raw(ssm_pool, k_pool, v_pool, angle_pool, zxdt, bc, dt_bias
 def _load_replay():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    major, minor = torch.cuda.get_device_capability()
-    sm = f"{major}{minor}"
-    flags = ["-O3", "-std=c++20", f"-gencode=arch=compute_{sm},code=sm_{sm}"]
-    if major == 10:
+    flags = ["-O3", "-std=c++20", gencode()]
+    if gpu_family() is GpuFamily.SM100:
         # sm_100a / sm_103a: the flush's stochastic rounding uses the hardware cvt.rs
-        flags = ["-O3", "-std=c++20", f"-gencode=arch=compute_{sm}a,code=sm_{sm}a", "-DREPLAY_HW_SR"]
-    return load_extension(f"olala_mamba3_replay_step_sm{sm}", "mamba3_replay_step.cu", flags)
+        flags = ["-O3", "-std=c++20", gencode(arch_specific=True), "-DREPLAY_HW_SR"]
+    return load_extension(f"olala_mamba3_replay_step_sm{sm_arch()}", "mamba3_replay_step.cu", flags)
 
 
 # Resident CTAs per SM the persistent replay kernel sizes its grid for: 5 fit
@@ -166,7 +171,7 @@ def replay_step_supported(num_heads_local, head_dim, d_state, rank, num_angles, 
     return (
         head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
         and ngroups == 1 and num_heads_local > 0
-        and torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
+        and has_fp8_cvt()
     )
 
 

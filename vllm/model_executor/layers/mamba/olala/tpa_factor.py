@@ -37,6 +37,13 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.olala.arch import (
+    GpuFamily,
+    gencode,
+    gpu_family,
+    has_bf16_mma,
+    sm_arch,
+)
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
@@ -71,7 +78,7 @@ def factor_cache_enabled() -> bool:
     if os.environ.get("OLALA_TPA_FACTOR", "1") == "0":
         logger.info("Olala: TPA factor cache disabled by OLALA_TPA_FACTOR=0.")
         return False
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+    if not has_bf16_mma():
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         warn_slow_path(
             "TPA factor KV cache disabled",
@@ -613,14 +620,14 @@ def factor_decode_write(
 
 @lru_cache(maxsize=1)
 def _hopper() -> bool:
-    return torch.cuda.get_device_capability()[0] == 9
+    return gpu_family() is GpuFamily.SM90
 
 
 @lru_cache(maxsize=1)
-def _blackwell_kernel() -> str | None:
+def _sm100_kernel() -> str | None:
     """"tc" on sm_100 / sm_103 (tpa_factor_decode_tc.cu: tcgen05 + TMEM, 16-31% faster than the mma.sync kernel
     on B300), None elsewhere or with OLALA_TPA_DECODE_KERNEL=sm80 (the generic kernel)."""
-    if torch.cuda.get_device_capability()[0] != 10:
+    if gpu_family() is not GpuFamily.SM100:
         return None
     return None if os.environ.get("OLALA_TPA_DECODE_KERNEL", "tc") == "sm80" else "tc"
 
@@ -636,22 +643,19 @@ def _load_kernel():
             ["-O3", "-std=c++20", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
             ["-lcuda"],
         )
-    elif _blackwell_kernel():
-        major, minor = torch.cuda.get_device_capability()
-        arch = f"{major}{minor}a"   # tcgen05 needs the arch-specific target
+    elif _sm100_kernel():
         ext = load_extension(
-            f"olala_tpa_factor_decode_tc_sm{arch}",
+            f"olala_tpa_factor_decode_tc_sm{sm_arch()}a",
             "tpa_factor_decode_tc.cu",
-            ["-O3", "-std=c++20", "--use_fast_math", f"-gencode=arch=compute_{arch},code=sm_{arch}"],
+            # tcgen05 needs the arch-specific target
+            ["-O3", "-std=c++20", "--use_fast_math", gencode(arch_specific=True)],
             ["-lcuda"],
         )
     else:
-        major, minor = torch.cuda.get_device_capability()
-        sm = f"{major}{minor}"
         ext = load_extension(
-            f"olala_tpa_factor_decode_sm{sm}",
+            f"olala_tpa_factor_decode_sm{sm_arch()}",
             "tpa_factor_decode_sm80.cu",
-            ["-O3", "-std=c++20", "--use_fast_math", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
+            ["-O3", "-std=c++20", "--use_fast_math", gencode()],
         )
     assert ext.TILE == TILE
     return ext
@@ -669,7 +673,7 @@ def _target_ctas() -> int:
 
 def split_table_path() -> str:
     name = torch.cuda.get_device_name().replace(" ", "_")
-    kind = _blackwell_kernel()
+    kind = _sm100_kernel()
     suffix = f",kernel={kind}" if kind else ""
     return os.path.join(SPLIT_TABLE_DIR, f"tpa_factor_splits,device_name={name}{suffix}.json")
 

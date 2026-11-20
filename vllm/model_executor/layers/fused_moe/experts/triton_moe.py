@@ -79,16 +79,21 @@ _MOE_CUDA_EXT = None
 def _moe_cuda_ext(device: torch.device):
     global _MOE_CUDA_EXT
     if _MOE_CUDA_EXT is None:
+        from vllm.model_executor.layers.mamba.olala.arch import gencode
         from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-        cc = "".join(map(str, torch.cuda.get_device_capability(device)))
         _MOE_CUDA_EXT = load_extension(
             "olala_moe_relu2_int8_sm80",
             "moe_relu2_int8_sm80.cu",
-            ["-O3", "-std=c++20", "--use_fast_math",
-             f"-gencode=arch=compute_{cc},code=sm_{cc}"],
+            ["-O3", "-std=c++20", "--use_fast_math", gencode(device)],
         )
     return _MOE_CUDA_EXT
+
+
+def _olala_sm80(device: torch.device) -> bool:
+    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+
+    return gpu_family(device) is GpuFamily.SM80
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -399,7 +404,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             and hidden_states.dtype == torch.bfloat16
             and topk_weights.dtype == torch.float32
             and (N, K) == (768, 384)
-            and torch.cuda.get_device_capability(hidden_states.device)[0] == 8
+            and _olala_sm80(hidden_states.device)
         ):
             sorted_ids, block_experts, n_padded = moe_align_block_size(
                 topk_ids, 32, global_num_experts, expert_map

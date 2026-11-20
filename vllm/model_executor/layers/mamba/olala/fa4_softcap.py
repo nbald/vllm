@@ -34,9 +34,9 @@ _LOG2_E = math.log2(math.e)
 @lru_cache(maxsize=1)
 def native_softcap_available() -> bool:
     """sm_10x and the vendored FA4 ``softmax_step`` matches the one the override copies."""
-    import torch
+    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    if gpu_family() is not GpuFamily.SM100:
         return False
     try:
         from vllm.vllm_flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100

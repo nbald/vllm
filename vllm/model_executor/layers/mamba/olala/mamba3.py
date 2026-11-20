@@ -30,8 +30,8 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     cat_rows_shared,
     decode_gemv,
-    is_blackwell,
 )
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.geo_linear import (
     GEO_LINEAR_MAX_TOKENS,
@@ -93,7 +93,7 @@ def _fuse_rotary_max_batch() -> int:
     # On Blackwell the CUDA step (rotary fused, csrc/mamba3_step.cu) beats the
     # CuteDSL step + separate rotary at every batch: B300, fp32 state, batch
     # 256: 168 us vs 172 + 13.5 us per layer.
-    if is_blackwell() and cuda_step_enabled():
+    if gpu_family() in (GpuFamily.SM100, GpuFamily.SM120) and cuda_step_enabled():
         return 1 << 30
     return _FUSE_ROTARY_MAX_BATCH
 
