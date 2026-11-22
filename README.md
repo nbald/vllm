@@ -33,6 +33,12 @@ its own paths, tuned on an RTX 5090:
 
 ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
 
+### Quantized checkpoints
+
+Single-GPU W8A16 (INT8 weight-only) checkpoints in the ModelOpt `MIXED_PRECISION` layout are served with
+`vllm serve <dir> --trust-remote-code`. Their format and the exporter, `tools/olala/build_q8.py`, are documented
+in [docs/features/quantization/olala.md](docs/features/quantization/olala.md).
+
 Chunked prefill is on by default, as for any vLLM model (`OLALA_CHUNKED_PREFILL` is no longer read): it bounds
 the TTFT of long prompts. `--no-enable-chunked-prefill` keeps whole-prompt steps and the FULL-decode CUDA-graph
 regime (more throughput under concurrency on short prompts); `--max-num-batched-tokens` must then be at least
