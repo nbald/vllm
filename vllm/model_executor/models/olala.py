@@ -630,8 +630,6 @@ class OlalaLatentMoE(nn.Module):
                 x_in, router_logits = y[:, :d], y[:, d : d + e]
                 if self._entry_router_parts == 2:
                     logits_lo = y[:, d + e :]
-                    if not small:
-                        router_logits = router_logits + logits_lo
             elif x_in is None:
                 x_in = (
                     int8_apply(self.fc1_latent_proj, hidden_states)
@@ -649,7 +647,7 @@ class OlalaLatentMoE(nn.Module):
             )
             if small:
                 return olala_moe_small_int8(*args, router_logits_lo=logits_lo)
-            return olala_moe_medium_int8(*args)
+            return olala_moe_medium_int8(*args, router_logits_lo=logits_lo)
         if router_logits is None:
             if self._router_w is not None:
                 router_logits = torch.ops.vllm.olala_router_logits(

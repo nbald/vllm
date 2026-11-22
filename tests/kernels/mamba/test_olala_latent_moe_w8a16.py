@@ -244,7 +244,9 @@ def test_int4_tiles_bit_exact(shape, bk):
     assert torch.equal(out2.float(), ref)
 
 
-@pytest.mark.parametrize("m,run", [(4, olala_moe_small_int8)])
+@pytest.mark.parametrize(
+    "m,run", [(4, olala_moe_small_int8), (33, olala_moe_medium_int8)]
+)
 def test_split_router_logits(m, run):
     """Router logits passed as two strided slices of the entry projection
     (``router_logits + router_logits_lo``) give the same output as their sum."""

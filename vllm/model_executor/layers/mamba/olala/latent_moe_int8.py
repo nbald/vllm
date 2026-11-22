@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
 
@@ -1018,6 +1019,7 @@ def olala_moe_medium_int8(
     top_k: int,
     routed_scale: float,
     configs=None,
+    router_logits_lo: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Medium-batch latent MoE: routing, compaction, grouped up GEMM (+ shared
     up), grouped down GEMM, exit GEMM (top-k sum + fc2_latent + shared down)."""
@@ -1048,6 +1050,14 @@ def olala_moe_medium_int8(
     rows = torch.empty(E, M, dtype=torch.int32, device=dev)
     cnt = torch.empty(E, dtype=torch.int32, device=dev)
     RB = 8
+    # Two rows per CTA shorten the 256-expert split-logit route on RTX 5090.
+    if (
+        router_logits_lo is not None
+        and E == 256
+        and top_k == 6
+        and gpu_family(dev) == GpuFamily.SM120
+    ):
+        RB = 2
     _route_topk_kernel[(triton.cdiv(M, RB),)](
         router_logits,
         e_score_bias,
@@ -1060,6 +1070,8 @@ def olala_moe_medium_int8(
         KP=triton.next_power_of_2(top_k),
         RB=RB,
         num_warps=4,
+        logits_lo_ptr=router_logits_lo,
+        stride_lo=router_logits_lo.stride(0) if router_logits_lo is not None else 0,
         **pdl_kwargs(),
     )
     _compact_kernel[(E,)](

@@ -48,6 +48,8 @@ def _route_topk_kernel(
     KP: tl.constexpr,
     RB: tl.constexpr,
     PDL: tl.constexpr = False,
+    logits_lo_ptr=None,
+    stride_lo=0,
 ):
     """Sigmoid scores ranked by score + bias; weights renormalized over the top k."""
     if PDL:
@@ -61,6 +63,12 @@ def _route_topk_kernel(
         mask=rmask[:, None],
         other=0.0,
     )
+    if logits_lo_ptr is not None:
+        lg += tl.load(
+            logits_lo_ptr + rows[:, None] * stride_lo + offs_e[None, :],
+            mask=rmask[:, None],
+            other=0.0,
+        )
     # Padded CUDA-graph rows can hold NaN logits. Scoring them 0 keeps the k
     # winners distinct (ranked by the bias alone): a repeated expert would
     # overflow its RCAP-row list in _compact_kernel and corrupt other rows.
