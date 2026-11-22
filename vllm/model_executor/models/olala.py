@@ -65,6 +65,24 @@ from vllm.model_executor.layers.mamba.olala.latent_moe_medium import (
     MEDIUM_BATCH_MAX_TOKENS,
     olala_moe_medium,
 )
+from vllm.model_executor.layers.mamba.olala.w8a16_layers import (
+    int8_apply,
+    int8_linear_weight,
+    is_int8_linear,
+    is_int8_quant_method,
+)
+from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
+    Segment,
+    int8_decode_linear,
+    int8_decode_max_m,
+)
+from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import (
+    INT8_SMALL_MAX_TOKENS,
+    WqWeight,
+    olala_moe_medium_int8,
+    olala_moe_small_int8,
+    wq_routed_experts,
+)
 from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -182,6 +200,38 @@ class OlalaSharedMLP(nn.Module):
         return x
 
 
+def _int8_moe_config(quant_config, prefix: str) -> bool:
+    """ModelOpt MIXED_PRECISION layer with W8A16 INT8
+    routed experts and a W8A16 or bf16 shared expert (both projections alike)
+    and latent projections: the weight-only paths of latent_moe_int8.py."""
+    if quant_config is None or quant_config.get_name() != "modelopt_mixed":
+        return False
+    algo = quant_config._resolve_quant_algo
+    shared = {algo(f"{prefix}.shared_experts.{p}") for p in ("up_proj", "down_proj")}
+    return (
+        algo(f"{prefix}.experts") == "W8A16"
+        and len(shared) == 1
+        and shared.pop() in ("W8A16", None)
+        and all(
+            algo(f"{prefix}.{p}") in ("W8A16", None)
+            for p in ("fc1_latent_proj", "fc2_latent_proj")
+        )
+    )
+
+
+def _wq_weight(layer) -> WqWeight | None:
+    """A W8A16 INT8 or bf16 linear as the INT8 MoE kernels read it."""
+    if is_int8_linear(layer):
+        w = int8_linear_weight(layer)
+        return WqWeight(w.weight, w.scale) if w is not None else None
+    if (
+        isinstance(layer.quant_method, UnquantizedLinearMethod)
+        and layer.weight.is_contiguous()
+    ):
+        return WqWeight(layer.weight)
+    return None
+
+
 @functools.cache
 def _int8_skip_layers() -> frozenset[int]:
     raw = os.environ.get("OLALA_INT8_SKIP_LAYERS", "")
@@ -279,6 +329,24 @@ class OlalaLatentMoE(nn.Module):
             prefix=f"{prefix}.fc2_latent_proj",
         )
 
+        self._int8 = (
+            _int8_moe_config(quant_config, prefix)
+            and self.shared_experts is not None
+            and all(
+                isinstance(lin.quant_method, UnquantizedLinearMethod)
+                or is_int8_quant_method(lin)
+                for lin in (
+                    self.fc1_latent_proj,
+                    self.fc2_latent_proj,
+                    self.shared_experts.up_proj,
+                    self.shared_experts.down_proj,
+                )
+            )
+        )
+        self._fc1_int8 = self._int8 and is_int8_quant_method(self.fc1_latent_proj)
+        self._int8_entry_st = None
+        self._int8_w = None
+
         # Single rank, unquantized: the latent projections and the shared
         # expert are handled here around a bare routed-experts FusedMoE — one
         # GEMM on [fc1_latent ; shared_up], routed experts on the latent slice,
@@ -287,7 +355,7 @@ class OlalaLatentMoE(nn.Module):
         # router weights. Otherwise the runner owns transforms and shared.
         self._fused_proj = (
             self.shared_experts is not None
-            and (quant_config is None or experts_int8)
+            and (quant_config is None or experts_int8 or self._int8)
             and get_tensor_model_parallel_world_size() == 1
             and not parallel_config.enable_eplb
             # EP dispatch is collective: every rank must take the runner path.
@@ -344,7 +412,9 @@ class OlalaLatentMoE(nn.Module):
         self._router_w: torch.Tensor | None = None
         self._small_w: tuple[torch.Tensor, torch.Tensor] | None = None
         self._small_path = (
-            self._fused_proj and os.environ.get("OLALA_MOE_SMALL", "1") != "0"
+            self._fused_proj
+            and os.environ.get("OLALA_MOE_SMALL", "1") != "0"
+            and (not self._int8 or os.environ.get("OLALA_MOE_INT8", "1") != "0")
         )
 
         # Medium batches (decode): fused routing/sort, relu^2 in the up GEMM,
@@ -352,13 +422,15 @@ class OlalaLatentMoE(nn.Module):
         # OLALA_MOE_MEDIUM=0 disables it.
         self._medium_path = (
             self._small_path
-            and quant_config is None
+            and (quant_config is None or self._int8)
             and os.environ.get("OLALA_MOE_MEDIUM", "1") != "0"
         )
         # Opt-in: medium batches through one persistent kernel (routing,
         # compaction, up, relu^2, down; latent_moe_fused.py).
         self._fused_moe_path = (
-            self._medium_path and os.environ.get("OLALA_MOE_FUSED", "0") == "1"
+            self._medium_path
+            and not self._int8
+            and os.environ.get("OLALA_MOE_FUSED", "0") == "1"
         )
 
         # Decode batches (small / medium paths): the router GEMM is merged
@@ -371,6 +443,19 @@ class OlalaLatentMoE(nn.Module):
             and self.gate.weight.dtype == self.fc1_latent_proj.weight.dtype
             and os.environ.get("OLALA_MOE_ENTRY", "1") != "0"
         )
+
+        self._entry_router_parts = 1
+        if (
+            self._int8
+            and self._small_path
+            and not self._entry_path
+            and self.gate.weight.dtype == torch.float32
+            and (self.fc1_latent_proj.weight.dtype == torch.bfloat16 or self._fc1_int8)
+            and self._router_mode in ("bf16", "bf16x2")
+            and os.environ.get("OLALA_MOE_ENTRY", "1") != "0"
+        ):
+            self._entry_path = True
+            self._entry_router_parts = 2 if self._router_mode == "bf16x2" else 1
 
         # Registered like the mixers so the MoE call is one opaque custom op
         # and the small/generic dispatch runs inside it (see forward_dispatch).
@@ -433,6 +518,8 @@ class OlalaLatentMoE(nn.Module):
             # First call is the profiling run, before CUDA graph capture: a
             # cache built during capture would live in a graph's private pool.
             self._entry_weight()
+        if self._int8:
+            return self._forward_int8(hidden_states, router_logits, x_in)
         re = self.experts.routed_experts if self._small_path else None
         # int8 experts on sm8x / sm90: the CUDA small path covers up to 32 tokens
         small_max = (
@@ -515,6 +602,146 @@ class OlalaLatentMoE(nn.Module):
             return out + self.shared_experts(hidden_states)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
+    def _forward_int8(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        x_in: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """W8A16 INT8 routed + W8A16 shared experts: the
+        small / medium paths of latent_moe_int8.py up to MEDIUM_BATCH_MAX_TOKENS
+        tokens, its sorted grouped GEMMs (or the FusedMoE, Triton int8_w8a16,
+        for per-row INT8) and W8A16 linears beyond (prefill)."""
+        m = hidden_states.shape[0]
+        weights = self._int8_weights()
+        small = m <= INT8_SMALL_MAX_TOKENS
+        if self._small_path and (
+            small or (self._medium_path and m <= MEDIUM_BATCH_MAX_TOKENS)
+        ):
+            logits_lo = None
+            if router_logits is None:
+                if self._fc1_int8:
+                    y = self._int8_entry(hidden_states)
+                else:
+                    y = torch.mm(
+                        hidden_states, self._entry_weight().t(), out_dtype=torch.float32
+                    )
+                d, e = self.latent_size, self.num_experts
+                x_in, router_logits = y[:, :d], y[:, d : d + e]
+                if self._entry_router_parts == 2:
+                    logits_lo = y[:, d + e :]
+                    if not small:
+                        router_logits = router_logits + logits_lo
+            elif x_in is None:
+                x_in = (
+                    int8_apply(self.fc1_latent_proj, hidden_states)
+                    if self._fc1_int8
+                    else decode_gemv(hidden_states, self.fc1_latent_proj.weight)
+                )
+            args = (
+                hidden_states,
+                x_in,
+                router_logits,
+                self.gate.e_score_correction_bias,
+                *weights,
+                self.top_k,
+                self.routed_scaling_factor,
+            )
+            if small:
+                return olala_moe_small_int8(*args, router_logits_lo=logits_lo)
+            return olala_moe_medium_int8(*args)
+        if router_logits is None:
+            if self._router_w is not None:
+                router_logits = torch.ops.vllm.olala_router_logits(
+                    hidden_states, self._router_w, self.num_experts
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
+        latent = self.fc1_latent_proj(hidden_states)[0]
+        if self._int8_own_prefill(weights[0]):
+            # Grouped weights require the Olala expert kernel.
+            routed = wq_routed_experts(
+                latent,
+                router_logits,
+                self.gate.e_score_correction_bias,
+                weights[0],
+                weights[1],
+                self.top_k,
+                self.routed_scaling_factor,
+            )
+        else:
+            routed = self.experts(hidden_states=latent, router_logits=router_logits)
+        out = self.fc2_latent_proj(routed)[0]
+        return out + self.shared_experts(hidden_states)
+
+    @staticmethod
+    def _int8_own_prefill(w13: WqWeight) -> bool:
+        """Prefill routed experts through latent_moe_int8.wq_routed_experts
+        (always for per-group scales; per-row ones too by default:
+        OLALA_INT8_MOE_PREFILL=vllm takes vLLM's Triton int8_w8a16 FusedMoE,
+        2 % slower on 64 x 1k / 8 x 8k prefills on an RTX 5090)."""
+        mode = os.environ.get("OLALA_INT8_MOE_PREFILL", "olala")
+        return w13.scale is not None and (
+            w13.scale.dim() == 3
+            or (mode == "olala" and os.environ.get("OLALA_MOE_INT8", "1") != "0")
+        )
+
+    def _int8_entry(self, h: torch.Tensor) -> torch.Tensor:
+        """``[fc1_latent | router parts]`` in fp32 with an INT8 fc1_latent: one
+        two-segment W8A16 launch (INT8 fc1 rows + bf16 router rows) at decode
+        sizes; the W8A16 linear and an fp32-output router GEMM beyond."""
+        if self._int8_entry_st is None:
+            w8 = int8_linear_weight(self.fc1_latent_proj)
+            if w8 is None:
+                raise RuntimeError("fc1_latent_proj: unsupported INT8 weight layout")
+            router = self._entry_weight()
+            segs = [Segment(w8.weight, w8.scale), Segment(router, col0=w8.n)]
+            self._int8_entry_st = (segs, w8, router)
+        segs, w8, router = self._int8_entry_st
+        m, width = h.shape[0], w8.n + router.shape[0]
+        out = torch.empty(m, width, dtype=torch.float32, device=h.device)
+        if 0 < m <= int8_decode_max_m(width, w8.k, router.shape[0]):
+            return int8_decode_linear(h, segs, out=out)
+        out[:, : w8.n] = int8_apply(self.fc1_latent_proj, h)
+        out[:, w8.n :] = torch.mm(h, router.t(), out_dtype=torch.float32)
+        return out
+
+    def _int8_weights(self) -> tuple[WqWeight, ...]:
+        """(w13, w2, shared_up, shared_down, fc2_latent) as the INT8 MoE kernels
+        read them, built on the first call (the profiling run, before graph
+        capture)."""
+        if self._int8_w is None:
+            re = self.experts.routed_experts
+            w13, w2 = re.w13_weight, re.w2_weight
+            s13, s2 = getattr(re, "w13_scale", None), getattr(re, "w2_scale", None)
+            ok = (
+                w13.dtype == w2.dtype == torch.int8
+                and w13.is_contiguous()
+                and w2.is_contiguous()
+                and s13 is not None
+                and s2 is not None
+            )
+            dense = [
+                _wq_weight(lin)
+                for lin in (
+                    self.shared_experts.up_proj,
+                    self.shared_experts.down_proj,
+                    self.fc2_latent_proj,
+                )
+            ]
+            if not ok or None in dense:
+                raise ValueError("Unsupported Olala weight-only MoE parameter layout.")
+            else:
+                # per-row scales fp32, per-group ones as stored (fp16)
+                self._int8_w = (
+                    WqWeight(
+                        w13, (s13 if s13.dim() == 3 else s13.float()).contiguous()
+                    ),
+                    WqWeight(w2, (s2 if s2.dim() == 3 else s2.float()).contiguous()),
+                    *dense,
+                )
+        return self._int8_w
+
     def _refresh_router_weight(self) -> None:
         w = self.gate.weight
         if self._router_mode == "fp32" or w.dtype != torch.float32 or not w.is_cuda:
@@ -549,24 +776,45 @@ class OlalaLatentMoE(nn.Module):
         return self._small_w
 
     def _entry_weight(self) -> torch.Tensor:
-        """``[fc1_latent ; shared_up ; router]`` for the merged entry GEMM."""
+        """``[fc1_latent ; shared_up ; router]`` for the merged entry GEMM
+        (``[fc1_latent ; router]`` with a weight-only shared expert)."""
         if self._entry_w is None:
-            w_in, _ = self._small_path_weights()
-            self._entry_w = torch.cat([w_in, self.gate.weight], 0).contiguous()
+            router = self._entry_router_rows()
+            if self._fc1_int8:
+                # the router rows only: _int8_entry runs the INT8 fc1 next to them
+                self._entry_w = router.clone()
+                return self._entry_w
+            if self._int8:
+                w_in = self.fc1_latent_proj.weight
+            else:
+                w_in, _ = self._small_path_weights()
+            self._entry_w = torch.cat([w_in, router], 0).contiguous()
         return self._entry_w
+
+    def _entry_router_rows(self) -> torch.Tensor:
+        if self.gate.weight.dtype == torch.bfloat16:
+            return self.gate.weight
+        if self._router_w is None:
+            self._refresh_router_weight()
+        return self._router_w
 
     def refresh_weight_caches(self) -> None:
         """Recompute the concatenated small-path projections into their
         existing storage (CUDA graphs bake their addresses; see the Mamba3
         mixer's refresh_weight_caches)."""
+        self._refresh_router_weight()
         if self._entry_w is not None:
             with torch.inference_mode():
-                n_in = self._entry_w.shape[0] - self.num_experts
+                router = self._entry_router_rows()
+                n_in = self._entry_w.shape[0] - router.shape[0]
                 w_fc1 = self.fc1_latent_proj.weight
-                w_up = self.shared_experts.up_proj.weight
-                self._entry_w[:n_in].copy_(torch.cat([w_fc1, w_up]))
-                self._entry_w[n_in:].copy_(self.gate.weight)
-        self._refresh_router_weight()
+                if self._int8:
+                    if n_in:
+                        self._entry_w[:n_in].copy_(w_fc1)
+                else:
+                    w_up = self.shared_experts.up_proj.weight
+                    self._entry_w[:n_in].copy_(torch.cat([w_fc1, w_up]))
+                self._entry_w[n_in:].copy_(router)
         if self._small_w is None:
             return
         w_in, w_out = self._small_w
@@ -922,6 +1170,7 @@ class OlalaMonoBlock(nn.Module):
             and isinstance(self.mlp, OlalaLatentMoE)
             and self.mlp._entry_path
             and self.mlp._medium_path
+            and not self.mlp._int8
             and get_pp_group().world_size == 1
         )
         if self.geo_fuse:
@@ -1320,6 +1569,8 @@ class OlalaForCausalLM(
             "moe_gate.weight": "gate.weight",
             "down_proj.weight": "fc1_latent_proj.weight",
             "up_proj.weight": "fc2_latent_proj.weight",
+            "shared_experts.fc_1.weight_scale": "shared_experts.up_proj.weight_scale",
+            "shared_experts.fc_2.weight_scale": "shared_experts.down_proj.weight_scale",
             "shared_experts.fc_1.weight": "shared_experts.up_proj.weight",
             "shared_experts.fc_2.weight": "shared_experts.down_proj.weight",
         }

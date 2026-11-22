@@ -6,12 +6,14 @@ from typing import Any
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
 )
+from vllm.model_executor.layers.quantization.online.int8 import Int8SerializedMoEMethod
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
@@ -132,5 +134,70 @@ def w8a16_quant_method(layer: torch.nn.Module, layer_info: dict[str, Any] | None
     if isinstance(layer, (LinearBase, ParallelLMHead)):
         return ModelOptW8A16LinearMethod(group_size=g)
     if isinstance(layer, RoutedExperts):
-        raise NotImplementedError("W8A16 routed experts are not supported")
+        # OlalaLatentMoE runs W8A16 experts with its own kernels (and, for
+        # per-channel ones, optionally the serialized int8_w8a16 fused MoE).
+        if not _is_olala_model():
+            raise NotImplementedError("W8A16 routed experts are not supported")
+        if g:
+            return ModelOptW8A16GroupMoEMethod(moe=layer.moe_config)
+        return Int8SerializedMoEMethod(moe=layer.moe_config)
     return None
+
+
+def _is_olala_model() -> bool:
+    config = get_current_vllm_config_or_none()
+    model_config = config.model_config if config is not None else None
+    hf_config = getattr(model_config, "hf_config", None)
+    return getattr(hf_config, "model_type", None) == "olala"
+
+
+class ModelOptW8A16GroupMoEMethod(Int8SerializedMoEMethod):
+    """Group-32 W8A16 routed experts of an Olala model: int8 weights as
+    Int8SerializedMoEMethod creates them, fp16 scales ``[E, N, K / 32]``.
+    OlalaLatentMoE runs them with its own kernels (latent_moe_int8.py)."""
+
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        rows13 = layer.w13_weight.shape[1]
+        for name, rows, k in (
+            ("w13_scale", rows13, hidden_size),
+            ("w2_scale", hidden_size, intermediate_size_per_partition),
+        ):
+            if k % 32:
+                raise ValueError(f"W8A16 group size 32 does not divide {k}")
+            delattr(layer, name)
+            layer.register_parameter(
+                name,
+                torch.nn.Parameter(
+                    torch.empty(num_experts, rows, k // 32, dtype=torch.float16),
+                    requires_grad=False,
+                ),
+            )
+        layer.w8a16_group_size = 32
+
+    def process_weights_after_loading(self, layer) -> None:
+        layer._already_called_process_weights_after_loading = True
+
+    def get_fused_moe_quant_config(self, layer):
+        return None
+
+    def apply(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Group-32 W8A16 routed experts only run inside Olala's latent MoE "
+            "(OlalaLatentMoE), which calls its own kernels"
+        )

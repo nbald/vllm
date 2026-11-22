@@ -64,7 +64,8 @@ The layer computes `x @ (weight_scale * weight).T` with BF16 activations and
 FP32 accumulation, through Triton kernels: a GEMV or skinny GEMM for decode
 batches and a W8A16 GEMM, or dequantization followed by cuBLAS, for prefill.
 `W8A16` applies to linear layers and the LM head; routed experts are not
-supported.
+supported, except in Olala models, which run per-channel and group-32
+`W8A16` experts through their own latent-MoE kernels.
 
 Every `W8A16` module needs its own `quantized_layers` entry. The layers run
 on a single CUDA GPU with compute capability 8.0 or later and a `bfloat16`

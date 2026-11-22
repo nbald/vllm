@@ -523,12 +523,18 @@ steps:
   source_file_dependencies:
   - csrc/mamba/
   - tests/kernels/mamba
+  - tests/quantization/test_olala_grouped_dispatch.py
+  - vllm/model_executor/layers/mamba/olala/
+  - vllm/model_executor/layers/quantization/modelopt.py
+  - vllm/model_executor/layers/quantization/modelopt_w8a16.py
+  - vllm/model_executor/layers/quantization/utils/w8a16_utils.py
+  - vllm/model_executor/models/olala.py
   - vllm/model_executor/layers/mamba/checkpoint.py
   - vllm/model_executor/layers/mamba/gdn
   - vllm/model_executor/layers/mamba/ops
   - vllm/v1/attention/backends/gdn_attn.py
   commands:
-    - pytest -v -s kernels/mamba
+    - pytest -v -s kernels/mamba quantization/test_olala_grouped_dispatch.py
   mirror:
     amd:
       label: ":amd: (MI250) Mamba Kernels"
