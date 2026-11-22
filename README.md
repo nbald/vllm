@@ -13,9 +13,22 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_TPA_CONCAT` | `1` | One GEMM over the concatenated DiffTPA input projections; `0` = separate projections. |
 | `OLALA_MOE_SMALL` | `1` | Small-batch latent-MoE decode path (gather-GEMV kernels); `0` = generic fused-MoE pipeline. |
 | `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
-| `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). Both kernels need an sm_90 GPU (H100/H200/GH200); elsewhere, or if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
+| `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). The extensions are built for the running GPU (SM80 or later, see GPU support below); if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
 | `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
 | `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
+
+### GPU support
+
+The Olala kernels dispatch on GPU families (`vllm/model_executor/layers/mamba/olala/arch.py`): SM80 (Ampere,
+Ada), SM90 (Hopper), SM100 (B200, B300) and SM120 (consumer Blackwell: RTX 50xx, RTX PRO Blackwell). SM120 has
+its own paths, tuned on an RTX 5090:
+
+- the Mamba-3 prefill runs the CUDA mma.sync chunk-state and output-pass kernels, as on SM80;
+- the decode projections use a dedicated GEMV dispatch: the full-K or K-loop GEMV at one row, the skinny kernel
+  up to 32 rows (64 on wide outputs), cuBLAS beyond;
+- the medium-batch latent-MoE projections take the same dispatch.
+
+ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
 
 Chunked prefill is on by default, as for any vLLM model (`OLALA_CHUNKED_PREFILL` is no longer read): it bounds
 the TTFT of long prompts. `--no-enable-chunked-prefill` keeps whole-prompt steps and the FULL-decode CUDA-graph
@@ -47,7 +60,7 @@ docker run --rm --gpus all --ipc=host -p 8000:8000 \
   olala-vllm:dragon-v0.26 /model --trust-remote-code --served-model-name olala
 ```
 
-The TPA-factor decode and Mamba-3 step CUDA extensions are JIT-built (nvcc, sm_90) on first use;
+The TPA-factor decode and Mamba-3 step CUDA extensions are JIT-built (nvcc, for the GPU's architecture) on first use;
 the `olala-jit` volume keeps them across container restarts.
 
 <p align="center">
