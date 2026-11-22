@@ -1896,6 +1896,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             info = self._weight_only_layer_info(prefix, quant_algo)
             return w8a16_quant_method(layer, info)
 
+        if quant_algo == "W4A16_AFFINE":
+            # INT4 affine weight-only routed experts (MLX q4 layout, Olala)
+            from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
+                w4a16_affine_quant_method,
+            )
+
+            info = self._weight_only_layer_info(prefix, quant_algo)
+            return w4a16_affine_quant_method(layer, info)
+
         if quant_algo is not None and quant_algo.lower() in B12X_BLOCK_CODECS:
             from .modelopt_block_quant import (
                 ModelOptBlockQuantLinearMethod,

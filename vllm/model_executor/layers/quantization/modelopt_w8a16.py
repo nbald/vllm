@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ModelOpt MIXED_PRECISION ``W8A16`` (INT8 weight-only) layers."""
+"""ModelOpt MIXED_PRECISION ``W8A16`` (INT8 weight-only) layers, and the
+``W4A16_AFFINE`` (INT4 affine weight-only) routed experts of Olala models."""
 
 from typing import Any
 
@@ -19,8 +20,10 @@ from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
+from vllm.model_executor.utils import set_weight_attrs
 
 W8A16_ALGO = "W8A16"
+W4A16_AFFINE_ALGO = "W4A16_AFFINE"
 
 
 def w8a16_group_size(layer_info: dict[str, Any] | None) -> int:
@@ -200,4 +203,100 @@ class ModelOptW8A16GroupMoEMethod(Int8SerializedMoEMethod):
         raise NotImplementedError(
             "Group-32 W8A16 routed experts only run inside Olala's latent MoE "
             "(OlalaLatentMoE), which calls its own kernels"
+        )
+
+
+def w4a16_affine_quant_method(
+    layer: torch.nn.Module, layer_info: dict[str, Any] | None
+):
+    """The quant method of a ModelOpt MIXED_PRECISION ``W4A16_AFFINE`` module
+    (routed experts of an Olala model only)."""
+    if not isinstance(layer, RoutedExperts) or not _is_olala_model():
+        raise NotImplementedError(
+            f"{W4A16_AFFINE_ALGO} is only supported for the routed experts of "
+            f"Olala models, got {type(layer).__name__}"
+        )
+    g = int((layer_info or {}).get("group_size", 32))
+    if g != 32:
+        raise ValueError(f"{W4A16_AFFINE_ALGO} requires group_size=32, got {g}")
+    return ModelOptW4A16AffineMoEMethod(moe=layer.moe_config)
+
+
+class ModelOptW4A16AffineMoEMethod(Int8SerializedMoEMethod):
+    """INT4 affine routed experts, group 32: uint8 codes ``[E, N, K / 2]`` (two
+    per byte, low nibble first), bf16 ``scale`` and ``qbias`` ``[E, N, K / 32]``,
+    ``w = scale * q + qbias``. After loading, scale and bias live interleaved in
+    one int32 buffer per weight (``w13_sb`` / ``w2_sb``) that OlalaLatentMoE's
+    kernels read; the named parameters stay as write-through views of it."""
+
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if self.moe.has_bias or self.moe.is_act_and_mul:
+            raise NotImplementedError(
+                f"{W4A16_AFFINE_ALGO}: non-gated experts without biases only"
+            )
+        if self.moe.tp_size != 1 or self.moe.ep_size != 1:
+            raise NotImplementedError(f"{W4A16_AFFINE_ALGO}: single-rank experts only")
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+        g = 32
+        i = intermediate_size_per_partition
+        for prefix, rows, k in (("w13", i, hidden_size), ("w2", hidden_size, i)):
+            if k % g:
+                raise ValueError(
+                    f"{W4A16_AFFINE_ALGO} group size {g} does not divide {k}"
+                )
+            w = torch.nn.Parameter(
+                torch.empty(num_experts, rows, k // 2, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            layer.register_parameter(f"{prefix}_weight", w)
+            set_weight_attrs(w, extra_weight_attrs)
+            for name in ("scale", "qbias"):
+                layer.register_parameter(
+                    f"{prefix}_{name}",
+                    torch.nn.Parameter(
+                        torch.empty(num_experts, rows, k // g, dtype=torch.bfloat16),
+                        requires_grad=False,
+                    ),
+                )
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        layer.w4a16_affine_group = g
+
+    def process_weights_after_loading(self, layer) -> None:
+        # Keep the checkpoint parameter names live. Their BF16 views write
+        # directly into the interleaved scale/bias read by captured kernels.
+        for prefix in ("w13", "w2"):
+            scale = getattr(layer, f"{prefix}_scale")
+            bias = getattr(layer, f"{prefix}_qbias")
+            name = f"{prefix}_sb"
+            packed = getattr(layer, name, None)
+            if packed is None or packed.device != scale.device:
+                packed = torch.empty_like(
+                    scale, dtype=torch.int32, memory_format=torch.contiguous_format
+                )
+                layer.register_buffer(name, packed, persistent=False)
+            halves = packed.view(torch.bfloat16).view(*scale.shape, 2)
+            for parameter, view in ((scale, halves[..., 0]), (bias, halves[..., 1])):
+                if not parameter.data.is_set_to(view):
+                    view.copy_(parameter.data)
+                    parameter.data = view
+        layer._already_called_process_weights_after_loading = True
+
+    def get_fused_moe_quant_config(self, layer):
+        return None
+
+    def apply(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"{W4A16_AFFINE_ALGO} routed experts only run inside Olala's latent "
+            "MoE (OlalaLatentMoE), which calls its own kernels"
         )
