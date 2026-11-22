@@ -1823,6 +1823,34 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return None
 
+    def _weight_only_layer_info(self, prefix: str, algo: str) -> dict[str, Any]:
+        """This module's own quantized_layers entry (including group_size).
+
+        Weight-only layers need an explicit entry, bf16 activations and a
+        single CUDA GPU with compute capability 8.0 or higher."""
+        config = get_current_vllm_config_or_none()
+        model_config = config.model_config if config is not None else None
+        parallel = config.parallel_config if config is not None else None
+        if (
+            parallel is None
+            or parallel.world_size != 1
+            or parallel.enable_expert_parallel
+            or parallel.enable_eplb
+            or (model_config is not None and model_config.dtype != torch.bfloat16)
+            or not current_platform.is_cuda()
+            or not current_platform.has_device_capability(80)
+        ):
+            raise ValueError(
+                f"{algo} requires a single CUDA GPU (SM80+) and bf16 activations."
+            )
+        for candidate in self._quantized_layer_prefix_candidates(prefix):
+            info = self.quantized_layers.get(candidate)
+            if info is not None and info["quant_algo"].upper() == algo:
+                return info
+        raise ValueError(
+            f"{algo} requires an explicit quantized_layers entry for {prefix}."
+        )
+
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> tuple[str, ...]:
         candidates = [prefix]
@@ -1858,6 +1886,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if quant_algo == "W8A16":
+            # INT8 weight-only (per channel, or per group: "group_size")
+            from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
+                w8a16_quant_method,
+            )
+
+            info = self._weight_only_layer_info(prefix, quant_algo)
+            return w8a16_quant_method(layer, info)
 
         if quant_algo is not None and quant_algo.lower() in B12X_BLOCK_CODECS:
             from .modelopt_block_quant import (

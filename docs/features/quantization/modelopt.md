@@ -21,7 +21,8 @@ following `quantization.quant_algo` values:
   activations (use `quantization="modelopt_fp4"`).
 - `MXFP8`: ModelOpt MXFP8 checkpoints (use `quantization="modelopt_mxfp8"`).
 - `MIXED_PRECISION`: per-layer formats specified by `quantized_layers`
-  (use `quantization="modelopt_mixed"`).
+  (use `quantization="modelopt_mixed"`). Besides the formats above, a layer
+  can use `W8A16` (INT8 weight-only, see below).
 
 For per-tensor `FP8`, vLLM converts E4M3FN weights and scales to E4M3FNUZ
 when required by the GPU, for example on AMD MI300.
@@ -48,6 +49,27 @@ module prefix and decoder layer indices before constructing quantized layers.
     For models quantized to MXFP8 with BF16 activations on SM100-family GPUs,
     use `--linear-backend flashinfer_trtllm` to select FlashInfer's TensorRT-LLM
     GEMM backend.
+
+### INT8 weight-only (`W8A16`) layers
+
+A `MIXED_PRECISION` checkpoint can declare `"quant_algo": "W8A16"` for a
+module in `quantized_layers`. Each such module stores:
+
+- `weight`: signed `int8` `[N, K]`, row-major;
+- `weight_scale`: `float32` `[N]` (one scale per output channel), or, with an
+  explicit `"group_size": 32` in the entry, `float16` `[N, K / 32]` (one scale
+  per group of 32 input channels).
+
+The layer computes `x @ (weight_scale * weight).T` with BF16 activations and
+FP32 accumulation, through Triton kernels: a GEMV or skinny GEMM for decode
+batches and a W8A16 GEMM, or dequantization followed by cuBLAS, for prefill.
+`W8A16` applies to linear layers and the LM head; routed experts are not
+supported.
+
+Every `W8A16` module needs its own `quantized_layers` entry. The layers run
+on a single CUDA GPU with compute capability 8.0 or later and a `bfloat16`
+model dtype. `VLLM_W8A16_INT8_DECODE=0` sends every batch through the prefill
+kernels.
 
 ## Benchmarking with dummy weights
 
