@@ -65,7 +65,8 @@ FP32 accumulation, through Triton kernels: a GEMV or skinny GEMM for decode
 batches and a W8A16 GEMM, or dequantization followed by cuBLAS, for prefill.
 `W8A16` applies to linear layers and the LM head; routed experts are not
 supported, except in Olala models, which run per-channel and group-32
-`W8A16` experts through their own latent-MoE kernels; see
+`W8A16` experts, and `W4A16_AFFINE` experts (INT4 affine, group 32; not a
+ModelOpt format), through their own latent-MoE kernels; see
 [Olala weight-only checkpoints](olala.md) for their layout.
 
 Every `W8A16` module needs its own `quantized_layers` entry. The layers run

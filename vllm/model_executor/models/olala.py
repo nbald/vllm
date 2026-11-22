@@ -201,7 +201,7 @@ class OlalaSharedMLP(nn.Module):
 
 
 def _int8_moe_config(quant_config, prefix: str) -> bool:
-    """ModelOpt MIXED_PRECISION layer with W8A16 INT8
+    """ModelOpt MIXED_PRECISION layer with W8A16 INT8 (or W4A16_AFFINE INT4)
     routed experts and a W8A16 or bf16 shared expert (both projections alike)
     and latent projections: the weight-only paths of latent_moe_int8.py."""
     if quant_config is None or quant_config.get_name() != "modelopt_mixed":
@@ -209,7 +209,7 @@ def _int8_moe_config(quant_config, prefix: str) -> bool:
     algo = quant_config._resolve_quant_algo
     shared = {algo(f"{prefix}.shared_experts.{p}") for p in ("up_proj", "down_proj")}
     return (
-        algo(f"{prefix}.experts") == "W8A16"
+        algo(f"{prefix}.experts") in ("W8A16", "W4A16_AFFINE")
         and len(shared) == 1
         and shared.pop() in ("W8A16", None)
         and all(
@@ -608,7 +608,7 @@ class OlalaLatentMoE(nn.Module):
         router_logits: torch.Tensor | None,
         x_in: torch.Tensor | None,
     ) -> torch.Tensor:
-        """W8A16 INT8 routed + W8A16 shared experts: the
+        """W8A16 INT8 (or W4A16 INT4 affine) routed + W8A16 shared experts: the
         small / medium paths of latent_moe_int8.py up to MEDIUM_BATCH_MAX_TOKENS
         tokens, its sorted grouped GEMMs (or the FusedMoE, Triton int8_w8a16,
         for per-row INT8) and W8A16 linears beyond (prefill)."""
@@ -677,7 +677,7 @@ class OlalaLatentMoE(nn.Module):
     @staticmethod
     def _int8_own_prefill(w13: WqWeight) -> bool:
         """Prefill routed experts through latent_moe_int8.wq_routed_experts
-        (always for per-group scales; per-row ones too by default:
+        (always for per-group scales and INT4; per-row ones too by default:
         OLALA_INT8_MOE_PREFILL=vllm takes vLLM's Triton int8_w8a16 FusedMoE,
         2 % slower on 64 x 1k / 8 x 8k prefills on an RTX 5090)."""
         mode = os.environ.get("OLALA_INT8_MOE_PREFILL", "olala")
@@ -713,9 +713,13 @@ class OlalaLatentMoE(nn.Module):
         if self._int8_w is None:
             re = self.experts.routed_experts
             w13, w2 = re.w13_weight, re.w2_weight
-            s13, s2 = getattr(re, "w13_scale", None), getattr(re, "w2_scale", None)
+            int4 = hasattr(re, "w4a16_affine_group")
+            if int4:  # W4A16_AFFINE: interleaved scale / bias (modelopt_w8a16)
+                s13, s2 = getattr(re, "w13_sb", None), getattr(re, "w2_sb", None)
+            else:
+                s13, s2 = getattr(re, "w13_scale", None), getattr(re, "w2_scale", None)
             ok = (
-                w13.dtype == w2.dtype == torch.int8
+                w13.dtype == w2.dtype == (torch.uint8 if int4 else torch.int8)
                 and w13.is_contiguous()
                 and w2.is_contiguous()
                 and s13 is not None
@@ -731,6 +735,8 @@ class OlalaLatentMoE(nn.Module):
             ]
             if not ok or None in dense:
                 raise ValueError("Unsupported Olala weight-only MoE parameter layout.")
+            elif int4:
+                self._int8_w = (WqWeight(w13, s13), WqWeight(w2, s2), *dense)
             else:
                 # per-row scales fp32, per-group ones as stored (fp16)
                 self._int8_w = (
@@ -1585,7 +1591,37 @@ class OlalaForCausalLM(
                     layer_idx = -1
                 if layer_idx in moe_layers:
                     target_prefix = f"model.layers.{layer_idx}.mlp"
-                    if tail in (
+                    routed = self.model.layers[layer_idx].mlp.experts.routed_experts
+                    int4_tail = tail.startswith(
+                        ("experts.experts.", "experts.output_experts.")
+                    ) and hasattr(routed, "w4a16_affine_group")
+                    if int4_tail:
+                        # ModelOpt W4A16_AFFINE experts (single rank): packed codes,
+                        # bf16 group scales and biases, every expert of the layer.
+                        is_w1 = tail.startswith("experts.experts.")
+                        suffix = tail.split(".", 2)[2]
+                        pname = (
+                            f"{'w13' if is_w1 else 'w2'}_"
+                            + {
+                                "weight": "weight",
+                                "weight_scale": "scale",
+                                "weight_bias": "qbias",
+                            }[suffix]
+                        )
+                        param = getattr(routed, pname)
+                        if (
+                            param.shape != loaded_weight.shape
+                            or param.dtype != loaded_weight.dtype
+                        ):
+                            raise ValueError(
+                                f"Olala load_weights: {name} is {loaded_weight.dtype} "
+                                f"{tuple(loaded_weight.shape)}, expected {param.dtype} "
+                                f"{tuple(param.shape)}."
+                            )
+                        param.data.copy_(loaded_weight)
+                        loaded.add(f"{target_prefix}.experts.{pname}")
+                        handled = True
+                    elif tail in (
                         "experts.experts.weight",
                         "experts.output_experts.weight",
                     ):

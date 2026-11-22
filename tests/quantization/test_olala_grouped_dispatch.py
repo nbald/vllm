@@ -18,11 +18,12 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 
+@pytest.mark.parametrize("algo", ["W8A16", "W4A16_AFFINE"])
 @pytest.mark.skipif(
     not current_platform.is_cuda() or not current_platform.has_device_capability(80),
     reason="Olala weight-only MoE requires CUDA BF16",
 )
-def test_grouped_experts_with_small_path_disabled(monkeypatch, dist_init):
+def test_grouped_experts_with_small_path_disabled(monkeypatch, dist_init, algo):
     monkeypatch.setenv("OLALA_MOE_SMALL", "0")
     monkeypatch.setenv("OLALA_INT8_MOE_PREFILL", "vllm")
     # Load the public model configuration only. The test supplies every weight.
@@ -45,7 +46,7 @@ def test_grouped_experts_with_small_path_disabled(monkeypatch, dist_init):
             "quantization": {
                 "quant_algo": "MIXED_PRECISION",
                 "quantized_layers": {
-                    f"{prefix}.experts": {"quant_algo": "W8A16", "group_size": 32}
+                    f"{prefix}.experts": {"quant_algo": algo, "group_size": 32}
                 },
                 "exclude_modules": [],
             }
@@ -76,3 +77,18 @@ def test_grouped_experts_with_small_path_disabled(monkeypatch, dist_init):
         expected[0, 0] = 4
         with set_forward_context(None, config):
             torch.testing.assert_close(layer(inputs), expected, rtol=0, atol=0)
+
+            if algo == "W4A16_AFFINE":
+                # Reload the named checkpoint tensors after the first forward
+                # has cached the interleaved affine pairs.
+                packed = routed.w2_sb
+                bias = torch.zeros_like(routed.w2_qbias)
+                bias[:, 0, 0] = 1
+                routed.load_state_dict(
+                    {"w2_scale": torch.full_like(routed.w2_scale, 2), "w2_qbias": bias},
+                    strict=False,
+                )
+                routed.quant_method.process_weights_after_loading(routed)
+                assert routed.w2_sb is packed
+                expected[0, 0] = 12  # ReLU²(2) * (2 * code_1 + 1)
+                torch.testing.assert_close(layer(inputs), expected, rtol=0, atol=0)

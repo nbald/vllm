@@ -85,7 +85,7 @@ def mixer_quant_config(quant_config):
     formats = {
         info["quant_algo"].upper() for info in quant_config.quantized_layers.values()
     }
-    if "W8A16" in formats and formats <= {"W8A16"}:
+    if "W8A16" in formats and formats <= {"W8A16", "W4A16_AFFINE"}:
         return quant_config
     return None
 

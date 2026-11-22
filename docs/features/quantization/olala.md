@@ -10,6 +10,7 @@ except that linear weights are stored as INT8 with their scales.
 |---|---|---|
 | Q8 | `W8A16` per channel, every linear including `lm_head` | 7.1 GB |
 | Q8 group-32 | `W8A16` with `group_size: 32` | 7.5 GB |
+| Q4A2 | routed experts `W4A16_AFFINE` (`group_size: 32`), every other linear `W8A16` per channel | 5.0 GB |
 
 ## Container
 
@@ -39,7 +40,9 @@ the same `quant_algo`, `quantized_layers` and `exclude_modules`. The
 checkpoints are not produced by NVIDIA Model Optimizer; they follow its
 mixed-precision layout, and `producer.version` names the exporter and recipe
 (`olala-q8-int8ch-rtn-1.0`: INT8 per channel, round to nearest;
-`olala-q8-int8g32-rtn-1.0`: group 32).
+`olala-q8-int8g32-rtn-1.0`: group 32; `olala-q4a2-int4g32affine-gptq-1.0`:
+Q4A2 with GPTQ-calibrated expert codes). `W4A16_AFFINE` is specific to these
+checkpoints; it is not a ModelOpt `quant_algo`.
 
 `quantized_layers` has one entry per quantized module, keyed by module name
 (next section). An entry carries `quant_algo` and, for grouped scales,
@@ -109,6 +112,25 @@ single-row GEMV), and some prefill shapes dequantize the whole weight to bf16
 for cuBLAS. Each of these matches a bf16 GEMM over the dequantized weights
 within bf16 rounding. The router stays fp32 and its logits are fp32.
 
+## W4A16_AFFINE: INT4 affine routed experts
+
+Used for the routed experts (`model.layers.i.mlp.experts`) only, with
+`"group_size": 32`. For each of the two expert weights (`M'` =
+`...mlp.experts.experts` and `...mlp.experts.output_experts`):
+
+- `M'.weight`: `uint8` `[E, N, K / 2]`. Byte `j` of row `n` holds the 4-bit
+  code `q[n, 2j]` in bits 0-3 and `q[n, 2j + 1]` in bits 4-7; codes are
+  unsigned, in `[0, 15]`. This is MLX's affine 4-bit layout (eight codes per
+  little-endian `uint32`, least significant first) viewed as bytes.
+- `M'.weight_scale`: `bfloat16` `[E, N, K / 32]`.
+- `M'.weight_bias`: `bfloat16` `[E, N, K / 32]`.
+- `w[n, k] = weight_scale[n, k // 32] * q[n, k] + weight_bias[n, k // 32]`.
+
+For the 7A1B model, `experts.weight` is `[256, 768, 192]` with scales and
+biases `[256, 768, 12]`, and `output_experts.weight` is `[256, 384, 384]` with
+`[256, 384, 24]`. vLLM evaluates `scale * q + bias` in fp32 (the product is
+exact) and rounds the weight to bf16 before the matrix multiply.
+
 ## Export
 
 `tools/olala/build_q8.py` writes these checkpoints from the bf16 release with
@@ -124,6 +146,10 @@ python tools/olala/build_q8.py --base /path/to/Olala-v1.0-mini-7A1B --verify /pa
 Per channel, `scale = max|w_row| / 127`; per group,
 `d = max|w_group| / 127` stored as fp16. `q = round(w / scale)`, rounded half
 away from zero and clipped to `[-127, 127]`.
+
+The Q4A2 exporter is not published yet: its expert codes come from a GPTQ
+calibration pipeline that will be released with it. The dense `W8A16` part
+of Q4A2 follows the Q8 recipe above.
 
 ## Serving with vLLM
 

@@ -12,7 +12,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_GEMV` | `1` | Single-token Triton GEMV for decode projections; `0` = regular GEMM. |
 | `OLALA_TPA_CONCAT` | `1` | One GEMM over the concatenated DiffTPA input projections; `0` = separate projections. |
 | `OLALA_MOE_SMALL` | `1` | Small-batch latent-MoE decode path (gather-GEMV kernels); `0` = generic fused-MoE pipeline. |
-| `OLALA_MOE_INT8` | `1` | W8A16 checkpoints: latent-MoE decode through the weight-only small and medium kernels (`latent_moe_int8.py`), per-channel routed-expert prefill through Olala's grouped GEMMs. `0` = per-channel INT8 experts through vLLM's `int8_w8a16` fused MoE at every batch size; group-32 experts keep Olala's grouped GEMMs. |
+| `OLALA_MOE_INT8` | `1` | W8A16 checkpoints: latent-MoE decode through the weight-only small and medium kernels (`latent_moe_int8.py`), per-channel routed-expert prefill through Olala's grouped GEMMs. `0` = per-channel INT8 experts through vLLM's `int8_w8a16` fused MoE at every batch size; group-32 and INT4 affine (`W4A16_AFFINE`) experts keep Olala's grouped GEMMs. |
 | `OLALA_INT8_MOE_PREFILL` | `olala` | W8A16 checkpoints, prefill of per-channel INT8 routed experts: `olala` = Olala's grouped GEMMs, `vllm` = vLLM's `int8_w8a16` fused MoE (2 % slower on an RTX 5090). |
 | `VLLM_W8A16_INT8_DECODE` | `1` | W8A16 checkpoints: Triton decode kernels (GEMV, skinny GEMM) for the INT8 linears; `0` = prefill kernels at every batch size. Declared in `vllm/envs.py`, like `VLLM_W8A16_INT8_DEQ_SCRATCH_MB` (default `48`, the dequantization buffer of the prefill path). |
 | `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
@@ -35,8 +35,8 @@ ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or
 
 ### Quantized checkpoints
 
-Single-GPU W8A16 (INT8 weight-only) checkpoints in the ModelOpt `MIXED_PRECISION` layout are served with
-`vllm serve <dir> --trust-remote-code`. Their format and the exporter, `tools/olala/build_q8.py`, are documented
+Single-GPU W8A16 (INT8 weight-only) checkpoints, and Q4A2 checkpoints with INT4 affine (`W4A16_AFFINE`) routed
+experts, in the ModelOpt `MIXED_PRECISION` layout are served with `vllm serve <dir> --trust-remote-code`. Their format and the exporter, `tools/olala/build_q8.py`, are documented
 in [docs/features/quantization/olala.md](docs/features/quantization/olala.md).
 
 Chunked prefill is on by default, as for any vLLM model (`OLALA_CHUNKED_PREFILL` is no longer read): it bounds
