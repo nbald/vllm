@@ -35,6 +35,17 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     decode_gemv,
 )
 from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+from vllm.model_executor.layers.mamba.olala.w8a16_layers import (
+    cat_int8_rows_shared,
+    is_int8_quant_method,
+    mixer_quant_config,
+)
+from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
+    Segment,
+    int8_decode_linear,
+    int8_decode_max_m,
+    int8_prefill_mm,
+)
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
@@ -64,6 +75,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
@@ -281,12 +293,15 @@ class OlalaDiffTPAAttention(PluggableLayer):
 
         # Head-axis projections are column-parallel so each rank owns its own
         # head slice; the shared TPA bases are replicated.
+        qc = mixer_quant_config(vllm_config.quant_config)
+
         def column(out_features: int, name: str) -> ColumnParallelLinear:
             return ColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_size=out_features,
                 bias=False,
                 gather_output=False,
+                quant_config=qc,
                 prefix=f"{prefix}.{name}",
             )
 
@@ -295,6 +310,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
                 input_size=self.hidden_size,
                 output_size=out_features,
                 bias=False,
+                quant_config=qc,
                 prefix=f"{prefix}.{name}",
             )
 
@@ -422,7 +438,12 @@ class OlalaDiffTPAAttention(PluggableLayer):
     ) -> None:
         n = hidden_states.shape[0]
 
-        if self._proj_concat_ok and os.environ.get("OLALA_TPA_CONCAT", "1") != "0":
+        if self._int8_concat_ok and os.environ.get("OLALA_TPA_CONCAT", "1") != "0":
+            # INT8 projections first, bf16 ones after: one launch / one GEMM
+            parts = self._int8_proj(hidden_states)
+            q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]
+            shift_alphas = tuple(parts[6:]) if self.token_shift else None
+        elif self._proj_concat_ok and os.environ.get("OLALA_TPA_CONCAT", "1") != "0":
             # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
             w_all = self._decode_proj_weight()
@@ -768,12 +789,90 @@ class OlalaDiffTPAAttention(PluggableLayer):
             and self.head_dim & (self.head_dim - 1) == 0
         )
 
+    def _proj_modules(self) -> tuple:
+        mods = (
+            self.c_q,
+            self.W_A_k,
+            self.W_A_v,
+            self.W_B_k,
+            self.W_B_v,
+            self.lambda_proj,
+        )
+        if self.token_shift:
+            mods = mods + (self.shift_proj_k, self.shift_proj_v)
+        return mods
+
+    def _n_quantized(self) -> int:
+        """Leading projections with a quantized weight (-1: not a prefix)."""
+        q = [
+            not isinstance(m.quant_method, UnquantizedLinearMethod)
+            for m in self._proj_modules()
+        ]
+        k = q.index(False) if False in q else len(q)
+        return k if not any(q[k:]) else -1
+
     @property
     def _proj_concat_ok(self) -> bool:
-        return get_tensor_model_parallel_world_size() == 1 and all(
-            m.bias is None for m in (self.c_q, self.W_A_k, self.W_A_v, self.W_B_k,
-                                     self.W_B_v, self.lambda_proj)
+        return (
+            get_tensor_model_parallel_world_size() == 1
+            and all(m.bias is None for m in self._proj_modules())
+            and self._n_quantized() == 0
         )
+
+    @property
+    def _int8_concat_ok(self) -> bool:
+        return (
+            is_int8_quant_method(self.c_q)
+            and get_tensor_model_parallel_world_size() == 1
+            and all(m.bias is None for m in self._proj_modules())
+            and self._n_quantized() > 0
+            and self._int8_proj_state() is not None
+        )
+
+    def _int8_proj_state(self) -> tuple | None:
+        """(decode segments, INT8 weight, bf16 weight, sizes) of the concatenated
+        projections ``[INT8 ... | bf16 ...]``, sharing their parameters' storage
+        (W8A16 INT8 checkpoints); built on the first call (the profiling run).
+        None if a layout is not supported (each projection runs its own linear)."""
+        st = getattr(self, "_int8_st", None)
+        if st is None:
+            mods = self._proj_modules()
+            k = self._n_quantized()
+            mods8, mods16 = mods[:k], mods[k:]
+            w8 = (
+                cat_int8_rows_shared(list(mods8))
+                if all(is_int8_quant_method(m) for m in mods8)
+                else None
+            )
+            if w8 is None:
+                st = ()
+            else:
+                segs = [Segment(w8.weight, w8.scale)]
+                w16 = None
+                if mods16:
+                    w16 = cat_rows_shared([m.weight for m in mods16])
+                    segs.append(Segment(w16, col0=w8.n))
+                st = (segs, w8, w16, [m.output_size_per_partition for m in mods])
+            self._int8_st = st
+        return st or None
+
+    def _int8_proj(self, h: torch.Tensor) -> list[torch.Tensor]:
+        """``[q, A_k, A_v, B_k, B_v, lambda, shift ...]`` views of one ``(n, W)``
+        buffer: W8A16 decode kernels up to int8_decode_max_m rows, one W8A16
+        prefill GEMM over the concatenated INT8 weight beyond (+ the bf16 rows)."""
+        segs, w8, w16, sizes = self._int8_proj_state()
+        n = h.shape[0]
+        width = sum(sizes)
+        n16 = 0 if w16 is None else w16.shape[0]
+        if 0 < n <= int8_decode_max_m(width, w8.k, n16):
+            out = int8_decode_linear(h, segs, width=width)
+        elif w16 is None:
+            out = int8_prefill_mm(h, w8)
+        else:
+            out = torch.empty(n, width, dtype=h.dtype, device=h.device)
+            out[:, : w8.n] = int8_prefill_mm(h, w8)
+            out[:, w8.n :] = F.linear(h, w16)
+        return list(torch.split(out, sizes, dim=-1))
 
     def _decode_proj_weight(self) -> torch.Tensor:
         """Concatenated [c_q; W_A_k; W_A_v; W_B_k; W_B_v; lambda_proj] weights

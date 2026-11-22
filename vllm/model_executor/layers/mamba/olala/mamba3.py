@@ -31,6 +31,20 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     cat_rows_shared,
     decode_gemv,
 )
+from vllm.model_executor.layers.mamba.olala.w8a16_layers import (
+    cat_int8_rows_shared,
+    int8_apply,
+    int8_linear_weight,
+    is_int8_quant_method,
+    mixer_int8_rows,
+    mixer_quant_config,
+)
+from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
+    Segment,
+    int8_decode_linear,
+    int8_decode_max_m,
+    int8_prefill_mm,
+)
 from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.geo_linear import (
@@ -413,11 +427,15 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # ``[h0: z(headdim), x(headdim), dt, A, trap | h1: ... ]``, total width
         # ``nheads * (2*headdim + 3)``. Splitting the output axis by TP
         # therefore yields a clean per-head shard.
+        int8_qc = mixer_int8_rows(vllm_config.quant_config, f"{prefix}.in_proj")
+        self._int8_in_proj = int8_qc is not None
+        self._int8_st: tuple | None = None
         self.in_proj = ColumnParallelLinear(
             input_size=self.d_model,
             output_size=self.d_inner * 2 + 3 * self.nheads,
             bias=False,
             gather_output=False,
+            quant_config=int8_qc,
             prefix=f"{prefix}.in_proj",
         )
         # in_proj_dyn produces B/C (per group, shared across heads) and the
@@ -428,6 +446,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 2 * self.ngroups * self.d_state * self.mimo_dim + self.num_rope_angles
             ),
             bias=False,
+            quant_config=mixer_quant_config(vllm_config.quant_config),
             prefix=f"{prefix}.in_proj_dyn",
         )
 
@@ -439,6 +458,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self._pre_geo: nn.Module | None = None
         self._in_proj_cat_ok = (
             tp == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None
+            and not self._int8_in_proj
+            and not is_int8_quant_method(self.in_proj_dyn)
         )
 
         head_shard = {"weight_loader": sharded_weight_loader(0)}
@@ -636,6 +657,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 and md.spec is None
                 and self._replay is None
                 and n <= GEO_LINEAR_MAX_TOKENS
+                and self._in_proj_cat_ok
                 and self._raw_step_ok(tuple(self.kv_cache[:4]))
             ):
                 cat = geo_linear(
@@ -713,6 +735,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         the preamble kernel takes the resulting row stride), streaming GEMV at
         batch 1. Otherwise the two parallel linears.
         """
+        if self._int8_in_proj:
+            segs, n1, width, n16, _ = self._int8_state()
+            if 0 < u.shape[0] <= int8_decode_max_m(width, u.shape[1], n16):
+                out = int8_decode_linear(u, segs, width=width)
+                return out[:, :n1], out[:, n1:]
+            return self._int8_parts(u)
         if self._in_proj_cat_ok:
             w = self._in_proj_cat_weight()
             out = decode_gemv(u, w)
@@ -721,6 +749,53 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         zxdt, _ = self.in_proj(u)
         bc, _ = self.in_proj_dyn(u)
         return zxdt, bc
+
+    def _int8_state(self) -> tuple:
+        """(decode segments, in_proj rows, width, bf16 rows, concatenated INT8
+        weight or None): ``[in_proj ; in_proj_dyn]`` as one INT8 weight (shared
+        storage) when both are INT8, else INT8 in_proj + bf16 in_proj_dyn rows
+        in the same launch. Built on the first call (the profiling run)."""
+        if self._int8_st is None:
+            n1 = self.in_proj.output_size_per_partition
+            n2 = self.in_proj_dyn.output_size_per_partition
+            cat = None
+            if self.in_proj_dyn.weight.dtype == torch.int8:
+                cat = cat_int8_rows_shared([self.in_proj, self.in_proj_dyn])
+                segs, n16 = ([Segment(cat.weight, cat.scale)] if cat else None), 0
+            else:
+                w8 = int8_linear_weight(self.in_proj)
+                segs = (
+                    [
+                        Segment(w8.weight, w8.scale),
+                        Segment(self.in_proj_dyn.weight, col0=n1),
+                    ]
+                    if w8
+                    else None
+                )
+                n16 = n2
+            if segs is None:
+                raise RuntimeError(
+                    f"{self.prefix}.in_proj: unsupported INT8 weight layout"
+                )
+            self._int8_st = (segs, n1, n1 + n2, n16, cat)
+        return self._int8_st
+
+    def _int8_parts(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """INT8 in_proj, prefill / large batches: ``(zxdt, bc)``, row views of one
+        W8A16 GEMM over the concatenated weight (two GEMMs with a bf16
+        in_proj_dyn)."""
+        _, n1, width, _, cat = self._int8_state()
+        if cat is not None:
+            y = int8_prefill_mm(h, cat)
+            return y[:, :n1], y[:, n1:]
+        return int8_apply(self.in_proj, h), self.in_proj_dyn(h)[0]
+
+    def _raw_in_proj_ok(self, n: int) -> bool:
+        """The raw CUDA step needs in_proj and in_proj_dyn in the same buffer."""
+        if not self._int8_in_proj:
+            return self._in_proj_cat_ok
+        _, _, width, n16, cat = self._int8_state()
+        return cat is not None or n <= int8_decode_max_m(width, self.d_model, n16)
 
     def _in_proj_cat_weight(self) -> torch.Tensor:
         if self._in_proj_cat_w is None:
@@ -757,7 +832,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
 
     def _project_in(self, h: torch.Tensor):
         """Run in_proj/in_proj_dyn on ``(N, D)`` and unpack the pieces."""
-        if h.shape[0] == 1 and self.in_proj.bias is None:
+        if h.shape[0] == 1 and not self._int8_in_proj and self.in_proj.bias is None:
             # Single-token decode: streaming GEMVs beat cuBLAS's batch-1 floor.
             zxdtAtrap = decode_gemv(h, self.in_proj.weight)
         else:
@@ -769,7 +844,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         A = per_head[..., 2 * self.headdim + 1]
         trap = per_head[..., 2 * self.headdim + 2]
 
-        if h.shape[0] == 1 and self.in_proj_dyn.bias is None:
+        if (
+            h.shape[0] == 1
+            and not is_int8_quant_method(self.in_proj_dyn)
+            and self.in_proj_dyn.bias is None
+        ):
             bc = decode_gemv(h, self.in_proj_dyn.weight)
         else:
             bc, _ = self.in_proj_dyn(h)
@@ -828,6 +907,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         activation peak (sizing the KV cache from a zeroed output left too
         little headroom on 20 GB GPUs), and the TileLang / Triton JIT and
         autotuning run before the KV cache is allocated."""
+        if self._int8_in_proj:
+            self._int8_state()
         if self._in_proj_cat_ok:
             self._in_proj_cat_weight()  # decode-time weight cache, before KV sizing
         if self._hybrid_ok and self._pf_split_ok(h.device):
@@ -1008,6 +1089,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 n1, n2 = self.in_proj.weight.shape[0], self.in_proj_dyn.weight.shape[0]
                 y = F.linear(h, self._in_proj_cat_weight())
                 zxdt, bc = y[:, :n1], y[:, n1 : n1 + n2]
+            elif self._int8_in_proj:
+                zxdt, bc = self._int8_parts(h)
             else:
                 zxdt, _ = self.in_proj(h)
                 bc, _ = self.in_proj_dyn(h)
@@ -1249,7 +1332,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # norm. They also keep DT/trap in fp32 where the eager chain rounded
         # to bf16 per op, so greedy output can differ within bf16 noise.
         fuse_preamble = self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)
-        if fuse_preamble and self._raw_step_ok(pools):
+        if (
+            fuse_preamble
+            and self._raw_step_ok(pools)
+            and self._raw_in_proj_ok(u.shape[0])
+        ):
             self._decode_raw_step(u, out, slots, pools)
             return
         if fuse_preamble:
@@ -1382,7 +1469,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         angle_pool, ssm_pool, k_pool, v_pool = pools
         return (
             _RAW_STEP
-            and self._in_proj_cat_ok
+            and (self._in_proj_cat_ok or self._int8_in_proj)
             and not self._postgate_norm
             and self.headdim <= _STEP_TILE_D
             and cuda_step_enabled()
