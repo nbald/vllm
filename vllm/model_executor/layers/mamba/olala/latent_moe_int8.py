@@ -15,7 +15,7 @@ from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
 
 # Weight formats (constexpr FMT)
-FMT_BF16, FMT_ROW, FMT_GROUP = 0, 1, 2
+FMT_BF16, FMT_ROW, FMT_GROUP, FMT_INT4 = 0, 1, 2, 3
 
 
 @dataclass
@@ -23,14 +23,31 @@ class WqWeight:
     """A weight-only quantized ``[N, K]`` (dense) or ``[E, N, K]`` (experts)
     matrix as the kernels read it."""
 
-    # Row-major INT8 or BF16 matrix (with an optional expert index).
+    # int8 [(E,) N, K]; bf16 for FMT_BF16; uint8 [(E,) N, K // 2] for FMT_INT4
     weight: torch.Tensor
-    # FP32 per-row or FP16 per-group scale.
+    # fp32 [(E,) N] or fp16 / fp32 [(E,) N, K // G]; FMT_INT4: int32
+    # [(E,) N, K // G], bf16 scale in the low and bf16 bias in the high half
     scale: torch.Tensor | None = None
 
     def __post_init__(self):
         assert self.weight.is_contiguous()
         assert self.scale is None or self.scale.is_contiguous()
+        assert self.weight.dtype != torch.uint8 or (
+            self.scale is not None and self.scale.dtype == torch.int32
+        )
+
+    @classmethod
+    def int4_affine(
+        cls, packed: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor
+    ) -> "WqWeight":
+        """INT4 affine weight, MLX q4 layout: ``w[.., n, k] = s[.., n, k // G] *
+        q[.., n, k] + b[.., n, k // G]`` (fp32, rounded to bf16), q in [0, 15]
+        with ``packed[.., n, j] = q[.., n, 2j] | q[.., n, 2j + 1] << 4``;
+        ``scale`` / ``bias`` bf16 ``[(E,) N, K // G]``."""
+        assert packed.dtype == torch.uint8
+        assert scale.dtype == bias.dtype == torch.bfloat16 and scale.shape == bias.shape
+        sb = torch.stack((scale, bias), dim=-1).contiguous().view(torch.int32)
+        return cls(packed.contiguous(), sb.squeeze(-1).contiguous())
 
     @property
     def n(self) -> int:
@@ -38,18 +55,20 @@ class WqWeight:
 
     @property
     def k(self) -> int:
-        return self.weight.shape[-1]
+        return self.weight.shape[-1] * (2 if self.fmt == FMT_INT4 else 1)
 
     @property
     def fmt(self) -> int:
         if self.scale is None:
             return FMT_BF16
+        if self.weight.dtype == torch.uint8:
+            return FMT_INT4
         return FMT_ROW if self.scale.dim() == self.weight.dim() - 1 else FMT_GROUP
 
     @property
     def group(self) -> int:
-        """G for FMT_GROUP (1 otherwise: unused constexpr)."""
-        if self.fmt == FMT_GROUP:
+        """G for FMT_GROUP / FMT_INT4 (1 otherwise: unused constexpr)."""
+        if self.fmt in (FMT_GROUP, FMT_INT4):
             return self.k // self.scale.shape[-1]
         return 1
 
@@ -72,13 +91,45 @@ def _wq_expert(
     G: tl.constexpr,
 ):
     """Weight and scale pointers of expert ``e`` of an ``[E, N, KD]`` weight."""
-    if FMT == 2:
+    if FMT == 3:
+        w = w_ptr + e * N * (KD // 2)
+        s = s_ptr + e * N * (KD // G)
+    elif FMT == 2:
         w = w_ptr + e * N * KD
         s = s_ptr + e * N * (KD // G)
     else:
         w = w_ptr + e * N * KD
         s = s_ptr + e * N
     return w, s
+
+
+@triton.jit
+def _i4_tiles(
+    w_ptr,
+    s_ptr,
+    offs_n,
+    k0,
+    KD: tl.constexpr,
+    G: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """FMT_INT4: the even (``k0 + 2j``) and odd (``k0 + 2j + 1``) columns of
+    ``W[offs_n, k0:k0 + BK]^T`` as two ``[BK / 2, BN]`` bf16 tiles of
+    ``s * q + b`` computed in fp32 (``s * q`` is exact). The codes become fp32
+    through the 2^23 exponent trick, the bf16 scale / bias by a shift."""
+    BKH: tl.constexpr = BK // 2
+    offs_h = k0 // 2 + tl.arange(0, BKH)
+    p = tl.load(w_ptr + offs_n[None, :] * (KD // 2) + offs_h[:, None]).to(tl.int32)
+    offs_g = k0 // G + tl.arange(0, BK // G)
+    sb = tl.load(s_ptr + offs_n[None, :] * (KD // G) + offs_g[:, None])
+    s = tl.expand_dims((sb << 16).to(tl.float32, bitcast=True), 1)
+    b = tl.expand_dims((sb & -65536).to(tl.float32, bitcast=True), 1)
+    lo = ((p & 15) | 0x4B000000).to(tl.float32, bitcast=True) - 8388608.0
+    hi = ((p >> 4) | 0x4B000000).to(tl.float32, bitcast=True) - 8388608.0
+    lo = tl.reshape(tl.reshape(lo, [BK // G, G // 2, BN]) * s + b, [BKH, BN])
+    hi = tl.reshape(tl.reshape(hi, [BK // G, G // 2, BN]) * s + b, [BKH, BN])
+    return lo.to(tl.bfloat16), hi.to(tl.bfloat16)
 
 
 @triton.jit
@@ -95,6 +146,9 @@ def _wq_tile_t(
 ):
     """Load a BF16 weight tile with K as the leading dimension.
     Group scales are applied here and per-row scales in the epilogue."""
+    if FMT == 3:
+        lo, hi = _i4_tiles(w_ptr, s_ptr, offs_n, k0, KD, G, BK, BN)
+        return tl.reshape(tl.permute(tl.join(lo, hi), (0, 2, 1)), [BK, BN])
     offs_k = k0 + tl.arange(0, BK)
     w = tl.load(w_ptr + offs_n[None, :] * KD + offs_k[:, None])
     if FMT == 2:
@@ -212,7 +266,7 @@ def _i8_small_up_kernel(
     bias_ptr,  # [E] fp32
     ids_ptr,  # [M*K] int32 out
     tw_ptr,  # [M*K] fp32 out (normalized routing weights)
-    w1_ptr,  # [E, N, D] int8
+    w1_ptr,  # [E, N, D] int8 (FMT_INT4: [E, N, D // 2] uint8)
     w1s_ptr,  # [E, N] / [E, N, D // G1] scales
     h_ptr,  # [M*K, N] bf16 out: relu^2
     hid_ptr,  # [M, H] bf16 block input (shared expert)
@@ -334,6 +388,24 @@ def _wq_gemv_x(
     """``[BN]`` fp32 = ``deq(W)[offs_n, :KD] @ a`` for the activation row at
     ``a_ptr + a_off`` (bf16 or fp32 rounded to bf16), fp32 FMAs, row scales
     applied."""
+    if FMT == 3:
+        # even / odd columns as two half tiles: no interleave of the codes
+        offs_h = tl.arange(0, BK // 2)
+        acc4 = tl.zeros([BK // 2, BN], dtype=tl.float32)
+        for k0 in tl.range(0, KD, BK):
+            a_lo = (
+                tl.load(a_ptr + a_off + k0 + 2 * offs_h).to(tl.bfloat16).to(tl.float32)
+            )
+            a_hi = (
+                tl.load(a_ptr + a_off + k0 + 2 * offs_h + 1)
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            lo, hi = _i4_tiles(w_ptr, s_ptr, offs_n, k0, KD, G, BK, BN)
+            acc4 += (
+                lo.to(tl.float32) * a_lo[:, None] + hi.to(tl.float32) * a_hi[:, None]
+            )
+        return tl.sum(acc4, axis=0)
     offs_k = tl.arange(0, BK)
     acc = tl.zeros([BK, BN], dtype=tl.float32)
     for k0 in tl.range(0, KD, BK):
@@ -696,8 +768,34 @@ _SMALL = [
 ]
 
 
-def _pick_small(M: int):
-    table = _SMALL
+# INT4 affine routed experts (FMT_INT4; dense INT8 / bf16 as above, the exits
+# unchanged): RTX 5090 sweep (uniform routing, cold weights): 14.9 / 18.9 / 27.7 /
+# 31.4 us per layer at 1 / 2 / 8 / 12 tokens (INT8 14.8 / 21.3 / 31.2 / 37.7);
+# bench_latent_moe_int8.py --format int4-affine times these configs.
+_SMALL_I4 = [
+    (
+        1,
+        dict(_SMALL_UP, BN=16, BKS=512, num_warps=2, num_stages=2, GEMV=True),
+        dict(_SMALL_DOWN, BN=8, num_stages=2),
+        _SMALL[0][3],
+    ),
+    (
+        2,
+        dict(_SMALL_UP, BN=16, BKS=512, num_warps=2, num_stages=2, GEMV=True),
+        dict(_SMALL_DOWN, BN=8),
+        _SMALL[1][3],
+    ),
+    (
+        16,
+        dict(_SMALL_UP, BN=64, BKS=256, num_warps=2, num_stages=2),
+        dict(_SMALL_DOWN, BN=16, BK=128, num_warps=2, num_stages=2),
+        _SMALL[2][3],
+    ),
+]
+
+
+def _pick_small(M: int, fmt: int = FMT_ROW):
+    table = _SMALL_I4 if fmt == FMT_INT4 else _SMALL
     for mx, *cfgs in table:
         if mx >= M:
             return cfgs
@@ -736,8 +834,28 @@ _MEDIUM = [
 ]
 
 
-def _pick_medium(M: int):
-    table = _MEDIUM
+# INT4 affine routed experts: 35.3 / 41.9 / 50.5 / 61.1 us per layer at 16 / 32 /
+# 64 / 128 tokens (INT8 42.3 / 50.6 / 63.2 / 75.9), same sweep.
+_MEDIUM_I4 = [
+    (
+        64,
+        dict(_UP_MEDIUM, BLOCK_SIZE_K=128, num_stages=3),
+        dict(_DOWN_MEDIUM, num_warps=2, num_stages=2),
+        _MEDIUM[0][3],
+        False,
+    ),
+    (
+        512,
+        dict(_UP_MEDIUM, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128, BN_SH=64, num_stages=2),
+        dict(_DOWN_MEDIUM, num_stages=3),
+        _MEDIUM[1][3],
+        False,
+    ),
+]
+
+
+def _pick_medium(M: int, fmt: int = FMT_ROW):
+    table = _MEDIUM_I4 if fmt == FMT_INT4 else _MEDIUM
     for mx, *cfgs in table:
         if mx >= M:
             return cfgs
@@ -745,7 +863,7 @@ def _pick_medium(M: int):
 
 
 def _fit_bk(bk: int, w: WqWeight) -> int:
-    g = w.group if w.fmt == FMT_GROUP else 1
+    g = w.group if w.fmt in (FMT_GROUP, FMT_INT4) else 1
     return max(bk, g) if g > 1 else bk
 
 
@@ -778,7 +896,7 @@ def olala_moe_small_int8(
     tw = torch.empty(MK, dtype=torch.float32, device=dev)
     h = torch.empty(MK, N1, dtype=torch.bfloat16, device=dev)
     s = torch.empty(M, S, dtype=torch.bfloat16, device=dev)
-    up_cfg, down_cfg, exit_cfg = configs or _pick_small(M)
+    up_cfg, down_cfg, exit_cfg = configs or _pick_small(M, w13.fmt)
     cfg = dict(up_cfg)
     gemv = cfg.pop("GEMV", False) or gemv
     cfg["BK"] = _fit_bk(cfg["BK"], w13)
@@ -915,7 +1033,7 @@ def olala_moe_medium_int8(
     E, N1, D1 = w13.weight.shape[0], w13.n, w13.k
     D2 = w2.n
     S = shared_up.n
-    up_cfg, down_cfg, exit_cfg, sum_k = configs or _pick_medium(M)
+    up_cfg, down_cfg, exit_cfg, sum_k = configs or _pick_medium(M, w13.fmt)
     up_cfg, down_cfg, exit_cfg = dict(up_cfg), dict(down_cfg), dict(exit_cfg)
     up_cfg["BLOCK_SIZE_K"] = _fit_bk(up_cfg["BLOCK_SIZE_K"], w13)
     up_cfg["BKS"] = _fit_bk(up_cfg["BKS"], shared_up)
@@ -1181,6 +1299,9 @@ _PREFILL_DOWN = dict(
     num_warps=4,
     num_stages=3,
 )
+# INT4 affine experts, up and down: 102 / 417 us per layer for 1024 / 8192 tokens
+# (INT8 99 / 397; RTX 5090).
+_PREFILL_I4 = dict(_PREFILL_UP, BLOCK_SIZE_K=128, num_stages=2)
 
 
 def wq_routed_experts(
@@ -1209,7 +1330,11 @@ def wq_routed_experts(
     D2 = w2.n
     dev = x.device
     MK = M * top_k
-    up_cfg, down_cfg = configs or (_PREFILL_UP, _PREFILL_DOWN)
+    up_cfg, down_cfg = configs or (
+        (_PREFILL_I4, _PREFILL_I4)
+        if w13.fmt == FMT_INT4
+        else (_PREFILL_UP, _PREFILL_DOWN)
+    )
     up_cfg, down_cfg = dict(up_cfg), dict(down_cfg)
     up_cfg["BLOCK_SIZE_K"] = _fit_bk(up_cfg["BLOCK_SIZE_K"], w13)
     down_cfg["BLOCK_SIZE_K"] = _fit_bk(down_cfg["BLOCK_SIZE_K"], w2)

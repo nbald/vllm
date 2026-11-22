@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare the Olala W8A16 MoE paths to dequantized FP32 references."""
+"""Olala decode MoE with weight-only INT8 (W8A16) or INT4 affine (W4A16) routed
+experts, shared expert and fc2_latent (latent_moe_int8.py) must match a torch
+reference over the dequantized weights in fp32: per-row and per-group (32)
+INT8 scales, INT4 affine groups of 32 (MLX q4 layout) for the routed experts,
+bf16 shared / fc2 mixed in, small and medium paths, MMA and GEMV variants of
+the small path, the prefill grouped GEMMs."""
 
 import pytest
 import torch
@@ -11,12 +16,17 @@ if not current_platform.is_cuda() or not current_platform.has_device_capability(
     pytest.skip("bf16 mma.sync needs sm_80+", allow_module_level=True)
 
 from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import (  # noqa: E402
+    FMT_INT4,
     WqWeight,
+    _i4_tiles,
+    _wq_tile_t,
     olala_moe_medium_int8,
     olala_moe_small_int8,
 )
+from vllm.triton_utils import tl, triton  # noqa: E402
 
 E, TOPK, H, D1, N1, S = 256, 6, 1536, 384, 768, 1536
+INT4 = "int4"  # routed experts INT4 affine g32, the rest INT8 per row (Q4A2)
 
 
 def _roundf(x):
@@ -46,6 +56,49 @@ def _make(w: torch.Tensor, group: int):
     )
 
 
+def _mlx_affine_quantize(w: torch.Tensor, group: int = 32, bits: int = 4):
+    """mlx.core.quantize (affine mode, ops.cpp affine_quantize) from its
+    definition: per group of ``group`` along K, the larger-magnitude extreme is
+    the edge (exactly representable), q = clip(round((w - b) / s), 0, 15).
+    Returns (packed uint8 [..., N, K / 2] = MLX's uint32 words as little-endian
+    bytes), BF16 scales and biases, and the reference dequantized weights."""
+    n_bins = (1 << bits) - 1
+    wg = w.reshape(*w.shape[:-1], w.shape[-1] // group, group).float()
+    w_max, w_min = wg.amax(-1, keepdim=True), wg.amin(-1, keepdim=True)
+    mask = w_min.abs() > w_max.abs()
+    scale = ((w_max - w_min) / n_bins).clamp(min=1e-7)
+    scale = torch.where(mask, scale, -scale)
+    edge = torch.where(mask, w_min, w_max)
+    q0 = torch.round(edge / scale)
+    scale = torch.where(q0 != 0, edge / q0, scale)
+    bias = torch.where(q0 == 0, torch.zeros_like(edge), edge)
+    sb, bb = scale.bfloat16(), bias.bfloat16()
+    q = torch.clamp(torch.round((wg - bb.float()) / sb.float()), 0, n_bins).to(
+        torch.int64
+    )
+    q = q.reshape(w.shape)
+    # MLX packs 32 // bits codes per uint32 (least significant code first)
+    words = q.reshape(*w.shape[:-1], w.shape[-1] // 8, 8)
+    words = (words << (bits * torch.arange(8, device=w.device))).sum(-1).to(torch.int32)
+    packed = words.contiguous().view(torch.uint8)
+    deq = sb.float() * q.reshape(wg.shape).float() + bb.float()
+    return (
+        packed,
+        sb.squeeze(-1).contiguous(),
+        bb.squeeze(-1).contiguous(),
+        deq.reshape(w.shape).bfloat16().float(),
+    )
+
+
+def _make_int4(w: torch.Tensor):
+    packed, sb, bb, deq = _mlx_affine_quantize(w)
+    return WqWeight.int4_affine(packed, sb, bb), deq
+
+
+def _make_expert(w: torch.Tensor, group):
+    return _make_int4(w) if group == INT4 else _make(w, group)
+
+
 def _relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.relu(x.bfloat16().float()).square().bfloat16()
 
@@ -69,15 +122,15 @@ def _reference(hidden, latent, logits, bias, w13, w2, su, sd, fc2):
 
 
 def _setup(m: int, group, dense_bf16: bool):
-    torch.manual_seed(m + group)
+    torch.manual_seed(m + (1000 if group == INT4 else group))
     dev = "cuda"
     hidden = torch.randn(m, H, device=dev).bfloat16()
     latent = torch.randn(m, D1, device=dev)  # fp32, as the entry launch writes it
     logits = torch.randn(m, E, device=dev)
     bias = torch.randn(E, device=dev) * 0.1
-    w13, dq13 = _make(torch.randn(E, N1, D1, device=dev) * D1**-0.5, group)
-    w2, dq2 = _make(torch.randn(E, D1, N1, device=dev) * N1**-0.5, group)
-    dense_group = group
+    w13, dq13 = _make_expert(torch.randn(E, N1, D1, device=dev) * D1**-0.5, group)
+    w2, dq2 = _make_expert(torch.randn(E, D1, N1, device=dev) * N1**-0.5, group)
+    dense_group = 0 if group == INT4 else group
     if dense_bf16:
         su_b = (torch.randn(S, H, device=dev) * H**-0.5).bfloat16()
         sd_b = (torch.randn(H, S, device=dev) * S**-0.5).bfloat16()
@@ -93,7 +146,7 @@ def _setup(m: int, group, dense_bf16: bool):
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 5, 12])
-@pytest.mark.parametrize("group", [0, 32])
+@pytest.mark.parametrize("group", [0, 32, INT4])
 @pytest.mark.parametrize("gemv", [False, True])
 @pytest.mark.parametrize("dense_bf16", [False, True])
 def test_small_path_matches_reference(m, group, gemv, dense_bf16):
@@ -103,7 +156,7 @@ def test_small_path_matches_reference(m, group, gemv, dense_bf16):
 
 
 @pytest.mark.parametrize("m", [6, 33, 128, 512])
-@pytest.mark.parametrize("group", [0, 32])
+@pytest.mark.parametrize("group", [0, 32, INT4])
 def test_medium_path_matches_reference(m, group):
     args, ref = _setup(m, group, False)
     out = olala_moe_medium_int8(*args, TOPK, 2.45)
@@ -111,19 +164,19 @@ def test_medium_path_matches_reference(m, group):
 
 
 @pytest.mark.parametrize("m", [1, 100, 1000, 3000])
-@pytest.mark.parametrize("group", [0, 32])
+@pytest.mark.parametrize("group", [0, 32, INT4])
 def test_prefill_routed_experts(m, group):
     """wq_routed_experts (sorted grouped GEMMs, any batch) = the routed part of
     the reference."""
     from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import wq_routed_experts
 
-    torch.manual_seed(m + group)
+    torch.manual_seed(m + (1000 if group == INT4 else group))
     dev = "cuda"
     latent = torch.randn(m, D1, device=dev).bfloat16()
     logits = torch.randn(m, E, device=dev)
     bias = torch.randn(E, device=dev) * 0.1
-    w13, dq13 = _make(torch.randn(E, N1, D1, device=dev) * D1**-0.5, group)
-    w2, dq2 = _make(torch.randn(E, D1, N1, device=dev) * N1**-0.5, group)
+    w13, dq13 = _make_expert(torch.randn(E, N1, D1, device=dev) * D1**-0.5, group)
+    w2, dq2 = _make_expert(torch.randn(E, D1, N1, device=dev) * N1**-0.5, group)
     out = wq_routed_experts(latent, logits, bias, w13, w2, TOPK, 2.45)
     sc = torch.sigmoid(logits)
     ids = torch.topk(sc + bias, TOPK, dim=-1).indices
@@ -137,6 +190,58 @@ def test_prefill_routed_experts(m, group):
     torch.testing.assert_close(
         out.float(), (ref * 2.45).bfloat16().float(), atol=3e-2, rtol=3e-2
     )
+
+
+# -- INT4 affine: the kernels' dequantized tiles, bit for bit -------------------
+
+
+@triton.jit
+def _deq_tiles_kernel(
+    w_ptr,
+    s_ptr,
+    out_ptr,
+    out2_ptr,
+    N: tl.constexpr,
+    KD: tl.constexpr,
+    FMT: tl.constexpr,
+    G: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """Out = the MMA tiles (_wq_tile_t), out2 = the GEMV half tiles (_i4_tiles)
+    re-interleaved, both bf16 [N, KD]."""
+    offs_n = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
+    offs_k = tl.arange(0, BK)
+    offs_h = tl.arange(0, BK // 2)
+    for k0 in tl.range(0, KD, BK):
+        w = _wq_tile_t(w_ptr, s_ptr, offs_n, k0, KD, FMT, G, BK, BN)
+        tl.store(out_ptr + offs_n[None, :] * KD + (k0 + offs_k)[:, None], w)
+        lo, hi = _i4_tiles(w_ptr, s_ptr, offs_n, k0, KD, G, BK, BN)
+        tl.store(out2_ptr + offs_n[None, :] * KD + (k0 + 2 * offs_h)[:, None], lo)
+        tl.store(out2_ptr + offs_n[None, :] * KD + (k0 + 2 * offs_h + 1)[:, None], hi)
+
+
+@pytest.mark.parametrize("shape", [(N1, D1), (D1, N1)])
+@pytest.mark.parametrize("bk", [32, 64, 128])
+def test_int4_tiles_bit_exact(shape, bk):
+    """The kernels' bf16 weights of an MLX-layout INT4 matrix (codes packed by
+    mlx.quantize's uint32 rule, bf16 scale and bias) equal bf16(s * q + b)."""
+    torch.manual_seed(bk)
+    n, k = shape
+    w = torch.randn(n, k, device="cuda") * k**-0.5
+    w[:, :32] = (
+        w[:, :32].abs() + 0.01
+    )  # a group without 0 (bias = min, not an exact zero point)
+    packed, sb, bb, ref = _mlx_affine_quantize(w)
+    wq = WqWeight.int4_affine(packed, sb, bb)
+    assert wq.fmt == FMT_INT4 and (wq.n, wq.k, wq.group) == (n, k, 32)
+    out = torch.empty(n, k, dtype=torch.bfloat16, device="cuda")
+    out2 = torch.empty_like(out)
+    _deq_tiles_kernel[(n // 32,)](
+        *wq.args(), out, out2, N=n, KD=k, FMT=wq.fmt, G=wq.group, BK=bk, BN=32
+    )
+    assert torch.equal(out.float(), ref)
+    assert torch.equal(out2.float(), ref)
 
 
 @pytest.mark.parametrize("m,run", [(4, olala_moe_small_int8)])

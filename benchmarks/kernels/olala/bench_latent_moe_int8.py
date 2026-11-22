@@ -32,11 +32,20 @@ def weight(shape):
     return WqWeight(q, scales)
 
 
-def layer():
+def expert_weight(shape, fmt):
+    if fmt == "int8":
+        return weight(shape)
+    e, n, k = shape
+    codes = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device="cuda")
+    scales = (torch.rand(e, n, k // 32, device="cuda") * 0.001 + 0.0001).bfloat16()
+    return WqWeight.int4_affine(codes, scales, (-7.5 * scales).bfloat16())
+
+
+def layer(fmt):
     fc1 = weight((D, H))
     router = torch.randn((2 * E, H), device="cuda", dtype=torch.bfloat16) * 0.02
     segs = [Segment(fc1.weight, fc1.scale), Segment(router, col0=D)]
-    experts = (weight((E, N, D)), weight((E, D, N)))
+    experts = (expert_weight((E, N, D), fmt), expert_weight((E, D, N), fmt))
     projections = (weight((H, H)), weight((H, H)), weight((H, D)))
     return segs, torch.randn(E, device="cuda") * 0.1, (*experts, *projections)
 
@@ -58,11 +67,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, nargs="+", default=[1, 8, 32, 128])
     parser.add_argument("--layers", type=int, default=36)
+    parser.add_argument("--format", choices=("int8", "int4-affine"), default="int8")
     args = parser.parse_args()
     if args.layers < 1 or any(not 1 <= b <= 128 for b in args.batch):
         parser.error("use at least one layer and batches of 1 to 128 tokens")
     torch.manual_seed(0)
-    layers = [layer() for _ in range(args.layers)]
+    layers = [layer(args.format) for _ in range(args.layers)]
     for batch in args.batch:
         hidden = torch.randn(batch, H, dtype=torch.bfloat16, device="cuda")
         calls = [partial(forward, hidden, p) for p in layers]
