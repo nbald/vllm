@@ -188,6 +188,8 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_W8A16_INT8_DECODE: bool = True
+    VLLM_W8A16_INT8_DEQ_SCRATCH_MB: int = 48
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -1555,6 +1557,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    ),
+    # INT8 weight-only (W8A16) linears: run the Triton decode kernels (GEMV,
+    # skinny GEMM) up to their shape-dependent row cutoff. 0 sends every batch
+    # through the prefill path (Triton W8A16 GEMM or dequantize + cuBLAS).
+    "VLLM_W8A16_INT8_DECODE": lambda: (
+        os.environ.get("VLLM_W8A16_INT8_DECODE", "1") != "0"
+    ),
+    # Size in MiB of the per-stream bf16 buffer that the W8A16 prefill path
+    # dequantizes a weight into before cuBLAS. Larger weights take the Triton
+    # W8A16 GEMM instead.
+    "VLLM_W8A16_INT8_DEQ_SCRATCH_MB": lambda: int(
+        os.environ.get("VLLM_W8A16_INT8_DEQ_SCRATCH_MB", "48")
     ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
