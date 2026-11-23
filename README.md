@@ -35,7 +35,20 @@ Blackwell). SM120 has its own paths, tuned on an RTX 5090:
 SM70 serves bf16 checkpoints through volta-forever, which runs CUDA 12/13 programs on a V100 and tells them
 compute capability 8.0 (`VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1`: vLLM keeps bf16, the Olala kernels build for
 sm_80 and the layer lowers them to sm_70, emulating the bf16 tensor-core instructions). The family is recognized
-before that capability (`OLALA_VOLTA`), and Volta runs the SM80 kernels wherever it has no path of its own.
+before that capability (`OLALA_VOLTA`), and Volta runs the SM80 kernels wherever it has no path of its own. Its
+own paths replace emulated tensor-core code with fp32 FMA code:
+
+- the decode projections take FMA GEMVs up to 32 rows, and so do the router at decode sizes (the hi + lo halves
+  of its bf16x2 split as one fp32 weight) and the LM head up to 16 sequences;
+- the Mamba-3 decode step runs its scalar-FMA update (`-DSTEP_VOLTA`, two CTAs per SM);
+- the TPA-factor decode attention has an FMA kernel (`tpa_factor_decode_volta.cu`), with one-tile splits and a
+  4-head split merge;
+- the latent-MoE small path covers up to 32 tokens; above, the medium path's projections take the same GEMV
+  dispatch and its grouped GEMMs one 16x64x32 single-stage tile.
+
+On a V100-SXM2-32GB through volta-forever this takes the bf16 model from 55 to 174 tok/s of decode at one
+request, from 12.6 to 72 tok/s per request at eight, and its prefill (480-token prompts) from ~1590 to ~1960
+tok/s; `OLALA_VOLTA=0` gives the SM80 dispatch back, token for token.
 
 ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
 
