@@ -18,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 
+from . import qwen3_dspine_fast as fast_path
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import WeightsMapper, maybe_prefix
 
@@ -140,6 +141,10 @@ class AdjacentCausalInjection(nn.Module):
         *,
         anchor_features: torch.Tensor,
     ) -> torch.Tensor:
+        if fast_path.FUSED:
+            return fast_path.inject(
+                self, layer_idx, pre_injection_states, anchor_features
+            )
         # Flat over the (requests * block_size) rows, no per-block reshape: rows
         # are independent, position 0 of a block keeps its state and position 1
         # takes the anchor's code as predecessor (same values as the blocked form).
@@ -173,6 +178,17 @@ def _score_transitions(
         ),
         dim=1,
     )
+    if fast_path.FUSED and lm_head.tp_size == 1:
+        return fast_path.score_transitions(
+            injection,
+            norm,
+            lm_head,
+            transfer_codebook,
+            candidate_ids,
+            final_pre_injection,
+            predecessor_ids,
+            final_layer_idx,
+        )
     receiver_features = injection.project(final_layer_idx, final_pre_injection)
     receiver_states = final_pre_injection[:, :, None, :]
     local_ids = candidate_ids.long()
@@ -355,6 +371,12 @@ class DSpineQwen3Model(DFlashQwen3Model):
 
 class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = DSpineQwen3Model
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        loaded = super().load_weights(weights)
+        # Opt-in fast draft path (OLALA_DSPINE_* flags, qwen3_dspine_fast.py).
+        fast_path.apply_fast_path(self)
+        return loaded
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
