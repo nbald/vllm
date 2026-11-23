@@ -332,7 +332,16 @@ def _max_stages() -> int:
     return 4 if smem >= 160 * 1024 else 3
 
 
+# Volta (V100, natively or through volta-forever): tl.dot's bf16 mma.sync is emulated with scalar
+# code and cp.async is a synchronous copy there, so pipeline stages only cost shared memory, and
+# 16-row blocks waste least on the ~11 rows per expert of a prefill chunk. V100 through
+# volta-forever, 480 tokens (route + compact + up + down): B300 configs 1906 us, this 744 us.
+_VOLTA_CONFIG = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, num_warps=4, num_stages=1)
+
+
 def _pick(M: int):
+    if gpu_family() is GpuFamily.SM70:
+        return _VOLTA_CONFIG, _VOLTA_CONFIG
     up, down = _CONFIGS[-1][1], _CONFIGS[-1][2]
     for mx, u, d in _CONFIGS:
         if mx >= M:
