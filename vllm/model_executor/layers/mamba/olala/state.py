@@ -73,10 +73,11 @@ def volta_state16() -> str | None:
 
     ``fp16sr`` (also ``1``, ``DEFAULT_VOLTA_STATE16``): the state is stored in fp16 with one power-of-two scale per
     state row (head, p) in an extra fp32 pool tensor, and the decode step rounds stochastically; ``fp16``: the same
-    rounded to nearest even; ``bf16sr`` / ``bf16``: bf16, stochastic / nearest even; unset or ``0``: off. Over 3.4k
-    decode steps of real inputs the state's relative error to an fp32 state is ~0.4 % for fp16sr against ~3 %
-    (fp16), ~2 % (bf16sr) and up to ~50 % (bf16, whose round-to-nearest-even stalls slow decays and small updates;
-    agents/perf128/STATE16.md). The decode step and the prefill state pass compute in fp32 and round only what they store
+    rounded to nearest even; ``bf16sr`` / ``bf16``: bf16, stochastic / nearest even; unset or ``0``: off. After 3.4k
+    decode steps of real inputs, the state's relative error to an fp32 state (median over the 29 layers, worst layer)
+    is 0.33 % (0.56 %) for fp16sr, 2.2 % (4.8 %) for fp16, 1.5 % (3.1 %) for bf16sr and 15 % (52 %) for bf16: rounding
+    to nearest loses slow decays and small updates the same way at every step (agents/perf128/STATE16.md). The
+    decode step and the prefill state pass compute in fp32 and round only what they store
     (``mamba3_step_volta16_kernel`` in csrc/mamba3_step.cu, ``_ssd_state_pass_pool``): half the state traffic of the
     fp32 state, which is the Mamba step's floor at high concurrency. Read only on the SM70 family
     (``arch.sm70_family_no_context``, i.e. ``gpu_family() is GpuFamily.SM70`` without a CUDA context: the state
