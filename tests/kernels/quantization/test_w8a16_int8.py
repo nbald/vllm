@@ -84,6 +84,23 @@ def test_volta_gemv_int8(n, k, m, group):
     _close(volta_gemv(x, q, torch.bfloat16, scale), ref)
 
 
+@pytest.mark.parametrize("wdtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("n,k", [(7344, 1536), (1536, 3072), (1536, 384), (256, 1536)])
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 9])
+def test_volta_gemv_float_weights(n, k, m, wdtype):
+    """The Volta FMA GEMVs on bf16 / fp32 weights (the bf16 model's projections and its fp32
+    router copy): 2-8 rows take the CUDA few-row GEMV (csrc/gemv_rows_volta.cu)."""
+    from vllm.model_executor.layers.mamba.olala.decode_gemv import volta_gemv
+
+    gen = torch.Generator(device="cuda").manual_seed(n + k + m)
+    w = (torch.randn(n, k, device="cuda", generator=gen) * 0.02).to(wdtype)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=gen)
+    ref = x.double() @ w.double().T
+    y = volta_gemv(x, w, torch.float32)
+    err = (y.double() - ref).abs().max() / ref.abs().max()
+    assert err < 1e-5, err
+
+
 @pytest.mark.parametrize("split", [2, 3, 6])
 @pytest.mark.parametrize("m", [3, 32])
 def test_split_k(split, m):

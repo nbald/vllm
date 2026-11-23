@@ -13,16 +13,19 @@ copy bandwidth there on an A4500, the skinny kernel 80-97 %).
 """
 
 import os
+from functools import cache
 
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family, sm_arch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
 _DISABLED = os.environ.get("OLALA_GEMV", "1") == "0"
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -385,6 +388,8 @@ def _decode_gemv_volta(
     if M == 1:
         return _gemv_m1_volta(x, weight, out_dtype, scale, out)
     y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device) if out is None else out
+    if M <= 8 and _rows_cuda(x, weight, scale, y):
+        return y
     if M <= 8:
         kernel, bn, bk, nw = _gemv_rows_kernel, 16, 128, 8
     else:
@@ -395,6 +400,83 @@ def _decode_gemv_volta(
         MB=triton.next_power_of_2(M), BN=bn, BK=bk, SCALE=mode, G=g, num_warps=nw,
     )
     return y
+
+
+@cache
+def _rows_ext():
+    """The CUDA few-row GEMV of Volta (csrc/gemv_rows_volta.cu), or None if its JIT build fails
+    (the Triton kernels above then serve)."""
+    if os.environ.get("OLALA_GEMV_ROWS_CUDA", "1") == "0":
+        return None
+    try:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+        return load_extension(
+            f"olala_gemv_rows_volta_sm{sm_arch()}",
+            "gemv_rows_volta.cu",
+            ["-O3", "-std=c++20", gencode()],
+        )
+    except Exception as e:  # noqa: BLE001 - any build failure falls back to Triton
+        logger.warning("Olala: Volta few-row GEMV not built (%s); Triton kernels instead.", e)
+        return None
+
+
+@cache
+def _num_sms() -> int:
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
+def _rows_cfg(N: int, K: int, M: int, int8_rows: bool) -> tuple[int, int, int] | None:
+    """(WK, VEC, NRW) of the CUDA few-row GEMV for M rows: 4 weight rows per warp for INT8
+    per-row weights with N >= 4096 at 4+ rows (each activation load then serves 4 rows), 2
+    otherwise (more CTAs; bf16 rows are twice as wide); the fewest K slices per CTA (each a
+    multiple of 32 x VEC) that still give 4 CTAs per SM. NRW does not change a row's
+    summation order, WK and VEC do. V100 through volta-forever: INT8 lm_head 151936 x 1536
+    2 rows 407 -> 281 us with NRW 2, 8 rows 503 -> 453 us with NRW 4; bf16 in_proj 7344 x 1536
+    8 rows 40 -> 34 us with NRW 2; mixer_proj 1536 x 3072 takes WK 2."""
+    nrw = 4 if int8_rows and N >= 4096 and M >= 4 else 2
+    if os.environ.get("OLALA_GEMV_ROWS_CFG"):  # "WK,VEC,NRW": measurements only
+        wk, vec, nrw = (int(v) for v in os.environ["OLALA_GEMV_ROWS_CFG"].split(","))
+        return (wk, vec, nrw) if K % (wk * 32 * vec) == 0 else None
+    feasible = [
+        (wk, vec) for wk in (1, 2, 4) for vec in (8, 4) if K % (wk * 32 * vec) == 0
+    ]
+    if not feasible:
+        return None
+    for wk, vec in feasible:
+        if -(-N // ((4 // wk) * nrw)) >= 4 * _num_sms():
+            return wk, vec, nrw
+    wk, vec = feasible[-1]
+    return wk, vec, nrw
+
+
+def _rows_cuda(
+    x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor | None, y: torch.Tensor
+) -> bool:
+    """2..8 rows through the CUDA few-row GEMV when it is built and the operands fit (bf16 x,
+    16-byte aligned rows); False: the caller takes the Triton kernel."""
+    ext = _rows_ext()
+    M = x.shape[0]
+    if ext is None or not 2 <= M <= 8 or x.dtype != torch.bfloat16 or y.stride(-1) != 1:
+        return False
+    if weight.dtype not in (torch.int8, torch.bfloat16, torch.float32):
+        return False
+    if (weight.dtype == torch.int8) != (scale is not None):
+        return False
+    if y.dtype not in (torch.bfloat16, torch.float32):
+        return False
+    N, K = weight.shape
+    cfg = _rows_cfg(N, K, M, scale is not None and scale.dim() == 1)
+    if cfg is None:
+        return False
+    es = weight.element_size()
+    if (
+        x.data_ptr() % 16 or (x.stride(0) * 2) % 16
+        or weight.data_ptr() % 16 or (weight.stride(0) * es) % 16
+    ):
+        return False
+    ext.gemv_rows(x, weight, scale, y, *cfg)
+    return True
 
 
 def volta_gemv_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
