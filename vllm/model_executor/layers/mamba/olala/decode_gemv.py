@@ -182,6 +182,52 @@ VOLTA_ROWS_MAX_M = 32
 
 
 @triton.jit
+def _gemv_m1_volta_kernel(
+    x_ptr, w_ptr, y_ptr, N, K, stride_wn,
+    BN: tl.constexpr, BK: tl.constexpr, KMASK: tl.constexpr,
+):
+    """One-row GEMV for Volta: partial sums per (n, k) lane, reduced once after the K loop; the
+    optional K mask lets K = 1920 (MoE w_out) use 512-wide blocks."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    n_mask = offs_n < N
+    acc = tl.zeros([BN, BK], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        if KMASK:
+            k_mask = offs_k < K
+            w = tl.load(
+                w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+                mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+            )
+            x = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0)
+        else:
+            w = tl.load(
+                w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+                mask=n_mask[:, None], other=0.0,
+            )
+            x = tl.load(x_ptr + offs_k)
+        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
+    tl.store(y_ptr + offs_n, tl.sum(acc, axis=1).to(y_ptr.dtype.element_ty), mask=n_mask)
+
+
+def _gemv_m1_volta(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    # V100 through volta-forever, graphed, weights from DRAM: one weight row per 4-warp
+    # program, 512-wide K blocks, against the GH200 configs of _gemv_m1, us: in_proj
+    # 7344x1536 30.5 -> 28.8, mixer_proj 1536x3072 14.5 -> 14.0, TPA gate 4608x1536
+    # 23.5 -> 19.2, MoE w_out 1536x1920 13.7 -> 9.3 (512-wide blocks need the K mask),
+    # fp32 router 256x1536 5.0 -> 3.9.
+    N, K = weight.shape
+    y = torch.empty(1, N, dtype=out_dtype or x.dtype, device=x.device)
+    _gemv_m1_volta_kernel[(N,)](
+        x, weight, y, N, K, weight.stride(0), BN=1, BK=512, KMASK=K % 512 != 0, num_warps=4,
+    )
+    return y
+
+
+@triton.jit
 def _rows_acc(acc, w, x_ptr, m: tl.constexpr, stride_xm, offs_k, M):
     x = tl.load(x_ptr + m * stride_xm + offs_k, mask=(offs_k * 0 + m) < M, other=0.0)
     return acc + w * x.to(tl.float32)[None, :]
@@ -276,7 +322,7 @@ def _decode_gemv_volta(
     M, K = x.shape
     N = weight.shape[0]
     if M == 1:
-        return _gemv_m1(x, weight, out_dtype)
+        return _gemv_m1_volta(x, weight, out_dtype)
     y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device)
     if M <= 8:
         kernel, bn, bk, nw = _gemv_rows_kernel, 16, 128, 8
@@ -334,11 +380,9 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _gemv_m1(x, weight)
 
 
-def _gemv_m1(
-    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
-) -> torch.Tensor:
+def _gemv_m1(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     N, K = weight.shape
-    y = torch.empty(1, N, dtype=out_dtype or x.dtype, device=x.device)
+    y = torch.empty(1, N, dtype=x.dtype, device=x.device)
     # HBM-streaming configs measured on GH200 (36 distinct weights, graphed):
     # wide outputs like 8 rows/program; narrow outputs want more programs.
     if N >= 4096:
