@@ -18,8 +18,9 @@ tile are token-major t*R + r):
   0. ``_ssd_prep``        (chunk, head): per-token chunk-local log-decay cumsum (and its 16-token-group
      variants), trapezoid scales, chunk-local phase cumsum; chunk totals.
   1. chunk-local states: CUDA ``chunk_state`` (olala/csrc/mamba3_scan_prefill.cu, sm90 wgmma;
-     mamba3_scan_prefill_tc.cu, sm100 / sm103 tcgen05; olala/csrc/mamba3_chunk_state_sm80.cu, sm8x)
-     or the Triton ``_ssd_chunk_state`` (``OLALA_CS_CUDA=0``).
+     mamba3_scan_prefill_tc.cu, sm100 / sm103 tcgen05; olala/csrc/mamba3_chunk_state_sm80.cu, sm8x;
+     mamba3_chunk_state_volta.cu, its FMA edition for the SM70 family) or the Triton ``_ssd_chunk_state``
+     (``OLALA_CS_CUDA=0``).
   2. ``_ssd_state_pass_pool`` (head, sequence): serial over chunks, S_in[c] = state entering chunk c,
      read from / written back to the request's pool slot; a chunk's local state is rotated by the
      phase prefix (rot(a + b) = rot(a) rot(b)).
@@ -34,7 +35,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family, mma_sync_class
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family, mma_sync_class, sm_arch
 
 from vllm.triton_utils import tl, triton
 
@@ -53,6 +54,11 @@ _SCAN_SM80 = _os.environ.get("OLALA_SCAN_SM80", "1") == "1"
 _SCAN_EXT = None
 _CS_SM80_EXT = None
 _SCAN_SM80_EXT = None
+# SM70 family (V100 through volta-forever, which emulates the sm8x kernels' bf16 mma.sync / ldmatrix with scalar
+# code): FMA edition of the chunk-state kernel, same arguments and values.
+# OLALA_VOLTA_PREFILL=0 keeps the sm8x kernel there.
+_VOLTA_PREFILL = _os.environ.get("OLALA_VOLTA_PREFILL", "1") == "1"
+_CS_VOLTA_EXT = None
 
 
 def _scan_cuda_ok(dev) -> bool:
@@ -93,6 +99,21 @@ def _scan_sm80_ext(dev):
         _SCAN_SM80_EXT = load_extension("olala_mamba3_scan_prefill_sm80", "mamba3_scan_prefill_sm80.cu",
                                         ["-O3", "-std=c++20", "--use_fast_math", gencode(dev)])
     return _SCAN_SM80_EXT
+
+
+def _volta_prefill(dev) -> bool:
+    return _VOLTA_PREFILL and gpu_family(dev) is GpuFamily.SM70
+
+
+def _cs_volta_ext(dev):
+    """FMA edition of the sm8x chunk-local states for the SM70 family (olala/csrc/mamba3_chunk_state_volta.cu)."""
+    global _CS_VOLTA_EXT
+    if _CS_VOLTA_EXT is None:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+        _CS_VOLTA_EXT = load_extension(f"olala_mamba3_chunk_state_volta_sm{sm_arch(dev)}",
+                                       "mamba3_chunk_state_volta.cu",
+                                       ["-O3", "-std=c++20", "--use_fast_math", gencode(dev)])
+    return _CS_VOLTA_EXT
 
 
 def xz_strided_ok(dev) -> bool:
@@ -484,7 +505,8 @@ def mamba3_mimo_hybrid_pools(
     elif cs_cuda:
         _scan_ext().chunk_state(K, V, k_bias, psi, thl, dacs, ts, dtot, m_start, m_len, Sloc, NC)
     elif cs_sm80:
-        _cs_sm80_ext(dev).chunk_state(K, V, k_bias, psi, thl, dacs, ts, dtot, m_start, m_len, Sloc, NC)
+        ext = _cs_volta_ext(dev) if _volta_prefill(dev) else _cs_sm80_ext(dev)
+        ext.chunk_state(K, V, k_bias, psi, thl, dacs, ts, dtot, m_start, m_len, Sloc, NC)
     else:
         _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
                                      R=R, N=N, P=P, NQ=NQ, LB=16, PB=P, num_warps=8)
