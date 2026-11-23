@@ -858,7 +858,8 @@ __global__ void __launch_bounds__(THREADS, 3) mamba3_step_volta_kernel(const Arg
 //                the row is stored as fp16(h_new * 2^(14 - e)) (round to nearest even, cvt.rn.f16.f32: a native
 //                Volta instruction), i.e. its max in [2^14, 2^15), and its inverse scale 2^(e - 14) (fp32) goes to the
 //                ssm_scale pool (P, H, D). 11 significant bits per element (bf16: 8) for any row magnitude;
-//   state16 = 3 / 4  the same formats with stochastic rounding (measurement editions, below).
+//   state16 = 3 / 4  the same formats with stochastic rounding (below); 4 is OLALA_VOLTA_STATE16's default: unbiased
+//                rounding keeps slow decays and small updates that round-to-nearest stalls on (STATE16.md).
 // The preamble (angles, bias + rotary on B/C), the token / pool rows, the output and the k / v / angle pool writes are
 // mamba3_step_volta_kernel's.
 __device__ __forceinline__ float2 bf16x2_to_f2(uint32_t w) { return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)); }
@@ -878,7 +879,7 @@ __device__ __forceinline__ uint32_t f2_to_f16x2_rn(float lo, float hi) {
   asm("{\n .reg .b16 l, h;\n cvt.rn.f16.f32 l, %1;\n cvt.rn.f16.f32 h, %2;\n mov.b32 %0, {l, h};\n}" : "=r"(w) : "f"(lo), "f"(hi));
   return w;
 }
-// Stochastic-rounding variants (state16 = 3: bf16, 4: fp16 + row scale; measurement editions): 16 / 13 random bits
+// Stochastic rounding (state16 = 3: bf16, 4: fp16 + row scale): 16 / 13 random bits
 // added below the kept mantissa, then truncation. The bits come from a hash of the item's inputs (dt, the new phase,
 // the thread), not of the slot: deterministic and independent of the batch composition.
 __device__ __forceinline__ uint32_t hash32_v16(uint32_t x) {   // lowbias32
@@ -1204,7 +1205,7 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
 #endif
   static const bool pipe = [] { const char* e = getenv("OLALA_STEP_PIPE"); return !(e && e[0] == '0'); }();
   // 16-bit state (OLALA_VOLTA_STATE16, Volta builds): state16 = 1 bf16, 2 fp16 with per-row scales, both rounded to
-  // nearest even; 3 / 4 the same with stochastic rounding (measurement editions); any batch size
+  // nearest even; 3 / 4 the same with stochastic rounding; any batch size
   if (state16 != 0) {
 #ifdef STEP_VOLTA
     TORCH_CHECK(!a.raw, "state16: the decode preamble runs upstream (OLALA_RAW_STEP is not supported)");

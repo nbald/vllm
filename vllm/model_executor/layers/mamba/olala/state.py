@@ -55,10 +55,10 @@ class ReplayConfig:
 
 DEFAULT_REPLAY_BUFFER_LEN = 8
 
-# OLALA_VOLTA_STATE16=1 picks this format (see volta_state16)
-DEFAULT_VOLTA_STATE16 = "fp16"
-# formats and their code for the step kernel (mamba3_step_cuda's state16); bf16sr / fp16sr round
-# stochastically: measurement editions
+# OLALA_VOLTA_STATE16=1 picks this format (see volta_state16): fp16 + per-row scales, stochastic rounding
+DEFAULT_VOLTA_STATE16 = "fp16sr"
+# formats and their code for the step kernel (mamba3_step_cuda's state16); the *sr formats round the
+# decode step's stores stochastically, the others to nearest even
 STATE16_CODES = {"bf16": 1, "fp16": 2, "bf16sr": 3, "fp16sr": 4}
 
 
@@ -71,10 +71,12 @@ def state16_scaled(fmt: str | None) -> bool:
 def volta_state16() -> str | None:
     """16-bit SSM state of the SM70 family (V100), opt-in: ``OLALA_VOLTA_STATE16``.
 
-    ``bf16``: the state is stored in bf16 (round to nearest even), ``fp16``: in fp16 with one power-of-two scale
-    per state row (head, p) in an extra fp32 pool tensor, ``1``: the default format (``DEFAULT_VOLTA_STATE16``);
-    unset or ``0``: off; ``bf16sr`` / ``fp16sr``: the same with stochastic rounding in the decode step
-    (measurement editions). The decode step and the prefill state pass compute in fp32 and round only what they store
+    ``fp16sr`` (also ``1``, ``DEFAULT_VOLTA_STATE16``): the state is stored in fp16 with one power-of-two scale per
+    state row (head, p) in an extra fp32 pool tensor, and the decode step rounds stochastically; ``fp16``: the same
+    rounded to nearest even; ``bf16sr`` / ``bf16``: bf16, stochastic / nearest even; unset or ``0``: off. Over 3.4k
+    decode steps of real inputs the state's relative error to an fp32 state is ~0.4 % for fp16sr against ~3 %
+    (fp16), ~2 % (bf16sr) and up to ~50 % (bf16, whose round-to-nearest-even stalls slow decays and small updates;
+    agents/perf128/STATE16.md). The decode step and the prefill state pass compute in fp32 and round only what they store
     (``mamba3_step_volta16_kernel`` in csrc/mamba3_step.cu, ``_ssd_state_pass_pool``): half the state traffic of the
     fp32 state, which is the Mamba step's floor at high concurrency. Read only on the SM70 family
     (``arch.sm70_family_no_context``, i.e. ``gpu_family() is GpuFamily.SM70`` without a CUDA context: the state
