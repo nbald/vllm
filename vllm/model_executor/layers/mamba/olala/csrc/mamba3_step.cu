@@ -12,6 +12,14 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+// STEP_VOLTA (mamba3_step_cuda.py on a V100, natively or through volta-forever): sm_70 has no bf16 mma.sync, ldmatrix
+// or cp.async, so volta-forever emulates them with scalar code (one bf16 m16n8k16 ~ 200 instructions, cp.async as a
+// synchronous copy) while plain fp32 FMA runs natively. The fp32-state step then takes the scalar FMA update + C dot
+// (STEP_F32_FMA, same math as the tensor-core split) in the 1-stage kernel instead of the tensor-core pipeline.
+#if defined(STEP_VOLTA) && !defined(STEP_F32_FMA)
+#define STEP_F32_FMA
+#endif
+
 namespace {
 constexpr int H = 48, D = 64, S = 128, R = 4, NA = 32;
 #ifndef STEP_NST
@@ -33,13 +41,20 @@ template <bool F32> struct __align__(128) Stage : StateTile<F32> {
   __nv_bfloat16 angp[NA];
   float angst[NA];
 };
+// Volta builds: the fp32-state step runs the FMA update, which needs neither the zero rows that pad the mma's k nor
+// the biases in shared memory (read through L1 instead); the tile then fits two CTAs per SM (45 KB instead of 52 KB).
+#ifdef STEP_VOLTA
+template <bool F32> constexpr bool kSlim = F32;
+#else
+template <bool F32> constexpr bool kSlim = false;
+#endif
 template <bool F32> struct __align__(128) Smem {
   Stage<F32> st[kStages<F32>];
-  float bias_k[R * S], bias_q[R * S];                  // per-head (fixed per CTA)
+  float bias_k[kSlim<F32> ? 4 : R * S], bias_q[kSlim<F32> ? 4 : R * S];   // per-head (fixed per CTA)
   float xproj[R * D], zproj[R * D], outproj[R * D];
   float sCos[NA], sSin[NA];
-  __nv_bfloat16 sBk[16][LDB];       // mma B operand of the update: rows 0..3 B'[r], 4..7 Bstate[r], 8..15 zero
-  __nv_bfloat16 sCb[8][LDB];        // rotated C' bf16, rows 4..7 zero: mma B operand for o = h C'^T
+  __nv_bfloat16 sBk[kSlim<F32> ? 8 : 16][LDB];   // mma B operand of the update: rows 0..3 B'[r], 4..7 Bstate[r], 8..15 zero
+  __nv_bfloat16 sCb[kSlim<F32> ? 4 : 8][LDB];    // rotated C' bf16, rows 4..7 zero: mma B operand for o = h C'^T
   float sTheta[NA];
 };
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
@@ -114,11 +129,17 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int h = blockIdx.x % H, nb_stride = gridDim.x / H;   // grid is a multiple of H
   const int nitems = a.B * H;
-  for (int i = t; i < 8 * LDB; i += THREADS) { S_.sBk[8 + i / LDB][i % LDB] = __float2bfloat16(0.f); if (i < 4 * LDB) S_.sCb[4 + i / LDB][i % LDB] = __float2bfloat16(0.f); }
+  if constexpr (!kSlim<F32>) {
+    for (int i = t; i < 8 * LDB; i += THREADS) { S_.sBk[8 + i / LDB][i % LDB] = __float2bfloat16(0.f); if (i < 4 * LDB) S_.sCb[4 + i / LDB][i % LDB] = __float2bfloat16(0.f); }
+  }
   // per-head constants once per CTA
-  { const int r = t >> 5, c = t & 31;
+  if constexpr (!kSlim<F32>) {
+    const int r = t >> 5, c = t & 31;
     cp16(S_.bias_k + r * S + c * 4, a.bias_k + ((size_t)r * H + h) * S + c * 4);
     cp16(S_.bias_q + r * S + c * 4, a.bias_q + ((size_t)r * H + h) * S + c * 4); }
+  // bias of (rank r, column j) of this head: shared memory, or global memory through L1 in the slim tile
+  auto bias_k = [&](int r, int j) -> float { if constexpr (kSlim<F32>) return __ldg(a.bias_k + ((size_t)r * H + h) * S + j); else return S_.bias_k[r * S + j]; };
+  auto bias_q = [&](int r, int j) -> float { if constexpr (kSlim<F32>) return __ldg(a.bias_q + ((size_t)r * H + h) * S + j); else return S_.bias_q[r * S + j]; };
   if (t < 64) { const int r = t >> 4, c = t & 15; cp16(S_.xproj + r * D + c * 4, a.xproj + ((size_t)r * H + h) * D + c * 4); cp16(S_.outproj + r * D + c * 4, a.outproj + ((size_t)r * H + h) * D + c * 4); }
   else { const int q = t - 64, r = q >> 4, c = q & 15; cp16(S_.zproj + r * D + c * 4, a.zproj + ((size_t)r * H + h) * D + c * 4); }
   // the per-head constants above are weights; everything below may be the previous kernel's output
@@ -172,8 +193,8 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
 #ifndef V_NOPRE
     for (int i = t; i < R * (S / 2); i += THREADS) {
       const int r = i / (S / 2), j = i % (S / 2);
-      float blo = bf2f(st.bm[r * S + j]) + S_.bias_k[r * S + j], bhi = bf2f(st.bm[r * S + j + 64]) + S_.bias_k[r * S + j + 64];
-      float clo = bf2f(st.cm[r * S + j]) + S_.bias_q[r * S + j], chi = bf2f(st.cm[r * S + j + 64]) + S_.bias_q[r * S + j + 64];
+      float blo = bf2f(st.bm[r * S + j]) + bias_k(r, j), bhi = bf2f(st.bm[r * S + j + 64]) + bias_k(r, j + 64);
+      float clo = bf2f(st.cm[r * S + j]) + bias_q(r, j), chi = bf2f(st.cm[r * S + j + 64]) + bias_q(r, j + 64);
       if (j < NA) {
         const float c = S_.sCos[j], s_ = S_.sSin[j];
         const float b0 = blo * c - bhi * s_, b1 = blo * s_ + bhi * c, c0 = clo * c - chi * s_, c1 = clo * s_ + chi * c;
@@ -622,6 +643,207 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
     __syncthreads();   // sBk / sCb / sTheta / this small stage are reused by the next item
   }
 }
+
+#ifdef STEP_VOLTA
+// ---------------------------------------------------------------------------------------------------------------------
+// fp32-state step, Volta edition (STEP_VOLTA builds). sm_70 has no cp.async: through volta-forever each cp.async of the
+// 1-stage kernel is a synchronous load + shared store, so a CTA meets every item's 32 KB state and token rows one copy
+// after the other, then computes while the DRAM pipe idles (213 us per layer at 32 sequences against a ~116 us floor).
+// Here the state never goes through shared memory: each thread loads the 64 state elements it updates (rows p0 and
+// p0 + 8, columns jt * 8 + 2 qd + {0, 1}: the 1-stage kernel's FMA fragment layout) straight into registers, all in
+// flight at once with the item's token / pool rows and head constants (registers, then a shared stage) and scalars,
+// and stores h_new from the same registers (per warp instruction 8 rows x 32 contiguous bytes). The small tile fits
+// several CTAs per SM, whose loads overlap one another's computation (a one-item register prefetch at fewer CTAs per
+// SM measured slower). Items (token, head) are dealt to the CTAs round-robin, so any grid balances. The arithmetic is
+// the 1-stage kernel's STEP_F32_FMA code, operation for operation and in the same order, on the same values: the
+// outputs, the state and the k / v / angle pools are bit-identical.
+struct __align__(16) VStage {
+  __nv_bfloat16 bst[R * S];   // previous B' (k_pool)
+  __nv_bfloat16 bm[R * S];    // token B rows
+  __nv_bfloat16 cm[R * S];    // token C rows
+  __nv_bfloat16 x[D], z[D], xst[D];
+  __nv_bfloat16 angp[NA];
+  float angst[NA];
+  float xproj[R * D], zproj[R * D], outproj[R * D];   // the item's head
+};
+struct __align__(16) VSmem {
+  VStage st;
+  float sCos[NA], sSin[NA], sTheta[NA];
+  __nv_bfloat16 sBk[8][LDB];   // rows 0..3 B'[r] rotated (bf16), 4..7 Bstate[r]
+  __nv_bfloat16 sCb[4][LDB];   // rotated C' (bf16)
+};
+
+// One item's global loads into registers: the thread's state fragment, its share of the token / pool rows (the
+// 1-stage kernel's issue_item chunks: threads 0..63 the k_pool / B / C chunks, 64..99 x, z, xst, angp, angst) and of
+// the head constants (threads 0..63 xproj + outproj, 64..127 zproj), and the item's scalars.
+struct VLoad {
+  float2 h[2][16];
+  uint4 sm[3];
+  float4 c[2];
+  float dt, A, trap;
+};
+__device__ __forceinline__ void v_issue(const Args& a, const int item, const int slot, const int t, const int p0,
+                                        const int qd, VLoad& L) {
+  const int h = item % H, b = item / H;
+  const int srow = (slot >= 0 && slot < a.P) ? slot : 0;
+  const float* src = reinterpret_cast<const float*>(a.ssm) + (size_t)srow * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+  for (int e = 0; e < 2; ++e)
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt) L.h[e][jt] = *reinterpret_cast<const float2*>(src + (p0 + e * 8) * S + jt * 8 + 2 * qd);
+  if (t < 64) {
+    const int r = t >> 4, c = t & 15;
+    L.sm[0] = *reinterpret_cast<const uint4*>(a.kp + (size_t)srow * a.kp_sst + ((size_t)r * H + h) * S + c * 8);
+    L.sm[1] = *reinterpret_cast<const uint4*>(a.Bm + (size_t)b * a.bc_bstride + t * 8);
+    L.sm[2] = *reinterpret_cast<const uint4*>(a.Cm + (size_t)b * a.bc_bstride + t * 8);
+    L.c[0] = __ldg(reinterpret_cast<const float4*>(a.xproj + ((size_t)r * H + h) * D + c * 4));
+    L.c[1] = __ldg(reinterpret_cast<const float4*>(a.outproj + ((size_t)r * H + h) * D + c * 4));
+  } else {
+    const int q = t - 64;
+    if (q < 8) L.sm[0] = *reinterpret_cast<const uint4*>(a.x + ((size_t)b * H + h) * D + q * 8);
+    else if (q < 16) L.sm[0] = *reinterpret_cast<const uint4*>(a.z + ((size_t)b * H + h) * D + (q - 8) * 8);
+    else if (q < 24) L.sm[0] = *reinterpret_cast<const uint4*>(a.vp + (size_t)srow * a.vp_sst + (size_t)h * D + (q - 16) * 8);
+    else if (q < 28) L.sm[0] = *reinterpret_cast<const uint4*>(a.angp + (size_t)b * a.angp_stride + (q - 24) * 8);
+    else if (q < 36) L.sm[0] = *reinterpret_cast<const uint4*>(a.angle + (size_t)srow * a.ang_sst + (size_t)h * NA + (q - 28) * 4);
+    const int r = q >> 4, c = q & 15;
+    L.c[0] = __ldg(reinterpret_cast<const float4*>(a.zproj + ((size_t)r * H + h) * D + c * 4));
+  }
+  L.dt = a.dt[b * H + h]; L.A = a.A[b * H + h]; L.trap = a.trap[b * H + h];
+}
+
+__device__ __forceinline__ void v_stage(VStage& st, const VLoad& L, const int t) {
+  if (t < 64) {
+    const int r = t >> 4, c = t & 15;
+    *reinterpret_cast<uint4*>(st.bst + r * S + c * 8) = L.sm[0];
+    *reinterpret_cast<uint4*>(st.bm + t * 8) = L.sm[1];
+    *reinterpret_cast<uint4*>(st.cm + t * 8) = L.sm[2];
+    *reinterpret_cast<float4*>(st.xproj + r * D + c * 4) = L.c[0];
+    *reinterpret_cast<float4*>(st.outproj + r * D + c * 4) = L.c[1];
+  } else {
+    const int q = t - 64;
+    if (q < 8) *reinterpret_cast<uint4*>(st.x + q * 8) = L.sm[0];
+    else if (q < 16) *reinterpret_cast<uint4*>(st.z + (q - 8) * 8) = L.sm[0];
+    else if (q < 24) *reinterpret_cast<uint4*>(st.xst + (q - 16) * 8) = L.sm[0];
+    else if (q < 28) *reinterpret_cast<uint4*>(st.angp + (q - 24) * 8) = L.sm[0];
+    else if (q < 36) *reinterpret_cast<uint4*>(st.angst + (q - 28) * 4) = L.sm[0];
+    const int r = q >> 4, c = q & 15;
+    *reinterpret_cast<float4*>(st.zproj + r * D + c * 4) = L.c[0];
+  }
+}
+
+__global__ void __launch_bounds__(THREADS, 3) mamba3_step_volta_kernel(const Args a) {
+  __shared__ VSmem S_;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int qd = lane & 3, p0 = warp * 16 + (lane >> 2);
+  const int nitems = a.B * H, stride = gridDim.x;   // items b * H + h, dealt round-robin
+  int item = blockIdx.x;
+  if (item >= nitems) return;
+  VStage& st = S_.st;
+  VLoad cur;
+  int slotc = a.slots[item / H];
+  v_issue(a, item, slotc, t, p0, qd, cur);
+  v_stage(st, cur, t);
+  int slotn = item + stride < nitems ? a.slots[(item + stride) / H] : 0;   // the next item's slot, one item ahead
+  __syncthreads();
+  for (; item < nitems; item += stride) {
+    const int b = item / H, h = item % H;
+    auto bias_k = [&](int r, int j) -> float { return __ldg(a.bias_k + ((size_t)r * H + h) * S + j); };
+    auto bias_q = [&](int r, int j) -> float { return __ldg(a.bias_q + ((size_t)r * H + h) * S + j); };
+    const int slot = slotc; const bool valid = slot >= 0 && slot < a.P;
+    const float dt = cur.dt, A = cur.A, trap = cur.trap;
+    const float Dh = a.Dp[h];
+    const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
+    // ---- preamble: angles, bias + rotary on B/C (bf16-rounded)
+    if (t < NA) { float th = st.angst[t] + tanhf(bf2f(st.angp[t])) * dt * 3.14159265358979323846f; th -= 6.283185307179586f * floorf(th / 6.283185307179586f); S_.sTheta[t] = th; sincosf(th, &S_.sSin[t], &S_.sCos[t]); }
+    __syncthreads();
+    for (int i = t; i < R * (S / 2); i += THREADS) {
+      const int r = i / (S / 2), j = i % (S / 2);
+      float blo = bf2f(st.bm[r * S + j]) + bias_k(r, j), bhi = bf2f(st.bm[r * S + j + 64]) + bias_k(r, j + 64);
+      float clo = bf2f(st.cm[r * S + j]) + bias_q(r, j), chi = bf2f(st.cm[r * S + j + 64]) + bias_q(r, j + 64);
+      if (j < NA) {
+        const float c = S_.sCos[j], s_ = S_.sSin[j];
+        const float b0 = blo * c - bhi * s_, b1 = blo * s_ + bhi * c, c0 = clo * c - chi * s_, c1 = clo * s_ + chi * c;
+        blo = b0; bhi = b1; clo = c0; chi = c1;
+      }
+      S_.sBk[r][j] = __float2bfloat16(blo); S_.sBk[r][j + 64] = __float2bfloat16(bhi);
+      S_.sBk[4 + r][j] = st.bst[r * S + j]; S_.sBk[4 + r][j + 64] = st.bst[r * S + j + 64];
+      S_.sCb[r][j] = __float2bfloat16(clo); S_.sCb[r][j + 64] = __float2bfloat16(chi);
+    }
+    __syncthreads();
+    // ---- h_new = alpha h + sum_k A[p][k] Bk[k][s] in fp32 (rows p0, p0+8; columns jt*8 + 2qd + {0,1}); then
+    // o[p][r] = sum_s h_new[p][s] C'[r][s], reduced over the 4 qd lanes (the 1-stage kernel's STEP_F32_FMA code)
+    float av[2][8];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int p = p0 + e * 8;
+      const float xp = bf2f(st.x[p]), xs = bf2f(st.xst[p]);
+#pragma unroll
+      for (int r = 0; r < R; ++r) { const float xpj = st.xproj[r * D + p]; av[e][r] = gamma * xp * xpj; av[e][4 + r] = beta * xs * xpj; }
+    }
+    float o[2][R];
+#pragma unroll
+    for (int e = 0; e < 2; ++e)
+#pragma unroll
+      for (int r = 0; r < R; ++r) o[e][r] = 0.f;
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt) {
+      const int n = jt * 8 + 2 * qd;
+      float2 bk[8], cr[R];
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) bk[kk] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sBk[kk][n]));
+#pragma unroll
+      for (int r = 0; r < R; ++r) cr[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sCb[r][n]));
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        float2 hv = cur.h[e][jt];
+        hv.x *= alpha; hv.y *= alpha;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) { hv.x = fmaf(av[e][kk], bk[kk].x, hv.x); hv.y = fmaf(av[e][kk], bk[kk].y, hv.y); }
+        cur.h[e][jt] = hv;
+#pragma unroll
+        for (int r = 0; r < R; ++r) o[e][r] = fmaf(hv.x, cr[r].x, fmaf(hv.y, cr[r].y, o[e][r]));
+      }
+    }
+#pragma unroll
+    for (int e = 0; e < 2; ++e)
+#pragma unroll
+      for (int r = 0; r < R; ++r) { o[e][r] += __shfl_xor_sync(0xffffffffu, o[e][r], 1); o[e][r] += __shfl_xor_sync(0xffffffffu, o[e][r], 2); }
+    float ys[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {   // lane qd takes r = qd
+      const int p = p0 + e * 8;
+      const float xp = bf2f(st.x[p]), zp = bf2f(st.z[p]);
+      float orr = o[e][0];
+#pragma unroll
+      for (int r = 1; r < R; ++r) orr = (qd == r) ? o[e][r] : orr;
+      orr += Dh * xp * st.xproj[qd * D + p];
+      const float zv = zp * st.zproj[qd * D + p];
+      orr *= __fdividef(zv, 1.f + __expf(-zv));
+      ys[e] = orr * st.outproj[qd * D + p];
+      ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
+    }
+    if (qd == 0) { a.y[((size_t)b * H + h) * D + p0] = __float2bfloat16(valid ? ys[0] : 0.f); a.y[((size_t)b * H + h) * D + p0 + 8] = __float2bfloat16(valid ? ys[1] : 0.f); }
+    if (valid) {   // h_new straight from the registers to the pool, then B' / x / theta
+      float* dst = reinterpret_cast<float*>(a.ssm) + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+#pragma unroll
+        for (int jt = 0; jt < 16; ++jt) *reinterpret_cast<float2*>(dst + (p0 + e * 8) * S + jt * 8 + 2 * qd) = cur.h[e][jt];
+      if (t < 64) { const int r = t >> 4, c = t & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[r][c * 8]); }
+      if (t < D) a.vp[(size_t)slot * a.vp_sst + (size_t)h * D + t] = st.x[t];
+      if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
+    }
+    __syncthreads();   // sBk / sCb / sTheta and the stage are free for the next item
+    if (item + stride < nitems) {
+      slotc = slotn;
+      if (item + 2 * stride < nitems) slotn = a.slots[(item + 2 * stride) / H];
+      v_issue(a, item + stride, slotc, t, p0, qd, cur);
+      v_stage(st, cur, t);
+      __syncthreads();
+    }
+  }
+}
+#endif  // STEP_VOLTA
 }  // namespace
 
 void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tensor v_pool, torch::Tensor angle_pool,
@@ -676,9 +898,26 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
       kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
     }
   };
-  // fp32 state, preamble done upstream: the pipelined kernel (OLALA_STEP_PIPE=0 keeps the 1-stage one)
+  // fp32 state, preamble done upstream: the pipelined kernel (OLALA_STEP_PIPE=0 keeps the 1-stage one); on Volta its
+  // FMA edition mamba3_step_volta_kernel (the tensor-core pipelined kernel is emulated there); else (raw rows, bf16
+  // state) the 1-stage kernel, with the FMA update on Volta
+#ifdef STEP_VOLTA
+  constexpr bool volta = true;
+#else
+  constexpr bool volta = false;
+#endif
   static const bool pipe = [] { const char* e = getenv("OLALA_STEP_PIPE"); return !(e && e[0] == '0'); }();
-  if (f32 && !a.raw && pipe) launch(mamba3_step_f32_pipe_kernel, (int)sizeof(SmemP));
+#if defined(STEP_VOLTA) && !defined(STEP_VOLTA_1STAGE)   // STEP_VOLTA_1STAGE: tests build the 1-stage kernel
+  if (f32 && !a.raw && pipe) {   // items dealt round-robin: the grid need not be a multiple of H
+    int nsm = 80; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+    int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, mamba3_step_volta_kernel, THREADS, 0);
+    const int cps = std::max(1, std::min<int>((int)ctas_per_sm, fit));
+    const int grid = std::max(1, std::min(a.B * H, nsm * cps));
+    mamba3_step_volta_kernel<<<grid, THREADS, 0, c10::cuda::getCurrentCUDAStream()>>>(a);
+    return;
+  }
+#endif
+  if (f32 && !a.raw && pipe && !volta) launch(mamba3_step_f32_pipe_kernel, (int)sizeof(SmemP));
   else if (f32) launch(mamba3_step_cuda_kernel<true>, (int)sizeof(Smem<true>));
   else launch(mamba3_step_cuda_kernel<false>, (int)sizeof(Smem<false>));
 }

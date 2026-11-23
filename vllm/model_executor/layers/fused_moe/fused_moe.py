@@ -1429,6 +1429,33 @@ def get_default_config(
     return config
 
 
+# V100 (the SM70 family: natively, or through volta-forever, which runs the kernel's bf16 tl.dot as
+# fp32 fmaf chains in the order of k): 16-row tiles pad each expert's sorted rows to 16 instead of the
+# default 64-128 (a 2048-token chunk of a 256-expert top-6 MoE has ~48 rows per expert), one stage (no
+# cp.async pipelining on Volta). The chains over k are the same with any tile: the same bits. Olala's
+# bf16 latent MoE (E = 256, N = 768, K = 384, top-6), V100 through volta-forever, graphed, us per layer,
+# default -> this: 513 tokens 4184 -> 803, 1024: 5131 -> 1225, 2048: 5289 -> 2053.
+_SM70_MOE_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 1,
+    "SPLIT_K": 1,
+    "num_warps": 4,
+    "num_stages": 1,
+}
+
+
+@functools.cache
+def _sm70_family() -> bool:
+    """A V100, natively or through volta-forever (which tells the process a later capability)."""
+    if not current_platform.is_cuda():
+        return False
+    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+
+    return gpu_family() is GpuFamily.SM70
+
+
 def try_get_optimal_moe_config(
     w1_shape: tuple[int, ...],
     w2_shape: tuple[int, ...],
@@ -1455,6 +1482,9 @@ def try_get_optimal_moe_config(
             # If an optimal configuration map has been found, look up the
             # optimal config
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        elif dtype is None and block_shape is None and _sm70_family():
+            # unquantized bf16 / fp16 experts on a V100
+            config = dict(_SM70_MOE_CONFIG)
         else:
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)

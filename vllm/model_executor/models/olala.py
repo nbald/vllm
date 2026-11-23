@@ -41,7 +41,13 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
-from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv, olala_linear
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+from vllm.model_executor.layers.mamba.olala.decode_gemv import (
+    decode_gemv,
+    olala_linear,
+    volta_gemv,
+    volta_gemv_ok,
+)
 from vllm.model_executor.layers.mamba.olala.geo_linear import (
     GEO_FUSE,
     GEO_LINEAR_MAX_TOKENS,
@@ -50,12 +56,17 @@ from vllm.model_executor.layers.mamba.olala.geo_linear import (
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     FUSED_PROJ_MAX_TOKENS,
     SMALL_BATCH_MAX_TOKENS,
+    SMALL_BATCH_MAX_TOKENS_VOLTA,
     SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM,
     small_path_max_tokens,
     olala_moe_small,
     moe_cat_shared,
 )
 from vllm.model_executor.layers.mamba.olala.latent_moe_fused import olala_moe_fused
+from vllm.model_executor.layers.mamba.olala.router_volta import (
+    router_chain,
+    router_chain_ok,
+)
 from vllm.model_executor.layers.mamba.olala.latent_moe_updown import (
     UPDOWN_ENABLED,
     olala_moe_updown,
@@ -77,9 +88,11 @@ from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
 )
 from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import (
     INT8_SMALL_MAX_TOKENS,
+    VOLTA_SMALL_MAX_TOKENS,
     WqWeight,
     olala_moe_medium_int8,
     olala_moe_small_int8,
+    olala_moe_small_int8_volta,
     wq_routed_experts,
 )
 from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
@@ -99,6 +112,7 @@ from vllm.model_executor.layers.mamba.olala import (
     OlalaDiffTPAAttention,
     OlalaMamba3Mixer,
     OlalaNorm,
+    volta_cuda,
 )
 from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
@@ -106,6 +120,7 @@ from vllm.model_executor.layers.mamba.olala.state import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -192,6 +207,9 @@ class OlalaSharedMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
+        # Volta tensor-core edition (OLALA_VOLTA_TC, volta_tc.py): the ReLU² input rows need
+        # two exact fp16 terms
+        self.down_proj.olala_tc_terms = 2
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -239,11 +257,32 @@ def _int8_skip_layers() -> frozenset[int]:
     return frozenset(int(x) for x in raw.replace(" ", "").split(",") if x)
 
 
+@functools.cache
+def _volta_tc_bf16() -> bool:
+    """OLALA_VOLTA_TC with bf16 projections on the SM70 family (volta_tc.py)."""
+    from vllm.model_executor.layers.mamba.olala.volta_tc import tc_enabled
+
+    return tc_enabled("bf16")
+
+
 def _olala_router_logits(
-    hidden_states: torch.Tensor, weight: torch.Tensor, num_experts: int
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    num_experts: int,
+    decode_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """fp32 router logits from bf16 activations and a bf16 router weight
-    holding one ([E, K]) or two ([hi ; lo], [2E, K]) bf16 parts."""
+    holding one ([E, K]) or two ([hi ; lo], [2E, K]) bf16 parts.
+    ``decode_weight`` (Volta): hi + lo as fp32 [E, K], used at decode sizes."""
+    if decode_weight is not None and volta_gemv_ok(hidden_states, decode_weight):
+        # Volta (OlalaLatentMoE._volta_router): the same bf16x2 product as an
+        # FMA GEMV over hi + lo (exact in fp32), without cuBLAS bf16.
+        return volta_gemv(hidden_states, decode_weight, torch.float32)
+    if router_chain_ok(hidden_states, weight, num_experts):
+        # SM70 family, 33..2048 rows: cuBLAS runs this bf16 GEMM as fp32 SIMT
+        # chains (magma) with few CTAs; the same chains and add, bit for bit,
+        # in a kernel tiled for the batch (router_volta.py).
+        return router_chain(hidden_states, weight, num_experts)
     out = torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
     if weight.shape[0] == num_experts:
         return out
@@ -251,7 +290,10 @@ def _olala_router_logits(
 
 
 def _olala_router_logits_fake(
-    hidden_states: torch.Tensor, weight: torch.Tensor, num_experts: int
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    num_experts: int,
+    decode_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return hidden_states.new_empty(
         (hidden_states.shape[0], num_experts), dtype=torch.float32
@@ -421,9 +463,15 @@ class OlalaLatentMoE(nn.Module):
         # Medium batches (decode): fused routing/sort, relu^2 in the up GEMM,
         # top-k sum fused with the shared concat. Unquantized experts only;
         # OLALA_MOE_MEDIUM=0 disables it.
+        # Volta with weight-only experts: the small path (FMA kernels) covers up
+        # to VOLTA_SMALL_MAX_TOKENS tokens and larger batches take the prefill
+        # path; the medium path's grouped GEMMs are emulated tl.dot there (and
+        # volta-forever refuses its down GEMM: redux.sync on a reused mask).
+        self._int8_volta = self._int8 and gpu_family() is GpuFamily.SM70
         self._medium_path = (
             self._small_path
             and (quant_config is None or self._int8)
+            and not self._int8_volta
             and os.environ.get("OLALA_MOE_MEDIUM", "1") != "0"
         )
         # Opt-in: medium batches through one persistent kernel (routing,
@@ -458,6 +506,20 @@ class OlalaLatentMoE(nn.Module):
             self._entry_path = True
             self._entry_router_parts = 2 if self._router_mode == "bf16x2" else 1
 
+        # Volta (V100; volta-forever tells the process sm_80): cuBLAS has no
+        # Volta bf16 GEMM kernel, so the bf16x2 router GEMM takes ~240 us per
+        # layer from 2 tokens on (7 us at one token). At decode sizes an FMA
+        # GEMV over hi + lo (exact in fp32) gives the same product in 5-10 us
+        # up to 8 tokens, 25 us at 32; prefill keeps the bf16x2 GEMM. Only
+        # where forward() computes the logits (not in the entry GEMM).
+        self._volta_router = (
+            self._router_mode == "bf16x2"
+            and self.gate.weight.dtype == torch.float32
+            and not self._entry_path
+            and gpu_family() is GpuFamily.SM70
+        )
+        self._router_w16: torch.Tensor | None = None
+
         # Registered like the mixers so the MoE call is one opaque custom op
         # and the small/generic dispatch runs inside it (see forward_dispatch).
         self.registry_name = f"{prefix}.latent_moe"
@@ -477,7 +539,7 @@ class OlalaLatentMoE(nn.Module):
             return out.reshape(orig_shape)
         if self._router_w is not None:
             router_logits = torch.ops.vllm.olala_router_logits(
-                hidden_states, self._router_w, self.num_experts
+                hidden_states, self._router_w, self.num_experts, self._router_w16
             )
         else:
             router_logits, _ = self.gate(hidden_states)
@@ -530,6 +592,13 @@ class OlalaLatentMoE(nn.Module):
             if re is not None
             else SMALL_BATCH_MAX_TOKENS
         )
+        if (
+            re is not None
+            and re.w13_weight.dtype != torch.int8
+            and gpu_family() is GpuFamily.SM70
+        ):
+            # the medium path's grouped GEMMs are emulated tl.dot on Volta
+            small_max = max(small_max, SMALL_BATCH_MAX_TOKENS_VOLTA)
         if router_logits is None:
             m = hidden_states.shape[0]
             if m <= small_max or (self._medium_path and m <= MEDIUM_BATCH_MAX_TOKENS):
@@ -581,7 +650,10 @@ class OlalaLatentMoE(nn.Module):
                 self.routed_scaling_factor,
                 x_in=x_in,
             )
-        if self._fused_proj and hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS:
+        if self._fused_proj and (
+            hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS or _volta_tc_bf16()
+        ):
+            # OLALA_VOLTA_TC: prefill batches too, through the two tensor-core projections
             w_in, w_out = self._small_path_weights()
             x_in = decode_gemv(hidden_states, w_in)
             latent = x_in[:, : self.latent_size].contiguous()
@@ -615,7 +687,9 @@ class OlalaLatentMoE(nn.Module):
         for per-row INT8) and W8A16 linears beyond (prefill)."""
         m = hidden_states.shape[0]
         weights = self._int8_weights()
-        small = m <= INT8_SMALL_MAX_TOKENS
+        small = m <= (
+            VOLTA_SMALL_MAX_TOKENS if self._int8_volta else INT8_SMALL_MAX_TOKENS
+        )
         if self._small_path and (
             small or (self._medium_path and m <= MEDIUM_BATCH_MAX_TOKENS)
         ):
@@ -647,6 +721,8 @@ class OlalaLatentMoE(nn.Module):
                 self.routed_scaling_factor,
             )
             if small:
+                if self._int8_volta:
+                    return olala_moe_small_int8_volta(*args, router_logits_lo=logits_lo)
                 return olala_moe_small_int8(*args, router_logits_lo=logits_lo)
             return olala_moe_medium_int8(*args, router_logits_lo=logits_lo)
         if router_logits is None:
@@ -761,6 +837,13 @@ class OlalaLatentMoE(nn.Module):
                 self._router_w = new
             else:
                 self._router_w.copy_(new)
+            if self._volta_router:
+                # hi + lo: 16 significant bits, exact in fp32
+                w16 = parts[0].float() + parts[1].float()
+                if self._router_w16 is None:
+                    self._router_w16 = w16
+                else:
+                    self._router_w16.copy_(w16)
 
     def _small_path_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Concatenated projections for the small-batch path.
@@ -898,6 +981,9 @@ def _olala_geodesic_norm(
     clamp: float,
 ) -> torch.Tensor:
     out = torch.empty_like(x)
+    if volta_cuda.geodesic_ok(x, g, out, scale, bias):
+        # Volta: the CUDA edition of _geodesic_norm_kernel, bit for bit (volta_cuda.py)
+        return volta_cuda.geodesic(x, g, out, scale, bias, inv_depth, clamp)
     D = x.shape[-1]
     _geodesic_norm_kernel[(x.numel() // D,)](
         x,
@@ -981,6 +1067,10 @@ class OlalaGeodesicNorm(nn.Module):
                 x, g, self.scale, self.bias, 1.0 / (self.layer_idx + 1), self.clamp
             )
         # into the caller's buffer: called from inside the opaque MoE op (eager)
+        if volta_cuda.geodesic_ok(x, g, out, self.scale, self.bias):
+            return volta_cuda.geodesic(
+                x, g, out, self.scale, self.bias, 1.0 / (self.layer_idx + 1), self.clamp
+            )
         D = x.shape[-1]
         _geodesic_norm_kernel[(x.numel() // D,)](
             x,
@@ -1108,6 +1198,10 @@ class OlalaMonoBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mixer_proj",
         )
+        if layer_type == "M":
+            # OLALA_VOLTA_TC (volta_tc.py): Mamba-3 output rows span up to ~100 binades, three
+            # exact fp16 terms
+            self.mixer_proj.olala_tc_terms = 3
 
         eps = config.norm_epsilon
         zc = getattr(config, "zero_centered_gamma", False)
@@ -1538,6 +1632,40 @@ class OlalaForCausalLM(
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        lp, head = self.logits_processor, self.lm_head
+        plain_head = (
+            hidden_states.dim() == 2
+            and not lp.logits_as_input
+            and lp.head_dtype in (None, hidden_states.dtype)
+            and head.tp_size == 1
+            and isinstance(head.quant_method, UnquantizedEmbeddingMethod)
+            and hidden_states.dtype == head.weight.dtype
+        )
+        logits = None
+        if (
+            plain_head
+            and hidden_states.shape[0] <= 16
+            and volta_gemv_ok(hidden_states, head.weight)
+        ):
+            # Volta, up to 16 sequences: cuBLAS has no Volta bf16 GEMM kernel
+            # and its fallback streams the 152k x 1536 head at ~150 GB/s; the
+            # FMA GEMV reads it once for all rows. V100 through volta-forever,
+            # graphed, us: 1 row 693 -> 536, 2: 3417 -> 555, 8: 2962 -> 787,
+            # 16: 2973 -> 1476 (from 24 rows cuBLAS is as fast). Same output
+            # dtype as cuBLAS (fp32 accumulation, logits rounded to bf16).
+            logits = decode_gemv(hidden_states, head.weight)
+        elif plain_head and gpu_family() is GpuFamily.SM70:
+            # OLALA_VOLTA_TC (on by default): the fp16 tensor cores, exactly scaled (volta_tc.py)
+            from vllm.model_executor.layers.mamba.olala.volta_tc import bf16_linear
+
+            logits = bf16_linear(hidden_states, head.weight)
+        if logits is not None:
+            logits = logits[..., : lp.org_vocab_size]
+            if lp.soft_cap is not None:
+                logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+            if lp.scale != 1.0:
+                logits = logits * lp.scale
+            return logits
         return self.logits_processor(self.lm_head, hidden_states)
 
     def update_physical_experts_metadata(
@@ -1738,6 +1866,11 @@ class OlalaForCausalLM(
         for module in self.modules():
             if isinstance(module, (OlalaMamba3Mixer, OlalaDiffTPAAttention, OlalaLatentMoE)):
                 module.refresh_weight_caches()
+        if _volta_tc_bf16():
+            # fp16 copies of the bf16 projections (volta_tc.py), before the KV cache is sized
+            from vllm.model_executor.layers.mamba.olala.volta_tc import prepare_bf16
+
+            prepare_bf16(self)
         return loaded
 
     def _maybe_prenormalize_embeddings(self) -> None:

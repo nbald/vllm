@@ -22,7 +22,12 @@ import os
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family
+from vllm.model_executor.layers.mamba.olala.arch import (
+    GpuFamily,
+    gencode,
+    gpu_family,
+    sm80_class,
+)
 from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
 from vllm.forward_context import get_forward_context
@@ -36,6 +41,12 @@ from vllm.utils.torch_utils import (
 SMALL_BATCH_MAX_TOKENS = 8
 # With the medium path available (bf16 experts) it wins from 6 tokens on B300.
 SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM = 5
+# Volta (V100, natively or through volta-forever): the medium path's grouped
+# GEMMs are tl.dot, whose bf16 mma.sync is emulated with scalar code there, and
+# pad each expert's rows to 16; the small path's gather-GEMV kernels are plain
+# FMA. Per layer, small vs medium (FMA projections): 8 tokens 110 vs 364 us,
+# 16 tokens 168 vs 459 us, 32 tokens 452 vs 751 us.
+SMALL_BATCH_MAX_TOKENS_VOLTA = 32
 
 # The CUDA small path (int8 experts) beats the generic path up to 32 tokens on an A4500
 # (realistic routing, decode16: -0.6 ms/step): no align/sort/sum launches.
@@ -50,8 +61,9 @@ _SMALL_EXT = None
 
 @functools.cache
 def _small_cuda_arch() -> bool:
-    # Ampere / Ada / Hopper (mma.sync); Blackwell keeps the Triton small path tuned for it
-    return gpu_family() in (GpuFamily.SM80, GpuFamily.SM90)
+    # Ampere / Ada / Hopper (mma.sync), and Volta through volta-forever; Blackwell keeps the
+    # Triton small path tuned for it
+    return sm80_class() or gpu_family() is GpuFamily.SM90
 
 
 def small_path_max_tokens(w13: torch.Tensor) -> int:

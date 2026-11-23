@@ -2507,4 +2507,27 @@ def compile_factors() -> dict[str, object]:
     for var in ray_noset_env_vars:
         factors[var] = normalize_value(os.getenv(var))
 
+    # Olala's kernels choose their dispatch from OLALA_* switches and, on a V100,
+    # from running under volta-forever (whose launcher exports VOLTA_FOREVER):
+    # both change the traced graph, so a graph compiled under one setting must
+    # not be reused under another (e.g. after switching OLALA_VOLTA).
+    # OLALA_TPA_BUILD_DIR only says where JIT extensions are built; the
+    # volta-forever version does not change the graph, only its presence does.
+    for var in sorted(os.environ):
+        if var.startswith("OLALA_") and var != "OLALA_TPA_BUILD_DIR":
+            factors[var] = normalize_value(os.environ[var])
+    # OLALA_VOLTA_TC was off when unset; it now defaults to the DEFAULT_KINDS of
+    # olala/volta_tc.py on the SM70 family. Key that default explicitly, so that a
+    # graph cached with the variable unset before the change is never reused with
+    # the new default (a constant: other GPUs recompile once, nothing else changes).
+    if "OLALA_VOLTA_TC" not in os.environ:
+        factors["OLALA_VOLTA_TC"] = "default:int8,bf16"
+    # VF_SAFE=1 (volta-forever's conservative switch; only the exact value "1")
+    # turns that edition off: key it too, so that graphs built with it on are not
+    # reused (other values change nothing, and add no factor).
+    if os.environ.get("VF_SAFE") == "1":
+        factors["VF_SAFE"] = "1"
+    if "VOLTA_FOREVER" in os.environ:
+        factors["VOLTA_FOREVER"] = True
+
     return factors

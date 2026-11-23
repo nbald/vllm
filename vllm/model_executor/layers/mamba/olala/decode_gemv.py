@@ -13,16 +13,19 @@ copy bandwidth there on an A4500, the skinny kernel 80-97 %).
 """
 
 import os
+from functools import cache
 
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family, sm_arch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
 _DISABLED = os.environ.get("OLALA_GEMV", "1") == "0"
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -167,12 +170,345 @@ def _decode_gemv_sm120(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.linear(x, weight)
 
 
+# -- Volta (V100), natively or through volta-forever ------------------------------------------
+# volta-forever tells the process sm_80 (so bf16 stays on), and on sm_70 tl.dot's bf16 mma.sync is
+# emulated with scalar code (~200 instructions per m16n8k16, 64 of them FMAs) while plain FMA code
+# runs natively. The skinny kernel pays that for 16 padded rows per real row (~170 GB/s whatever
+# M), and cuBLAS has no Volta bf16 GEMM kernels (F.linear: 70-300 us per decode projection). So on
+# Volta decode GEMVs take FMA kernels: one row the GEMV below at any K; 2..32 rows the kernels
+# below, which load each weight tile once for all rows and keep fp32 partial sums per lane until a
+# single reduction. V100 through volta-forever, graphed, weights from DRAM, us (skinny -> FMA):
+# 1 row: in_proj 7344x1536 124 -> 30, mixer_proj 1536x3072 121 -> 14, TPA mixer 1536x4608
+# 178 -> 20, MoE w_out 1536x1920 77 -> 14; 8 rows: in_proj 134 -> 50, mixer_proj 130 -> 28,
+# TPA mixer 193 -> 40, w_in 1920x1536 67 -> 16; 32 rows: mixer_proj 197 -> 94, in_proj 175 -> 165.
+VOLTA_ROWS_MAX_M = 32
+
+# Weight scales of the Volta GEMVs (constexpr SCALE): none (bf16 / fp32 weights), one fp32 scale
+# per output row (INT8 W8A16 per channel: applied to the fp32 row sum), one scale per G weights
+# along K (INT8 W8A16 per group: applied to the fp32 weight before the FMAs).
+VOLTA_SCALE_NONE, VOLTA_SCALE_ROW, VOLTA_SCALE_GROUP = 0, 1, 2
+
+
+@triton.jit
+def _volta_w_tile(
+    w_ptr, s_ptr, offs_n, n_mask, offs_k, mask, stride_wn, stride_sn,
+    SCALE: tl.constexpr, G: tl.constexpr,
+):
+    """A [BN, BK] weight tile as fp32 (INT8 codes are exact), group scales applied."""
+    w = tl.load(
+        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :], mask=mask, other=0.0,
+    ).to(tl.float32)
+    if SCALE == 2:
+        # one scale per G codes, gathered per element (L1 hits): no reshape of the tile
+        s = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + (offs_k // G)[None, :], mask=mask, other=0.0,
+        ).to(tl.float32)
+        w = w * s
+    return w
+
+
+@triton.jit
+def _volta_row_sum(acc, s_ptr, offs_n, n_mask, SCALE: tl.constexpr):
+    """Row sums of the per-lane partial sums, per-row scales applied."""
+    y = tl.sum(acc, axis=1)
+    if SCALE == 1:
+        y = y * tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)
+    return y
+
+
+@triton.jit
+def _gemv_m1_volta_kernel(
+    x_ptr, w_ptr, y_ptr, s_ptr, N, K, stride_wn, stride_sn,
+    BN: tl.constexpr, BK: tl.constexpr, KMASK: tl.constexpr,
+    SCALE: tl.constexpr = 0, G: tl.constexpr = 1,
+):
+    """One-row GEMV for Volta: partial sums per (n, k) lane, reduced once after the K loop; the
+    optional K mask lets K = 1920 (MoE w_out) use 512-wide blocks."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    n_mask = offs_n < N
+    acc = tl.zeros([BN, BK], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        if KMASK:
+            k_mask = offs_k < K
+            w = _volta_w_tile(
+                w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None] & k_mask[None, :],
+                stride_wn, stride_sn, SCALE, G,
+            )
+            x = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0)
+        else:
+            w = _volta_w_tile(
+                w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None], stride_wn, stride_sn,
+                SCALE, G,
+            )
+            x = tl.load(x_ptr + offs_k)
+        acc += w * x.to(tl.float32)[None, :]
+    y = _volta_row_sum(acc, s_ptr, offs_n, n_mask, SCALE)
+    tl.store(y_ptr + offs_n, y.to(y_ptr.dtype.element_ty), mask=n_mask)
+
+
+def _volta_scale_args(weight: torch.Tensor, scale: torch.Tensor | None) -> tuple:
+    """(scale pointer, its row stride, SCALE, G) of a Volta GEMV launch."""
+    if scale is None:
+        return weight, 0, VOLTA_SCALE_NONE, 1
+    if scale.dim() == 1:
+        return scale, 0, VOLTA_SCALE_ROW, 1
+    return scale, scale.stride(0), VOLTA_SCALE_GROUP, weight.shape[1] // scale.shape[1]
+
+
+def _gemv_m1_volta(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # V100 through volta-forever, graphed, weights from DRAM: one weight row per 4-warp
+    # program, 512-wide K blocks, against the GH200 configs of _gemv_m1, us: in_proj
+    # 7344x1536 30.5 -> 28.8, mixer_proj 1536x3072 14.5 -> 14.0, TPA gate 4608x1536
+    # 23.5 -> 19.2, MoE w_out 1536x1920 13.7 -> 9.3 (512-wide blocks need the K mask),
+    # fp32 router 256x1536 5.0 -> 3.9.
+    N, K = weight.shape
+    y = torch.empty(1, N, dtype=out_dtype or x.dtype, device=x.device) if out is None else out
+    s, ss, mode, g = _volta_scale_args(weight, scale)
+    _gemv_m1_volta_kernel[(N,)](
+        x, weight, y, s, N, K, weight.stride(0), ss, BN=1, BK=512, KMASK=K % 512 != 0,
+        SCALE=mode, G=g, num_warps=4,
+    )
+    return y
+
+
+@triton.jit
+def _rows_acc(acc, w, x_ptr, m: tl.constexpr, stride_xm, offs_k, M):
+    x = tl.load(x_ptr + m * stride_xm + offs_k, mask=(offs_k * 0 + m) < M, other=0.0)
+    return acc + w * x.to(tl.float32)[None, :]
+
+
+@triton.jit
+def _rows_store(
+    y_ptr, acc, m: tl.constexpr, stride_ym, offs_n, n_mask, M, s_ptr, SCALE: tl.constexpr,
+):
+    y = _volta_row_sum(acc, s_ptr, offs_n, n_mask, SCALE)
+    tl.store(y_ptr + m * stride_ym + offs_n, y.to(y_ptr.dtype.element_ty), mask=n_mask & (m < M))
+
+
+@triton.jit
+def _gemv_rows_kernel(
+    x_ptr, w_ptr, y_ptr, s_ptr, M, N, K, stride_xm, stride_wn, stride_ym, stride_sn,
+    MB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    SCALE: tl.constexpr = 0, G: tl.constexpr = 1,
+):
+    """``y = x @ w.T`` for M <= MB <= 8 rows with FMAs (Volta): each [BN, BK] weight tile is
+    loaded once and used for every row; per-row partial sums stay per (n, k) lane across the K
+    loop and are reduced once at the end."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    n_mask = offs_n < N
+    a0 = tl.zeros([BN, BK], dtype=tl.float32)
+    a1 = tl.zeros([BN, BK], dtype=tl.float32)
+    a2 = tl.zeros([BN, BK], dtype=tl.float32)
+    a3 = tl.zeros([BN, BK], dtype=tl.float32)
+    a4 = tl.zeros([BN, BK], dtype=tl.float32)
+    a5 = tl.zeros([BN, BK], dtype=tl.float32)
+    a6 = tl.zeros([BN, BK], dtype=tl.float32)
+    a7 = tl.zeros([BN, BK], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        w = _volta_w_tile(
+            w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None], stride_wn, stride_sn, SCALE, G,
+        )
+        a0 = _rows_acc(a0, w, x_ptr, 0, stride_xm, offs_k, M)
+        a1 = _rows_acc(a1, w, x_ptr, 1, stride_xm, offs_k, M)
+        if MB > 2:
+            a2 = _rows_acc(a2, w, x_ptr, 2, stride_xm, offs_k, M)
+            a3 = _rows_acc(a3, w, x_ptr, 3, stride_xm, offs_k, M)
+        if MB > 4:
+            a4 = _rows_acc(a4, w, x_ptr, 4, stride_xm, offs_k, M)
+            a5 = _rows_acc(a5, w, x_ptr, 5, stride_xm, offs_k, M)
+            a6 = _rows_acc(a6, w, x_ptr, 6, stride_xm, offs_k, M)
+            a7 = _rows_acc(a7, w, x_ptr, 7, stride_xm, offs_k, M)
+    _rows_store(y_ptr, a0, 0, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+    _rows_store(y_ptr, a1, 1, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+    if MB > 2:
+        _rows_store(y_ptr, a2, 2, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a3, 3, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+    if MB > 4:
+        _rows_store(y_ptr, a4, 4, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a5, 5, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a6, 6, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a7, 7, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+
+
+@triton.jit
+def _gemv_rows_many_kernel(
+    x_ptr, w_ptr, y_ptr, s_ptr, M, N, K, stride_xm, stride_wn, stride_ym, stride_sn,
+    MB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    SCALE: tl.constexpr = 0, G: tl.constexpr = 1,
+):
+    """The same for 9..32 rows (Volta): one [MB, BN, BK] product per K step, partial sums kept
+    across the loop (more separate row accumulators would spill)."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    offs_m = tl.arange(0, MB)
+    n_mask = offs_n < N
+    m_mask = offs_m < M
+    acc = tl.zeros([MB, BN, BK], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        w = _volta_w_tile(
+            w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None], stride_wn, stride_sn, SCALE, G,
+        )
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :], mask=m_mask[:, None], other=0.0,
+        )
+        acc += x.to(tl.float32)[:, None, :] * w[None, :, :]
+    y = tl.sum(acc, axis=2)
+    if SCALE == 1:
+        y = y * tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+    tl.store(
+        y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :], y.to(y_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def _decode_gemv_volta(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """1..VOLTA_ROWS_MAX_M rows on Volta (K % 128 == 0, unit inner strides); x and weight may be
+    any float dtypes, or an INT8 weight with ``scale`` (fp32 [N] per row, or [N, K // G] per
+    group); fp32 accumulation, the output is ``out_dtype`` (default x's), or written into
+    ``out`` (an (M, N) view with unit column stride, e.g. a column slice of a wider buffer)."""
+    M, K = x.shape
+    N = weight.shape[0]
+    if M == 1:
+        return _gemv_m1_volta(x, weight, out_dtype, scale, out)
+    y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device) if out is None else out
+    if M <= 8 and _rows_cuda(x, weight, scale, y):
+        return y
+    if M <= 8:
+        kernel, bn, bk, nw = _gemv_rows_kernel, 16, 128, 8
+    else:
+        kernel, bn, bk, nw = _gemv_rows_many_kernel, 8, 64, 4
+    s, ss, mode, g = _volta_scale_args(weight, scale)
+    kernel[(triton.cdiv(N, bn),)](
+        x, weight, y, s, M, N, K, x.stride(0), weight.stride(0), y.stride(0), ss,
+        MB=triton.next_power_of_2(M), BN=bn, BK=bk, SCALE=mode, G=g, num_warps=nw,
+    )
+    return y
+
+
+@cache
+def _rows_ext():
+    """The CUDA few-row GEMV of Volta (csrc/gemv_rows_volta.cu), or None if its JIT build fails
+    (the Triton kernels above then serve)."""
+    if os.environ.get("OLALA_GEMV_ROWS_CUDA", "1") == "0":
+        return None
+    try:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+        return load_extension(
+            f"olala_gemv_rows_volta_sm{sm_arch()}",
+            "gemv_rows_volta.cu",
+            ["-O3", "-std=c++20", gencode()],
+        )
+    except Exception as e:  # noqa: BLE001 - any build failure falls back to Triton
+        logger.warning("Olala: Volta few-row GEMV not built (%s); Triton kernels instead.", e)
+        return None
+
+
+@cache
+def _num_sms() -> int:
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
+def _rows_cfg(N: int, K: int, M: int, int8_rows: bool) -> tuple[int, int, int] | None:
+    """(WK, VEC, NRW) of the CUDA few-row GEMV for M rows: 4 weight rows per warp for INT8
+    per-row weights with N >= 4096 at 4+ rows (each activation load then serves 4 rows), 2
+    otherwise (more CTAs; bf16 rows are twice as wide); the fewest K slices per CTA (each a
+    multiple of 32 x VEC) that still give 4 CTAs per SM. NRW does not change a row's
+    summation order, WK and VEC do. V100 through volta-forever: INT8 lm_head 151936 x 1536
+    2 rows 407 -> 281 us with NRW 2, 8 rows 503 -> 453 us with NRW 4; bf16 in_proj 7344 x 1536
+    8 rows 40 -> 34 us with NRW 2; mixer_proj 1536 x 3072 takes WK 2."""
+    nrw = 4 if int8_rows and N >= 4096 and M >= 4 else 2
+    if os.environ.get("OLALA_GEMV_ROWS_CFG"):  # "WK,VEC,NRW": measurements only
+        wk, vec, nrw = (int(v) for v in os.environ["OLALA_GEMV_ROWS_CFG"].split(","))
+        return (wk, vec, nrw) if K % (wk * 32 * vec) == 0 else None
+    feasible = [
+        (wk, vec) for wk in (1, 2, 4) for vec in (8, 4) if K % (wk * 32 * vec) == 0
+    ]
+    if not feasible:
+        return None
+    for wk, vec in feasible:
+        if -(-N // ((4 // wk) * nrw)) >= 4 * _num_sms():
+            return wk, vec, nrw
+    wk, vec = feasible[-1]
+    return wk, vec, nrw
+
+
+def _rows_cuda(
+    x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor | None, y: torch.Tensor
+) -> bool:
+    """2..8 rows through the CUDA few-row GEMV when it is built and the operands fit (bf16 x,
+    16-byte aligned rows); False: the caller takes the Triton kernel."""
+    ext = _rows_ext()
+    M = x.shape[0]
+    if ext is None or not 2 <= M <= 8 or x.dtype != torch.bfloat16 or y.stride(-1) != 1:
+        return False
+    if weight.dtype not in (torch.int8, torch.bfloat16, torch.float32):
+        return False
+    if (weight.dtype == torch.int8) != (scale is not None):
+        return False
+    if y.dtype not in (torch.bfloat16, torch.float32):
+        return False
+    N, K = weight.shape
+    cfg = _rows_cfg(N, K, M, scale is not None and scale.dim() == 1)
+    if cfg is None:
+        return False
+    es = weight.element_size()
+    if (
+        x.data_ptr() % 16 or (x.stride(0) * 2) % 16
+        or weight.data_ptr() % 16 or (weight.stride(0) * es) % 16
+    ):
+        return False
+    ext.gemv_rows(x, weight, scale, y, *cfg)
+    return True
+
+
+def volta_gemv_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """The Volta FMA GEMV applies (decode-sized x, K % 128 == 0, unit inner strides)."""
+    return (
+        x.is_cuda and not _DISABLED and x.dim() == 2 and x.shape[0] <= VOLTA_ROWS_MAX_M
+        and weight.shape[1] % 128 == 0 and x.stride(-1) == 1 and weight.stride(-1) == 1
+        and gpu_family() is GpuFamily.SM70
+    )
+
+
+def volta_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+    scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T`` in fp32 FMAs, stored as ``out_dtype``, for any float x / weight dtypes
+    (e.g. bf16 activations against the fp32 router weight) or an INT8 weight with its W8A16
+    ``scale`` (per row: on the fp32 row sum; per group: on the weight); ``out``: write into this
+    (M, N) view instead. Requires volta_gemv_ok()."""
+    return _decode_gemv_volta(x, weight, out_dtype, scale, out)
+
+
 def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` for ``x: (M, K)``, ``weight: (N, K)``: the skinny kernel up to
     SKINNY_MAX_M rows (bf16), except single rows with K <= 1536 (triton GEMV, as fast there);
     F.linear otherwise. At one row the GEMV's 128-wide K blocks are slow for K = 1920 (w_out:
     53 % of the copy bandwidth vs 89 % on an A4500). Datacenter Blackwell keeps its own dispatch
-    (the full-K GEMV at one row, F.linear otherwise), and so does consumer Blackwell."""
+    (the full-K GEMV at one row, F.linear otherwise), and so does consumer Blackwell. Volta takes
+    FMA kernels up to VOLTA_ROWS_MAX_M rows."""
     M = x.shape[0]
     family = gpu_family() if x.is_cuda else None
     if family in (GpuFamily.SM100, GpuFamily.SM120):
@@ -182,8 +518,21 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             return _decode_gemv_sm120(x, weight)
         return _decode_gemv_blackwell(x, weight) if M == 1 else F.linear(x, weight)
     N, K = weight.shape
+    if family is GpuFamily.SM70 and M > 8 and x.dtype == weight.dtype == torch.bfloat16:
+        # OLALA_VOLTA_TC (on by default): bf16 weights on the fp16 tensor cores, exactly scaled
+        from vllm.model_executor.layers.quantization.utils.w8a16_utils import volta_tc
+
+        tc = volta_tc()
+        y = tc.bf16_linear(x, weight) if tc is not None else None
+        if y is not None:
+            return y
     if _DISABLED or not x.is_cuda or x.dtype != weight.dtype or K % 128 != 0 or M > SKINNY_MAX_M:
         return F.linear(x, weight)
+    if (
+        family is GpuFamily.SM70 and M <= VOLTA_ROWS_MAX_M
+        and x.stride(-1) == 1 and weight.stride(-1) == 1
+    ):
+        return _decode_gemv_volta(x, weight)
     if (M != 1 or K > 1536) and _skinny_ok(x, weight):
         return skinny_linear(x, weight)
     if M != 1:

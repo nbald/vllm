@@ -414,3 +414,35 @@ def test_hybrid_prefill_mma_sync_vs_fp64(monkeypatch):
     assert _rel(o_mma, o_tl.double()) < 2e-2
     for x, y in zip(p_mma, p_tl):
         assert _rel(x.float(), y.double()) < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or current_platform.get_device_capability().major not in (8, 12),
+    reason="mma.sync prefill kernels (sm80 path) target sm_8x / sm_12x",
+)
+@torch.inference_mode()
+def test_hybrid_prefill_volta_vs_mma_sync(monkeypatch):
+    """The FMA editions of the chunk-local states and output pass (SM70 family) return
+    the mma.sync kernels' values, sequences resuming from pool states included: bit for
+    bit through volta-forever, which runs the bf16 mma.sync as fmaf chains in the order
+    of k as the FMA kernels do, and at rounding level on a GPU with bf16 tensor cores."""
+    from vllm.model_executor.layers.mamba.olala.arch import volta_forever
+    from vllm.model_executor.layers.mamba.ops.mamba3 import mimo_ssd
+
+    lens = [77, 300, 161]
+    args = _hybrid_inputs(sum(lens))
+    init = [True, False, True]
+    runs = {}
+    for volta in (False, True):
+        monkeypatch.setattr(mimo_ssd, "_volta_prefill", lambda dev, v=volta: v)
+        runs[volta] = _hybrid_run(args, lens, init, False, monkeypatch, True)
+    (o_mma, p_mma), (o_fma, p_fma) = runs[False], runs[True]
+    if volta_forever():
+        assert torch.equal(o_fma, o_mma)
+        for x, y in zip(p_fma, p_mma):
+            assert torch.equal(x, y)
+    else:
+        assert _rel(o_fma, o_mma.double()) < 1e-2
+        for x, y in zip(p_fma, p_mma):
+            assert _rel(x.float(), y.double()) < 1e-2

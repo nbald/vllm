@@ -66,6 +66,15 @@ TARGET_CTAS = 400  # ~3 CTAs per SM on GH200 (Hopper kernel)
 logger = init_logger(__name__)
 
 MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits stay empty (cheap)
+
+
+@lru_cache(maxsize=1)
+def _min_split_tokens() -> int:
+    # The Volta kernel (tpa_factor_decode_volta.cu) has no load pipeline to fill:
+    # one 13-token tile per split doubles the CTAs of a short context.
+    return TILE if gpu_family() is GpuFamily.SM70 else MIN_SPLIT_TOKENS
+
+
 SPLIT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 
@@ -162,7 +171,7 @@ class OlalaTPAFactorMetadata:
         if t is None:
             mx = self.seq_lens.max()
             tps = ((mx + nsplit - 1) // nsplit + TILE - 1) // TILE * TILE
-            tps = torch.clamp_min(tps, MIN_SPLIT_TOKENS)
+            tps = torch.clamp_min(tps, _min_split_tokens())
             nact = (mx + tps - 1) // tps
             t = (tps.to(torch.int32).reshape(1), nact.to(torch.int32).reshape(1))
             self.tok_per_split[nsplit] = t
@@ -651,6 +660,15 @@ def _load_kernel():
             ["-O3", "-std=c++20", "--use_fast_math", gencode(arch_specific=True)],
             ["-lcuda"],
         )
+    elif gpu_family() is GpuFamily.SM70:
+        # V100 (told sm_80 by volta-forever): the mma.sync kernel's bf16 tensor-core
+        # products, ldmatrix and cp.async are emulated with scalar code there, so
+        # the FMA edition (same cache layout, launch contract and partials).
+        ext = load_extension(
+            f"olala_tpa_factor_decode_volta_sm{sm_arch()}",
+            "tpa_factor_decode_volta.cu",
+            ["-O3", "-std=c++20", "--use_fast_math", gencode()],
+        )
     else:
         ext = load_extension(
             f"olala_tpa_factor_decode_sm{sm_arch()}",
@@ -727,6 +745,19 @@ def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, nactive_ptr, o_pt
              mask=hmask[:, None])
 
 
+@lru_cache(maxsize=1)
+def _volta_split_ctas() -> int:
+    """Volta: KV splits for about OLALA_TPA_SPLIT_CTAS decode CTAs from 32 requests on (default 512: 16 splits at 32
+    requests, 8 at 64, 4 at 128; 0 keeps the one-wave rule below). V100 through volta-forever, ~480-735-token
+    contexts, kernel + combine, us: 128 requests 1075.7 (1 split) -> 886.2 (4); 64: 580.6 (1) -> 478.2 (8); 32:
+    311.2 (2) -> 260.4 (16); Q8 server: steady decode at 32 requests on ~3,800-token prompts 24.66 -> 25.57 tok/s
+    per request, 128-request bursts 7.86 -> 7.91. The partials merge differently, so the outputs change at rounding
+    level; teacher forcing through CPU fp32 at 32-128 requests stays at the one-wave rule's level."""
+    if gpu_family() is not GpuFamily.SM70:
+        return 0
+    return int(os.environ.get("OLALA_TPA_SPLIT_CTAS", "512") or 0)
+
+
 def num_splits_for_batch(batch: int) -> int:
     """KV splits per request, a power of two so the combine kernel has at most 8
     specializations (all compiled during cudagraph capture). Hopper: ~_target_ctas()
@@ -736,6 +767,12 @@ def num_splits_for_batch(batch: int) -> int:
     if _hopper():
         want = max(1, min(128, -(-_target_ctas() // batch)))
         return 1 << (want - 1).bit_length()
+    volta = _volta_split_ctas()
+    if volta and batch >= 32:
+        # Volta (OLALA_TPA_SPLIT_CTAS, default 512): about that many CTAs (power-of-two splits); the one-wave rule
+        # below leaves the Volta kernel, at 1 CTA per SM, with 1-2 CTAs per request from 32 requests on
+        want = max(1, min(128, volta // batch))
+        return 1 << (want.bit_length() - 1)
     table = _split_table()
     if table:
         return next((n for b, n in reversed(table) if b <= batch), table[0][1])
@@ -769,7 +806,10 @@ def factor_decode_attention(
     if out is None:
         out = torch.empty(B, HQ * HEAD_DIM, dtype=q.dtype, device=q.device)
     assert out.is_contiguous() and out.shape == (B, HQ * HEAD_DIM)
-    # 8 heads per program and up to 16 splits in flight: the merge of a single long request (128 splits) is latency-bound
-    _factor_combine_kernel[(B, HQP // 8)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=8, D=HEAD_DIM,
-                                          CHUNK=min(16, nsplit), num_warps=4)
+    # 8 heads per program and up to 16 splits in flight: the merge of a single long request (128 splits) is latency-bound.
+    # Volta: 4 heads per program and chunks of 4 splits (twice the programs; same result): one request, 57 active
+    # splits, 39 -> 20 us on a V100 through volta-forever.
+    hb, chunk = (4, 4) if gpu_family() is GpuFamily.SM70 else (8, 16)
+    _factor_combine_kernel[(B, HQP // hb)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=hb,
+                                           D=HEAD_DIM, CHUNK=min(chunk, nsplit), num_warps=4)
     return out

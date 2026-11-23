@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     cat_rows_shared,
     decode_gemv,
 )
+from vllm.model_executor.layers.mamba.olala.volta_tc import dense_linear
 from vllm.model_executor.layers.mamba.olala.w8a16_layers import (
     cat_int8_rows_shared,
     int8_apply,
@@ -1071,8 +1072,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         K = torch.empty(T, R, S, device=dev, dtype=torch.bfloat16)
         ang = torch.empty(T, self.num_rope_angles, device=dev, dtype=torch.float32)
         if self._pf_split_ok(dev):
-            # one GEMM, x / z stay in its output (row-strided views)
-            cat = F.linear(h, self._pf_in_weight())
+            # one GEMM, x / z stay in its output (row-strided views); OLALA_VOLTA_TC: on the
+            # fp16 tensor cores (volta_tc.py)
+            cat = dense_linear(h, self._pf_in_weight())
             z = cat[:, : H * D].view(T, H, D)
             x = cat[:, H * D : 2 * H * D].view(T, H, D)
             BT = 32
@@ -1090,7 +1092,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 # in_proj_dyn (1056 rows) alone fills 1.3 waves on 56 SMs; the prologue reads
                 # both outputs through their row strides
                 n1, n2 = self.in_proj.weight.shape[0], self.in_proj_dyn.weight.shape[0]
-                y = F.linear(h, self._in_proj_cat_weight())
+                y = dense_linear(h, self._in_proj_cat_weight())
                 zxdt, bc = y[:, :n1], y[:, n1 : n1 + n2]
             elif self._int8_in_proj:
                 zxdt, bc = self._int8_parts(h)
@@ -1142,6 +1144,58 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             if self._postgate_norm:
                 y = self.output_norm(y)
             out.copy_(y.to(out.dtype))
+
+    @torch.inference_mode()
+    def warmup_prefill_kernels(self, max_tokens: int) -> int:
+        """Compile every Triton specialization of the hybrid prefill that a
+        serving batch can hit, before serving: the prologue and the Mamba-3
+        prefill kernels (mimo_ssd.py) specialize on the token count (1, a
+        multiple of 16, other), on the 16-byte alignment of the chunk /
+        sequence layout slices (the chunk and sequence counts mod 4) and of
+        the prefill slots (a slice after the decodes: the decode count mod 4),
+        on reading initial states or not, and on the long-sequence tile (32+
+        chunks). One small batch per class runs through ``_prefill_hybrid`` as
+        a step would, on dummy pools with the real pools' strides: the KV
+        cache is not touched and no output changes. Returns the batch count."""
+        _lazy_import_kernels()
+        if _mamba3_mimo_hybrid_pools is None or not self._hybrid_ok:
+            return 0
+        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import _scan_tc_ok
+
+        real = tuple(self.kv_cache[:4])
+        dev, dtype = real[1].device, self.model_config.dtype
+        pools = tuple(
+            torch.empty_strided((2, *p.shape[1:]), p.stride(), dtype=p.dtype, device=dev).zero_()
+            for p in real
+        )
+        ls = 256 if _scan_tc_ok(dev) else 128  # chunk length of mamba3_mimo_hybrid_pools
+        layouts = [[1]]
+        for chunks0 in (0, 31) if max_tokens > 32 * ls else (0,):
+            for ns in range(1, 5):  # sequence count mod 4
+                for extra in range(4):  # chunk count mod 4
+                    for div16 in (True, False):
+                        t0 = ns - 1 + ls * (chunks0 + extra)
+                        last = ls * (chunks0 + extra) + ((-t0) % 16 or 16) + (0 if div16 else 1)
+                        layouts.append([1] * (ns - 1) + [last])
+        n = 0
+        for lens in layouts:
+            T = sum(lens)
+            if T > max_tokens:
+                continue
+            cu = [0]
+            for length in lens:
+                cu.append(cu[-1] + length)
+            qsl_cpu = torch.tensor(cu, dtype=torch.int32)
+            qsl = qsl_cpu.to(dev)
+            h = torch.zeros(T, self.d_model, dtype=dtype, device=dev)
+            out = torch.empty(T, self.nheads_local * self.headdim, dtype=dtype, device=dev)
+            for off in (0, 1):  # prefill slots after 0 / 1 decodes (int32: aligned or not)
+                slots = torch.zeros(off + len(lens), dtype=torch.int32, device=dev)[off:]
+                for has_init in (None, torch.ones(len(lens), dtype=torch.bool, device=dev)):
+                    self._prefill_hybrid(h, out, slots, qsl, pools, has_init, qsl_cpu)
+                    n += 1
+        torch.cuda.synchronize(dev)
+        return n
 
     # -- Decode -------------------------------------------------------------
     def refresh_weight_caches(self) -> None:

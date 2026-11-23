@@ -91,9 +91,10 @@ def _moe_cuda_ext(device: torch.device):
 
 
 def _olala_sm80(device: torch.device) -> bool:
-    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+    # Ampere / Ada, and Volta through volta-forever
+    from vllm.model_executor.layers.mamba.olala.arch import sm80_class
 
-    return gpu_family(device) is GpuFamily.SM80
+    return sm80_class(device)
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):

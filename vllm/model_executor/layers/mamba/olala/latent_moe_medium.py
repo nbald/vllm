@@ -332,7 +332,16 @@ def _max_stages() -> int:
     return 4 if smem >= 160 * 1024 else 3
 
 
+# Volta (V100, natively or through volta-forever): tl.dot's bf16 mma.sync is emulated with scalar
+# code and cp.async is a synchronous copy there, so pipeline stages only cost shared memory, and
+# 16-row blocks waste least on the ~11 rows per expert of a prefill chunk. V100 through
+# volta-forever, 480 tokens (route + compact + up + down): B300 configs 1906 us, this 744 us.
+_VOLTA_CONFIG = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, num_warps=4, num_stages=1)
+
+
 def _pick(M: int):
+    if gpu_family() is GpuFamily.SM70:
+        return _VOLTA_CONFIG, _VOLTA_CONFIG
     up, down = _CONFIGS[-1][1], _CONFIGS[-1][2]
     for mx, u, d in _CONFIGS:
         if mx >= M:
@@ -448,8 +457,13 @@ def olala_moe_medium(
     D2 = w2.shape[1]
     S = w_in.shape[0] - D1
     # sm_120: the skinny kernel up to 32 rows, where cuBLAS picks sm80 wmma kernels (5.5 vs 17 us
-    # in, 5.2 vs 11.2 us out on an RTX 5090)
-    linear = decode_gemv if gpu_family() is GpuFamily.SM120 else torch.nn.functional.linear
+    # in, 5.2 vs 11.2 us out on an RTX 5090). Volta: cuBLAS has no Volta bf16 GEMM kernel (~250-300
+    # us per projection at decode sizes); decode_gemv takes FMA / skinny kernels up to 64 rows.
+    linear = (
+        decode_gemv
+        if gpu_family() in (GpuFamily.SM70, GpuFamily.SM120)
+        else torch.nn.functional.linear
+    )
     if x_in is None:
         x_in = linear(hidden, w_in)  # [M, D1 + S]
     part = moe_routed_medium(x_in[:, :D1], router_logits, e_score_bias, w13, w2, top_k)

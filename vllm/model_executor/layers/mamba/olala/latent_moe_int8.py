@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.model_executor.layers.mamba.olala import volta_cuda
 from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
@@ -900,7 +901,23 @@ def olala_moe_small_int8(
     gemv: bool = False,
 ) -> torch.Tensor:
     """Small-batch (M <= 16) latent MoE with weight-only quantized (or bf16)
-    routed experts, shared expert and fc2_latent."""
+    routed experts, shared expert and fc2_latent. On Volta without explicit
+    configs: olala_moe_small_int8_volta (FMA kernels; ``gemv`` does not apply)."""
+    if configs is None and gpu_family(hidden.device) is GpuFamily.SM70:
+        return olala_moe_small_int8_volta(
+            hidden,
+            x_in,
+            router_logits,
+            e_score_bias,
+            w13,
+            w2,
+            shared_up,
+            shared_down,
+            fc2,
+            top_k,
+            routed_scale,
+            router_logits_lo=router_logits_lo,
+        )
     M, H = hidden.shape
     E, N1, D1 = w13.weight.shape[0], w13.n, w13.k
     D2 = w2.n
@@ -1039,7 +1056,23 @@ def olala_moe_medium_int8(
     router_logits_lo: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Medium-batch latent MoE: routing, compaction, grouped up GEMM (+ shared
-    up), grouped down GEMM, exit GEMM (top-k sum + fc2_latent + shared down)."""
+    up), grouped down GEMM, exit GEMM (top-k sum + fc2_latent + shared down).
+    On Volta without explicit configs: _olala_moe_medium_int8_volta."""
+    if configs is None and gpu_family(hidden.device) is GpuFamily.SM70:
+        return _olala_moe_medium_int8_volta(
+            hidden,
+            x_in,
+            router_logits,
+            e_score_bias,
+            w13,
+            w2,
+            shared_up,
+            shared_down,
+            fc2,
+            top_k,
+            routed_scale,
+            router_logits_lo,
+        )
     from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
         _latent_moe_epilogue_kernel,
     )
@@ -1209,6 +1242,450 @@ def olala_moe_medium_int8(
     return out
 
 
+# -- Volta small path ------------------------------------------------------------
+# On a V100 (natively or through volta-forever, which tells the process sm_80) the bf16
+# mma.sync behind tl.dot is emulated with scalar code (~200 instructions per m16n8k16), while
+# plain fp32 FMA code runs natively. The Volta small path keeps the stock path's four launches
+# and its values (bf16 activations, weights as dequantized, fp32 sums) with FMA kernels only:
+# the routed experts as one GEMV per (token, slot), the shared expert's up projection and the
+# exit (fc2_latent + shared down) as multi-row GEMVs that read each weight tile once for all
+# tokens. The routed experts' group-scaled and INT4 weights are dequantized in fp32 and not
+# rounded to bf16, as the stock GEMV variant does; dense group-scaled tiles are rounded to bf16
+# as in the stock exit and shared-up kernels.
+VOLTA_SMALL_MAX_TOKENS = 32
+
+
+@triton.jit
+def _volta_w_rows(
+    w_ptr,
+    s_ptr,
+    offs_n,
+    k0,
+    KD: tl.constexpr,
+    FMT: tl.constexpr,
+    G: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """``deq(W)[offs_n, k0:k0 + BK]`` as an fp32 ``[BN, BK]`` tile, K contiguous (dense
+    FMT_BF16 / FMT_ROW / FMT_GROUP weights; FMT_ROW scales are left to the row sums; FMT_GROUP
+    tiles rounded to bf16 as the stock path's _wq_tile_t does)."""
+    offs_k = k0 + tl.arange(0, BK)
+    w = tl.load(w_ptr + offs_n[:, None] * KD + offs_k[None, :]).to(tl.float32)
+    if FMT == 2:
+        s = tl.load(s_ptr + offs_n[:, None] * (KD // G) + (offs_k // G)[None, :])
+        w = (w * s.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    return w
+
+
+@triton.jit
+def _volta_row_operand(
+    a_ptr, m, stride_a, offs_k, M, SUMK: tl.constexpr, scale,
+):
+    """Row ``m`` of the activation operand for the K block ``offs_k``, as fp32 holding bf16
+    values: ``bf16(a[m])``, or with SUMK the routed latent ``bf16(scale * sum_k a[m * SUMK +
+    k])`` (fp32 partial rows of the experts)."""
+    mask = (offs_k * 0 + m) < M
+    if SUMK > 0:
+        r = tl.load(a_ptr + (m * SUMK) * stride_a + offs_k, mask=mask, other=0.0)
+        for kk in tl.static_range(1, SUMK):
+            r += tl.load(a_ptr + (m * SUMK + kk) * stride_a + offs_k, mask=mask, other=0.0)
+        r = r * scale
+    else:
+        r = tl.load(a_ptr + m * stride_a + offs_k, mask=mask, other=0.0)
+    return r.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _volta_set_row(y, offs_m, m, acc):
+    """``y[m, :] = sum_k acc[:, k]`` (y [MB, BN], acc [BN, BK] partial sums)."""
+    return tl.where(offs_m[:, None] == m, tl.sum(acc, axis=1)[None, :], y)
+
+
+@triton.jit
+def _volta_rows8(
+    y,
+    r0,
+    a_ptr,
+    stride_a,
+    M,
+    w_ptr,
+    s_ptr,
+    offs_n,
+    KD: tl.constexpr,
+    FMT: tl.constexpr,
+    G: tl.constexpr,
+    MB: tl.constexpr,
+    R: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    SUMK: tl.constexpr,
+    scale,
+):
+    """Rows r0 .. r0 + R (R <= 8) of ``y [MB, BN]``: one [BN, BK] fp32 partial-sum tile per
+    row, each weight tile loaded once for the R rows, one reduction after the K loop."""
+    a0 = tl.zeros([BN, BK], dtype=tl.float32)
+    a1 = tl.zeros([BN, BK], dtype=tl.float32)
+    a2 = tl.zeros([BN, BK], dtype=tl.float32)
+    a3 = tl.zeros([BN, BK], dtype=tl.float32)
+    a4 = tl.zeros([BN, BK], dtype=tl.float32)
+    a5 = tl.zeros([BN, BK], dtype=tl.float32)
+    a6 = tl.zeros([BN, BK], dtype=tl.float32)
+    a7 = tl.zeros([BN, BK], dtype=tl.float32)
+    for k0 in range(0, KD, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        w = _volta_w_rows(w_ptr, s_ptr, offs_n, k0, KD, FMT, G, BN, BK)
+        a0 += w * _volta_row_operand(a_ptr, r0, stride_a, offs_k, M, SUMK, scale)[None, :]
+        if R > 1:
+            a1 += w * _volta_row_operand(a_ptr, r0 + 1, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+        if R > 2:
+            a2 += w * _volta_row_operand(a_ptr, r0 + 2, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+            a3 += w * _volta_row_operand(a_ptr, r0 + 3, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+        if R > 4:
+            a4 += w * _volta_row_operand(a_ptr, r0 + 4, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+            a5 += w * _volta_row_operand(a_ptr, r0 + 5, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+            a6 += w * _volta_row_operand(a_ptr, r0 + 6, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+            a7 += w * _volta_row_operand(a_ptr, r0 + 7, stride_a, offs_k, M, SUMK, scale)[
+                None, :
+            ]
+    offs_m = tl.arange(0, MB)
+    y = _volta_set_row(y, offs_m, r0, a0)
+    if R > 1:
+        y = _volta_set_row(y, offs_m, r0 + 1, a1)
+    if R > 2:
+        y = _volta_set_row(y, offs_m, r0 + 2, a2)
+        y = _volta_set_row(y, offs_m, r0 + 3, a3)
+    if R > 4:
+        y = _volta_set_row(y, offs_m, r0 + 4, a4)
+        y = _volta_set_row(y, offs_m, r0 + 5, a5)
+        y = _volta_set_row(y, offs_m, r0 + 6, a6)
+        y = _volta_set_row(y, offs_m, r0 + 7, a7)
+    return y
+
+
+@triton.jit
+def _volta_rows_dot(
+    a_ptr,
+    stride_a,
+    M,
+    w_ptr,
+    s_ptr,
+    offs_n,
+    KD: tl.constexpr,
+    FMT: tl.constexpr,
+    G: tl.constexpr,
+    MB: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    SUMK: tl.constexpr = 0,
+    scale=1.0,
+):
+    """``[MB, BN]`` fp32 = ``bf16(A[:M, :KD]) @ deq(W)[offs_n, :KD].T`` (row scales applied)
+    with FMAs, each weight tile loaded once for the M rows. One or two rows: per-row 2-D
+    partial sums (_volta_rows8). More: one [MB, BN, BK] product per K step, partial sums kept
+    per lane until one reduction (faster from 4 rows on a V100: 8 tokens 106 vs 145 us per
+    MoE layer)."""
+    if MB <= 2:
+        y = tl.zeros([MB, BN], dtype=tl.float32)
+        y = _volta_rows8(
+            y, 0, a_ptr, stride_a, M, w_ptr, s_ptr, offs_n, KD, FMT, G, MB, MB, BN, BK, SUMK,
+            scale,
+        )
+    else:
+        offs_m = tl.arange(0, MB)
+        m_mask = offs_m < M
+        offs_k = tl.arange(0, BK)
+        acc = tl.zeros([MB, BN, BK], dtype=tl.float32)
+        for k0 in range(0, KD, BK):
+            w = _volta_w_rows(w_ptr, s_ptr, offs_n, k0, KD, FMT, G, BN, BK)
+            if SUMK > 0:
+                a = tl.zeros([MB, BK], dtype=tl.float32)
+                for kk in tl.static_range(SUMK):
+                    a += tl.load(
+                        a_ptr + (offs_m * SUMK + kk)[:, None] * stride_a + (k0 + offs_k)[None, :],
+                        mask=m_mask[:, None],
+                        other=0.0,
+                    )
+                a = a * scale
+            else:
+                a = tl.load(
+                    a_ptr + offs_m[:, None] * stride_a + (k0 + offs_k)[None, :],
+                    mask=m_mask[:, None],
+                    other=0.0,
+                )
+            acc += a.to(tl.bfloat16).to(tl.float32)[:, None, :] * w[None, :, :]
+        y = tl.sum(acc, axis=2)
+    if FMT == 1:
+        y = y * tl.load(s_ptr + offs_n)[None, :]
+    return y
+
+
+@triton.jit(do_not_specialize=["M"])
+def _volta_small_up_kernel(
+    x_ptr,  # [M, D] latent (bf16, or fp32 rounded to bf16 on load)
+    logits_ptr,  # [M, E] fp32
+    logits_lo_ptr,  # [M, E] fp32 low-part logits added to logits (LOGITS_LO)
+    bias_ptr,  # [E] fp32
+    ids_ptr,  # [M*K] int32 out
+    tw_ptr,  # [M*K] fp32 out (normalized routing weights)
+    w1_ptr,  # [E, N, D] int8 (FMT_INT4: [E, N, D // 2] uint8)
+    w1s_ptr,  # its scales
+    h_ptr,  # [M*K, N] bf16 out: relu^2
+    hid_ptr,  # [M, H] bf16 block input (shared expert)
+    su_ptr,  # [S, H] shared up
+    sus_ptr,  # its scales
+    s_ptr,  # [M, S] bf16 out: relu^2(shared up)
+    M,
+    stride_xm,
+    stride_lm,
+    stride_hm,
+    E: tl.constexpr,
+    D: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    K: tl.constexpr,
+    FMT1: tl.constexpr,
+    G1: tl.constexpr,
+    FMTS: tl.constexpr,
+    GS: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    MB: tl.constexpr,
+    BNS: tl.constexpr,
+    BKS: tl.constexpr,
+    LOGITS_LO: tl.constexpr = False,
+):
+    """_i8_small_up_kernel with FMAs only: programs [0, S/BNS) the shared up projection of all
+    M (<= MB) tokens for BNS rows, the rest one routed (token, slot, N block) GEMV each, with
+    the router top-k recomputed from the logits."""
+    pid = tl.program_id(0)
+    NB: tl.constexpr = N // BN
+    NBS: tl.constexpr = S // BNS
+    if pid >= NBS:
+        pid -= NBS
+        row = pid // NB
+        nb = pid % NB
+        m = row // K
+        e, wsel = _topk_slot(
+            logits_ptr, logits_lo_ptr, bias_ptr, m, row % K, stride_lm, E, K, LOGITS_LO
+        )
+        if nb == 0:
+            tl.store(ids_ptr + row, e.to(tl.int32))
+            tl.store(tw_ptr + row, wsel)
+        e64 = e.to(tl.int64)
+        offs_n = (nb * BN + tl.arange(0, BN)).to(tl.int64)
+        w1, w1s = _wq_expert(w1_ptr, w1s_ptr, e64, N, D, FMT1, G1)
+        acc1 = _wq_gemv_x(
+            x_ptr, m.to(tl.int64) * stride_xm, w1, w1s, offs_n, D, FMT1, G1, BK, BN
+        )
+        tl.store(h_ptr + row * N + offs_n, _relu2_bf16(acc1))
+    else:
+        offs_ns = pid * BNS + tl.arange(0, BNS)
+        y = _volta_rows_dot(
+            hid_ptr, stride_hm, M, su_ptr, sus_ptr, offs_ns, H, FMTS, GS, MB, BNS, BKS
+        )
+        offs_m = tl.arange(0, MB)
+        tl.store(
+            s_ptr + offs_m[:, None] * S + offs_ns[None, :],
+            _relu2_bf16(y),
+            mask=(offs_m < M)[:, None],
+        )
+
+
+@triton.jit(do_not_specialize=["M"])
+def _volta_small_exit_kernel(
+    part_ptr,  # [M*K, D2] fp32 routed partials (routing weight applied)
+    fc2_ptr,  # [H, D2]
+    fc2s_ptr,  # its scales
+    s_ptr,  # [M, S] bf16 relu^2(shared up)
+    sd_ptr,  # [H, S] shared down
+    sds_ptr,  # its scales
+    out_ptr,  # [M, H] bf16
+    M,
+    scale,
+    D2: tl.constexpr,
+    S: tl.constexpr,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    FMTF: tl.constexpr,
+    GF: tl.constexpr,
+    FMTD: tl.constexpr,
+    GD: tl.constexpr,
+    MB: tl.constexpr,
+    BN: tl.constexpr,
+    BKL: tl.constexpr,
+    BKS: tl.constexpr,
+):
+    """``out = fc2_latent(bf16(scale * sum_k partials)) + shared_down(s)`` for M (<= MB) tokens
+    and BN output rows per program, with FMAs (_i8_exit_gemv_kernel for many tokens: each
+    weight tile is loaded once for all of them)."""
+    offs_n = tl.program_id(0) * BN + tl.arange(0, BN)
+    offs_m = tl.arange(0, MB)
+    m_mask = offs_m < M
+    y = _volta_rows_dot(
+        part_ptr, D2, M, fc2_ptr, fc2s_ptr, offs_n, D2, FMTF, GF, MB, BN, BKL, K, scale
+    )
+    y += _volta_rows_dot(s_ptr, S, M, sd_ptr, sds_ptr, offs_n, S, FMTD, GD, MB, BN, BKS)
+    tl.store(
+        out_ptr + offs_m[:, None] * H + offs_n[None, :],
+        y.to(tl.bfloat16),
+        mask=m_mask[:, None],
+    )
+
+
+def _volta_small_cfg(mb: int) -> dict:
+    """Tiles of the Volta small path for MB (power of two >= M) tokens: routed up / down GEMVs
+    (UP_BN / UP_BK, DOWN_BN / DOWN_BK), shared up (SH_BN / SH_BK) and exit (EX_BN, EX_BK) as
+    multi-row blocks (_volta_rows_dot)."""
+    # V100 through volta-forever, graphed sweeps (us per layer, INT8 per row): 1 token 29,
+    # 2: 39, 4: 73, 8: 106, 16: 164, 32: 325 (stock small path: 100 / 109 at 1 / 2 tokens).
+    if mb == 1:
+        return dict(UP_BN=8, UP_BK=128, DOWN_BN=8, DOWN_BK=256, SH_BN=8, SH_BK=128, EX_BN=1,
+                    EX_BK=128)
+    if mb == 2:
+        return dict(UP_BN=32, UP_BK=64, DOWN_BN=8, DOWN_BK=256, SH_BN=8, SH_BK=256, EX_BN=1,
+                    EX_BK=128)
+    rows = {4: (16, 64), 8: (8, 64), 16: (8, 32)}.get(mb, (4, 32))
+    return dict(UP_BN=32, UP_BK=128, DOWN_BN=8, DOWN_BK=256, SH_BN=rows[0], SH_BK=rows[1],
+                EX_BN=rows[0], EX_BK=rows[1])
+
+
+def olala_moe_small_int8_volta(
+    hidden: torch.Tensor,  # [M, H] bf16 (shared expert input)
+    x_in: torch.Tensor,  # [M, >= D1] latent (bf16 or fp32), any row stride
+    router_logits: torch.Tensor,  # [M, E] fp32
+    e_score_bias: torch.Tensor,  # [E] fp32
+    w13: WqWeight,  # [E, N1, D1]
+    w2: WqWeight,  # [E, D2, N1]
+    shared_up: WqWeight,  # [S, H]
+    shared_down: WqWeight,  # [H, S]
+    fc2: WqWeight,  # [H, D2]
+    top_k: int,
+    routed_scale: float,
+    router_logits_lo: torch.Tensor | None = None,  # added to router_logits
+    config: dict | None = None,
+) -> torch.Tensor:
+    """olala_moe_small_int8 for Volta (M <= VOLTA_SMALL_MAX_TOKENS): the same four launches
+    and values with FMA kernels only (no tl.dot). ``config``: _volta_small_cfg's keys."""
+    M, H = hidden.shape
+    E, N1, D1 = w13.weight.shape[0], w13.n, w13.k
+    D2 = w2.n
+    S = shared_up.n
+    assert M <= VOLTA_SMALL_MAX_TOKENS
+    assert w2.k == N1 and shared_down.k == S and (fc2.n, fc2.k) == (H, D2)
+    if config is None and volta_cuda.moe_small_ok(
+        M, hidden, x_in, router_logits, router_logits_lo, e_score_bias, w13, w2, shared_up, shared_down, fc2, top_k
+    ):
+        # the CUDA editions of the three launches below, bit for bit (volta_cuda.py)
+        return volta_cuda.moe_small(
+            hidden, x_in, router_logits, router_logits_lo, e_score_bias, w13, w2, shared_up, shared_down, fc2,
+            top_k, routed_scale,
+        )
+    assert shared_up.fmt != FMT_INT4 and shared_down.fmt != FMT_INT4 and fc2.fmt != FMT_INT4
+    dev = hidden.device
+    MK = M * top_k
+    mb = triton.next_power_of_2(M)
+    c = config or _volta_small_cfg(mb)
+    ids = torch.empty(MK, dtype=torch.int32, device=dev)
+    tw = torch.empty(MK, dtype=torch.float32, device=dev)
+    h = torch.empty(MK, N1, dtype=torch.bfloat16, device=dev)
+    s = torch.empty(M, S, dtype=torch.bfloat16, device=dev)
+    up_bn, up_bk = c["UP_BN"], _fit_bk(c["UP_BK"], w13)
+    _volta_small_up_kernel[(MK * (N1 // up_bn) + S // c["SH_BN"],)](
+        x_in,
+        router_logits,
+        router_logits if router_logits_lo is None else router_logits_lo,
+        e_score_bias,
+        ids,
+        tw,
+        *w13.args(),
+        h,
+        hidden,
+        *shared_up.args(),
+        s,
+        M,
+        x_in.stride(0),
+        router_logits.stride(0),
+        hidden.stride(0),
+        E=E,
+        D=D1,
+        N=N1,
+        H=H,
+        S=S,
+        K=top_k,
+        FMT1=w13.fmt,
+        G1=w13.group,
+        FMTS=shared_up.fmt,
+        GS=shared_up.group,
+        BN=up_bn,
+        BK=up_bk,
+        MB=mb,
+        BNS=c["SH_BN"],
+        BKS=max(c["SH_BK"], shared_up.group),
+        LOGITS_LO=router_logits_lo is not None,
+        num_warps=4,
+        num_stages=1,
+    )
+    assert router_logits_lo is None or router_logits_lo.stride(
+        0
+    ) == router_logits.stride(0)
+    part = torch.empty(MK, D2, dtype=torch.float32, device=dev)
+    _i8_small_down_kernel[(MK * (D2 // c["DOWN_BN"]),)](
+        h,
+        ids,
+        tw,
+        *w2.args(),
+        part,
+        N1=N1,
+        D2=D2,
+        FMT2=w2.fmt,
+        G2=w2.group,
+        BN=c["DOWN_BN"],
+        BK=_fit_bk(c["DOWN_BK"], w2),
+        GEMV=True,
+        num_warps=4,
+        num_stages=1,
+    )
+    out = torch.empty(M, H, dtype=torch.bfloat16, device=dev)
+    _volta_small_exit_kernel[(H // c["EX_BN"],)](
+        part,
+        *fc2.args(),
+        s,
+        *shared_down.args(),
+        out,
+        M,
+        routed_scale,
+        D2=D2,
+        S=S,
+        K=top_k,
+        H=H,
+        FMTF=fc2.fmt,
+        GF=fc2.group,
+        FMTD=shared_down.fmt,
+        GD=shared_down.group,
+        MB=mb,
+        BN=c["EX_BN"],
+        BKL=max(c["EX_BK"], fc2.group),
+        BKS=max(c["EX_BK"], shared_down.group),
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
 # -- prefill (any number of tokens) -------------------------------------------
 
 
@@ -1331,6 +1808,25 @@ _PREFILL_DOWN = dict(
 # INT4 affine experts, up and down: 102 / 417 us per layer for 1024 / 8192 tokens
 # (INT8 99 / 397; RTX 5090).
 _PREFILL_I4 = dict(_PREFILL_UP, BLOCK_SIZE_K=128, num_stages=2)
+# Volta (bf16 mma.sync emulated): 16-row tiles, as a 480-token prefill gives ~11 rows per
+# expert, which 64-row tiles pad 6x; no software pipelining (cp.async is emulated too).
+# Same values as the stock tiles, bit for bit. V100 through volta-forever, up + down +
+# routing per layer, 480 tokens: INT8 1797 -> 748 us, INT4 affine 9169 -> 870 us.
+_PREFILL_VOLTA = dict(
+    BLOCK_SIZE_M=16,
+    BLOCK_SIZE_N=128,
+    BLOCK_SIZE_K=32,
+    GROUP_SIZE_M=8,
+    num_warps=4,
+    num_stages=1,
+)
+
+
+def _volta_moe_tc(w13: WqWeight, w2: WqWeight) -> bool:
+    """OLALA_VOLTA_TC with the "moe" kind on the SM70 family, and experts its kernel takes."""
+    from vllm.model_executor.layers.mamba.olala.volta_tc import moe_ok, tc_enabled
+
+    return tc_enabled("moe") and moe_ok(w13, w2)
 
 
 def wq_routed_experts(
@@ -1359,6 +1855,10 @@ def wq_routed_experts(
     D2 = w2.n
     dev = x.device
     MK = M * top_k
+    # OLALA_VOLTA_TC with "moe" (opt-in): the grouped GEMMs on Volta's fp16 tensor cores
+    volta_tc_moe = configs is None and _volta_moe_tc(w13, w2)
+    if configs is None and gpu_family(x.device) is GpuFamily.SM70:
+        configs = (_PREFILL_VOLTA, _PREFILL_VOLTA)
     up_cfg, down_cfg = configs or (
         (_PREFILL_I4, _PREFILL_I4)
         if w13.fmt == FMT_INT4
@@ -1367,6 +1867,8 @@ def wq_routed_experts(
     up_cfg, down_cfg = dict(up_cfg), dict(down_cfg)
     up_cfg["BLOCK_SIZE_K"] = _fit_bk(up_cfg["BLOCK_SIZE_K"], w13)
     down_cfg["BLOCK_SIZE_K"] = _fit_bk(down_cfg["BLOCK_SIZE_K"], w2)
+    # the kernel covers N // BLOCK_SIZE_N column blocks
+    assert N1 % up_cfg["BLOCK_SIZE_N"] == 0 and D2 % down_cfg["BLOCK_SIZE_N"] == 0
     ids = torch.empty(M, top_k, dtype=torch.int32, device=dev)
     tw = torch.empty(MK, dtype=torch.float32, device=dev)
     RB = 8
@@ -1383,6 +1885,10 @@ def wq_routed_experts(
         RB=RB,
         num_warps=4,
     )
+    if volta_tc_moe:
+        from vllm.model_executor.layers.mamba.olala.volta_tc import moe_experts
+
+        return moe_experts(x, ids, tw, w13, w2, top_k, routed_scale)
     bm = up_cfg["BLOCK_SIZE_M"]
     assert down_cfg["BLOCK_SIZE_M"] == bm
     sorted_ids, expert_ids, ntp = moe_align_block_size(ids, bm, E)
@@ -1433,3 +1939,44 @@ def wq_routed_experts(
         part, out, routed_scale, M, D=D2, K=top_k, BR=BR, BD=128, num_warps=4
     )
     return out
+
+
+def _wq_dense_mm(x: torch.Tensor, w: WqWeight) -> torch.Tensor:
+    """``x @ deq(W).T`` (bf16) for a dense FMT_BF16 / FMT_ROW / FMT_GROUP weight."""
+    if w.fmt == FMT_BF16:
+        return x @ w.weight.t()
+    from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
+        Int8Weight,
+        int8_mm,
+    )
+
+    return int8_mm(x, Int8Weight(w.weight, w.scale))
+
+
+def _olala_moe_medium_int8_volta(
+    hidden: torch.Tensor,
+    x_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    e_score_bias: torch.Tensor,
+    w13: WqWeight,
+    w2: WqWeight,
+    shared_up: WqWeight,
+    shared_down: WqWeight,
+    fc2: WqWeight,
+    top_k: int,
+    routed_scale: float,
+    router_logits_lo: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """olala_moe_medium_int8 on Volta, where its grouped GEMMs run emulated bf16
+    mma.sync and volta-forever refuses the down GEMM (redux.sync on a reused mask
+    register): the prefill path's pieces, i.e. the routed experts of
+    wq_routed_experts (Volta tiles) and the W8A16 linears. The serving path does
+    not call it on Volta (OlalaLatentMoE turns the medium path off there); it keeps
+    the function's contract. Within bf16 rounding of the stock path (the shared
+    and fc2 GEMMs are rounded to bf16 before their sum)."""
+    logits = router_logits if router_logits_lo is None else router_logits + router_logits_lo
+    lat = x_in[:, : w13.k].to(torch.bfloat16)  # the stock kernels round x_in to bf16 on load
+    routed = wq_routed_experts(lat, logits, e_score_bias, w13, w2, top_k, routed_scale)
+    s = _wq_dense_mm(hidden, shared_up).float()
+    s = torch.relu(s).square().to(torch.bfloat16)
+    return _wq_dense_mm(routed, fc2) + _wq_dense_mm(s, shared_down)

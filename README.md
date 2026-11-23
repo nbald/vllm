@@ -20,19 +20,64 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_DSPINE_FUSED`, `OLALA_DSPINE_GEMV`, `OLALA_DSPINE_CUDA_NORM` | `0` | Opt-in fast path of a DSpine drafter (compiled injection and transition scoring, `2` also compiles the draft layers; skinny GEMV; CUDA RMSNorm). See [DSpine](docs/features/speculative_decoding/dspine.md). |
 | `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
 | `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). The extensions are built for the running GPU (SM80 or later, see GPU support below); if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
+| `OLALA_VOLTA` | auto | Volta (V100) detection, see GPU support below: auto = a native sm_70 GPU, or a process running through volta-forever (`VOLTA_FOREVER` set, or its `libcuda.so.1` proxy loaded); `1` / `0` forces the SM70 family on / off (`0` = the dispatch of the capability the process is told, e.g. SM80 through volta-forever). |
+| `OLALA_VOLTA_TC` | `int8,bf16` on SM70 | SM70 family: the fp16 tensor-core edition (`olala/volta_tc.py`). The W8A16 linears (`int8`) and the bf16 model's dense projections (`bf16`) run on cuBLAS's fp16 HMMA GEMMs from 9 activation rows (33 for linears whose rows need 2-3 exact fp16 terms) and in prefill, with exactly scaled operands; fp16 weight copies cost about 2 GiB. Unset or `1` = those two kinds; `0` = off (the FMA and emulated paths, their outputs bit for bit); a comma list picks kinds, `moe` adds the routed experts above 32 tokens (not in the default: on chat_math it moved one confident prompt position per quantized checkpoint). Ignored on other GPUs; `VF_SAFE=1` turns it off, all kinds, whatever this variable says. |
+| `VF_SAFE` | unset | volta-forever's conservative switch, read by this fork too (once per process): only the exact value `1` turns it on (`0`, empty, `true`... do not). It means no path whose results leave the conservative reference class. On the SM70 family the fp16 tensor-core edition (`OLALA_VOLTA_TC`) is then off: HMMA truncates its fp32 sums, a systematic bias toward zero. The fp32-FMA kernels stay on: the Volta editions that return the stock values bit for bit (the prefill kernels), and those that accumulate in fp32 and only reorder a sum, without a bias (the decode GEMVs, the few-row GEMV `OLALA_GEMV_ROWS_CUDA`), which strictly are not bit-identical to stock either. |
 | `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
 | `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
 
 ### GPU support
 
-The Olala kernels dispatch on GPU families (`vllm/model_executor/layers/mamba/olala/arch.py`): SM80 (Ampere,
-Ada), SM90 (Hopper), SM100 (B200, B300) and SM120 (consumer Blackwell: RTX 50xx, RTX PRO Blackwell). SM120 has
-its own paths, tuned on an RTX 5090:
+The Olala kernels dispatch on GPU families (`vllm/model_executor/layers/mamba/olala/arch.py`): SM70 (Volta:
+V100), SM80 (Ampere, Ada), SM90 (Hopper), SM100 (B200, B300) and SM120 (consumer Blackwell: RTX 50xx, RTX PRO
+Blackwell). SM120 has its own paths, tuned on an RTX 5090:
 
 - the Mamba-3 prefill runs the CUDA mma.sync chunk-state and output-pass kernels, as on SM80;
 - the decode projections use a dedicated GEMV dispatch: the full-K or K-loop GEMV at one row, the skinny kernel
   up to 32 rows (64 on wide outputs), cuBLAS beyond;
 - the medium-batch latent-MoE projections take the same dispatch.
+
+SM70 serves bf16 checkpoints through volta-forever, which runs CUDA 12/13 programs on a V100 and tells them
+compute capability 8.0 (`VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1`: vLLM keeps bf16, the Olala kernels build for
+sm_80 and the layer lowers them to sm_70, emulating the bf16 tensor-core instructions). The family is recognized
+before that capability (`OLALA_VOLTA`), and Volta runs the SM80 kernels wherever it has no path of its own. Its
+own paths replace emulated tensor-core code with fp32 FMA code:
+
+- the decode projections take FMA GEMVs up to 32 rows, and so do the router at decode sizes (the hi + lo halves
+  of its bf16x2 split as one fp32 weight) and the LM head up to 16 sequences;
+- the router of 33-2048-token batches runs fp32 FMA chains (`router_chain_volta.cu`) that return cuBLAS's logits
+  bit for bit (cuBLAS runs this bf16 GEMM as fp32 SIMT chains on a V100, with few CTAs); `OLALA_ROUTER_CHAIN=0`
+  keeps cuBLAS;
+- the Mamba-3 decode step runs its scalar-FMA update (`-DSTEP_VOLTA`); with an fp32 state, the state goes straight
+  to registers, all loads in flight at once, three CTAs per SM (`mamba3_step_volta_kernel`, the 1-stage kernel's
+  bits; `OLALA_STEP_PIPE=0` keeps that one);
+- the TPA-factor decode attention has an FMA kernel (`tpa_factor_decode_volta.cu`), with one-tile splits and a
+  4-head split merge;
+- the latent-MoE small path covers up to 32 tokens; above, the medium path's projections take the same GEMV
+  dispatch and its grouped GEMMs one 16x64x32 single-stage tile;
+- the Mamba-3 prefill's chunk-state and output-pass kernels and the DiffTPA prefill attention have FMA editions
+  (`mamba3_chunk_state_volta.cu`, `mamba3_scan_prefill_volta.cu`, `tpa_prefill_attn_volta.cu`) that return the SM80
+  kernels' and FlashAttention-2's values, bit for bit through volta-forever (`OLALA_VOLTA_PREFILL=0` keeps those);
+- unquantized routed experts above the medium path (prefill chunks) take 16-row single-stage tiles in vLLM's fused
+  MoE kernel (same bits as its default tiles);
+- the Triton kernels that the first requests would compile (Mamba-3 and TPA-factor prefill, LM head, logprobs) are
+  compiled at start for every specialization a batch can hit (`vllm/model_executor/warmup/olala_triton_warmup.py`).
+
+On a V100-SXM2-32GB through volta-forever this takes the bf16 model from 55 to 174 tok/s of decode at one
+request, from 12.6 to 72 tok/s per request at eight, and its prefill (480-token prompts) from ~1590 to ~2700
+tok/s; `OLALA_VOLTA=0` gives the SM80 dispatch back, token for token.
+
+From 9 rows, the projections then leave those paths for Volta's fp16 tensor cores (`OLALA_VOLTA_TC`, on by
+default): an fp16 copy of each weight (INT8 codes exactly; bf16 rows scaled by a power of two, with a sparse
+term for the few elements that do not fit), each activation row split into one to three exactly scaled fp16
+terms, cuBLAS 12.9's native HMMA GEMM with fp32 sums, and a per-row FMA fallback for the rare rows the terms
+do not cover. Outputs stay at the CPU-bf16 level of the checkpoints. Through volta-forever on a
+V100-SXM2-32GB, decode per request at 32 / 128 requests and the TTFT of a 480-token prompt: bf16 20.7 -> 31.3
+/ 6.9 -> 10.7 tok/s, 0.177 -> 0.110 s; Q8 24.2 -> 32.5 / 7.8 -> 12.0, 0.192 -> 0.106 s; Q4A2 22.2 -> 29.0 /
+7.5 -> 11.1, 0.196 -> 0.115 s; 1-8 rows unchanged; 1.8-2.8 GiB less KV cache (the fp16 weight copies take
+about 2 GiB). `OLALA_VOLTA_TC=0` gives the previous outputs back, bit for bit. With `VF_SAFE=1`
+(volta-forever's conservative switch) this edition, with its truncation bias, is off; the fp32-FMA kernels
+that only reorder a sum stay on, though strictly they are not bit-identical to stock either.
 
 ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
 
