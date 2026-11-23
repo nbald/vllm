@@ -114,6 +114,7 @@ from vllm.model_executor.layers.mamba.olala.state import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -1560,6 +1561,29 @@ class OlalaForCausalLM(
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        lp, head = self.logits_processor, self.lm_head
+        if (
+            hidden_states.dim() == 2
+            and hidden_states.shape[0] <= 16
+            and not lp.logits_as_input
+            and lp.head_dtype in (None, hidden_states.dtype)
+            and head.tp_size == 1
+            and isinstance(head.quant_method, UnquantizedEmbeddingMethod)
+            and hidden_states.dtype == head.weight.dtype
+            and volta_gemv_ok(hidden_states, head.weight)
+        ):
+            # Volta, up to 16 sequences: cuBLAS has no Volta bf16 GEMM kernel
+            # and its fallback streams the 152k x 1536 head at ~150 GB/s; the
+            # FMA GEMV reads it once for all rows. V100 through volta-forever,
+            # graphed, us: 1 row 693 -> 536, 2: 3417 -> 555, 8: 2962 -> 787,
+            # 16: 2973 -> 1476 (from 24 rows cuBLAS is as fast). Same output
+            # dtype as cuBLAS (fp32 accumulation, logits rounded to bf16).
+            logits = decode_gemv(hidden_states, head.weight)[..., : lp.org_vocab_size]
+            if lp.soft_cap is not None:
+                logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+            if lp.scale != 1.0:
+                logits = logits * lp.scale
+            return logits
         return self.logits_processor(self.lm_head, hidden_states)
 
     def update_physical_experts_metadata(
