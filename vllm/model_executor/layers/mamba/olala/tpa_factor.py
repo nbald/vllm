@@ -787,7 +787,10 @@ def factor_decode_attention(
     if out is None:
         out = torch.empty(B, HQ * HEAD_DIM, dtype=q.dtype, device=q.device)
     assert out.is_contiguous() and out.shape == (B, HQ * HEAD_DIM)
-    # 8 heads per program and up to 16 splits in flight: the merge of a single long request (128 splits) is latency-bound
-    _factor_combine_kernel[(B, HQP // 8)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=8, D=HEAD_DIM,
-                                          CHUNK=min(16, nsplit), num_warps=4)
+    # 8 heads per program and up to 16 splits in flight: the merge of a single long request (128 splits) is latency-bound.
+    # Volta: 4 heads per program and chunks of 4 splits (twice the programs; same result): one request, 57 active
+    # splits, 39 -> 20 us on a V100 through volta-forever.
+    hb, chunk = (4, 4) if gpu_family() is GpuFamily.SM70 else (8, 16)
+    _factor_combine_kernel[(B, HQP // hb)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=hb,
+                                           D=HEAD_DIM, CHUNK=min(chunk, nsplit), num_warps=4)
     return out
