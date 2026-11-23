@@ -5,7 +5,7 @@ experts, shared expert and fc2_latent (latent_moe_int8.py) must match a torch
 reference over the dequantized weights in fp32: per-row and per-group (32)
 INT8 scales, INT4 affine groups of 32 (MLX q4 layout) for the routed experts,
 bf16 shared / fc2 mixed in, small and medium paths, MMA and GEMV variants of
-the small path, the prefill grouped GEMMs."""
+the small path, the FMA-only small path of Volta, the prefill grouped GEMMs."""
 
 import pytest
 import torch
@@ -22,6 +22,7 @@ from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import (  # noqa: E4
     _wq_tile_t,
     olala_moe_medium_int8,
     olala_moe_small_int8,
+    olala_moe_small_int8_volta,
 )
 from vllm.triton_utils import tl, triton  # noqa: E402
 
@@ -152,6 +153,18 @@ def _setup(m: int, group, dense_bf16: bool):
 def test_small_path_matches_reference(m, group, gemv, dense_bf16):
     args, ref = _setup(m, group, dense_bf16)
     out = olala_moe_small_int8(*args, TOPK, 2.45, gemv=gemv)
+    torch.testing.assert_close(out.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("m", [1, 2, 3, 5, 8, 12, 17, 32])
+@pytest.mark.parametrize("group", [0, 32, INT4])
+@pytest.mark.parametrize("dense_bf16", [False, True])
+def test_volta_small_path_matches_reference(m, group, dense_bf16):
+    """The Volta small path (FMA kernels only; plain Triton, so it runs on any GPU): routed
+    group and INT4 weights stay fp32 after dequantization (as in the GEMV variant), within bf16
+    rounding of the reference."""
+    args, ref = _setup(m, group, dense_bf16)
+    out = olala_moe_small_int8_volta(*args, TOPK, 2.45)
     torch.testing.assert_close(out.float(), ref.float(), atol=3e-2, rtol=3e-2)
 
 

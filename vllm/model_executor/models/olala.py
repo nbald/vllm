@@ -85,9 +85,11 @@ from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
 )
 from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import (
     INT8_SMALL_MAX_TOKENS,
+    VOLTA_SMALL_MAX_TOKENS,
     WqWeight,
     olala_moe_medium_int8,
     olala_moe_small_int8,
+    olala_moe_small_int8_volta,
     wq_routed_experts,
 )
 from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
@@ -439,9 +441,15 @@ class OlalaLatentMoE(nn.Module):
         # Medium batches (decode): fused routing/sort, relu^2 in the up GEMM,
         # top-k sum fused with the shared concat. Unquantized experts only;
         # OLALA_MOE_MEDIUM=0 disables it.
+        # Volta with weight-only experts: the small path (FMA kernels) covers up
+        # to VOLTA_SMALL_MAX_TOKENS tokens and larger batches take the prefill
+        # path; the medium path's grouped GEMMs are emulated tl.dot there (and
+        # volta-forever refuses its down GEMM: redux.sync on a reused mask).
+        self._int8_volta = self._int8 and gpu_family() is GpuFamily.SM70
         self._medium_path = (
             self._small_path
             and (quant_config is None or self._int8)
+            and not self._int8_volta
             and os.environ.get("OLALA_MOE_MEDIUM", "1") != "0"
         )
         # Opt-in: medium batches through one persistent kernel (routing,
@@ -654,7 +662,9 @@ class OlalaLatentMoE(nn.Module):
         for per-row INT8) and W8A16 linears beyond (prefill)."""
         m = hidden_states.shape[0]
         weights = self._int8_weights()
-        small = m <= INT8_SMALL_MAX_TOKENS
+        small = m <= (
+            VOLTA_SMALL_MAX_TOKENS if self._int8_volta else INT8_SMALL_MAX_TOKENS
+        )
         if self._small_path and (
             small or (self._medium_path and m <= MEDIUM_BATCH_MAX_TOKENS)
         ):
@@ -686,6 +696,8 @@ class OlalaLatentMoE(nn.Module):
                 self.routed_scaling_factor,
             )
             if small:
+                if self._int8_volta:
+                    return olala_moe_small_int8_volta(*args, router_logits_lo=logits_lo)
                 return olala_moe_small_int8(*args, router_logits_lo=logits_lo)
             return olala_moe_medium_int8(*args, router_logits_lo=logits_lo)
         if router_logits is None:
