@@ -803,6 +803,21 @@ def _pick_small(M: int, fmt: int = FMT_ROW):
     return table[-1][1:]
 
 
+def _sm80_stages(cfg: dict, gemv: bool, fmt: int, dev: torch.device) -> None:
+    """Triton 3.8 fails to compile the pipelined MMA form of the small-path up
+    and down kernels for sm_80 / 86 / 89 when the routed experts are bf16 or
+    per-row INT8 (TritonGPUPrefetch: "PassManager::run failed"); grouped INT8
+    and INT4 experts compile. The tables above were tuned on sm_120: one stage
+    on the SM80 family. The stage count does not change the result."""
+    if (
+        not gemv
+        and fmt in (FMT_BF16, FMT_ROW)
+        and cfg.get("num_stages", 1) > 1
+        and gpu_family(dev) == GpuFamily.SM80
+    ):
+        cfg["num_stages"] = 1
+
+
 _UP_MEDIUM = dict(
     BLOCK_SIZE_M=16,
     BLOCK_SIZE_N=64,
@@ -900,6 +915,7 @@ def olala_moe_small_int8(
     up_cfg, down_cfg, exit_cfg = configs or _pick_small(M, w13.fmt)
     cfg = dict(up_cfg)
     gemv = cfg.pop("GEMV", False) or gemv
+    _sm80_stages(cfg, gemv, w13.fmt, dev)
     cfg["BK"] = _fit_bk(cfg["BK"], w13)
     cfg["BKS"] = _fit_bk(cfg["BKS"], shared_up)
     _i8_small_up_kernel[(MK * (N1 // cfg["BN"]) + S // cfg["BNS"],)](
@@ -938,6 +954,7 @@ def olala_moe_small_int8(
     ) == router_logits.stride(0)
     part = torch.empty(MK, D2, dtype=torch.float32, device=dev)
     cfg = dict(down_cfg)
+    _sm80_stages(cfg, gemv, w2.fmt, dev)
     cfg["BK"] = _fit_bk(cfg["BK"], w2)
     _i8_small_down_kernel[(MK * (D2 // cfg["BN"]),)](
         h,
