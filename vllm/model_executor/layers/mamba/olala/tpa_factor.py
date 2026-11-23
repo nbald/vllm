@@ -66,6 +66,15 @@ TARGET_CTAS = 400  # ~3 CTAs per SM on GH200 (Hopper kernel)
 logger = init_logger(__name__)
 
 MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits stay empty (cheap)
+
+
+@lru_cache(maxsize=1)
+def _min_split_tokens() -> int:
+    # The Volta kernel (tpa_factor_decode_volta.cu) has no load pipeline to fill:
+    # one 13-token tile per split doubles the CTAs of a short context.
+    return TILE if gpu_family() is GpuFamily.SM70 else MIN_SPLIT_TOKENS
+
+
 SPLIT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 
@@ -162,7 +171,7 @@ class OlalaTPAFactorMetadata:
         if t is None:
             mx = self.seq_lens.max()
             tps = ((mx + nsplit - 1) // nsplit + TILE - 1) // TILE * TILE
-            tps = torch.clamp_min(tps, MIN_SPLIT_TOKENS)
+            tps = torch.clamp_min(tps, _min_split_tokens())
             nact = (mx + tps - 1) // tps
             t = (tps.to(torch.int32).reshape(1), nact.to(torch.int32).reshape(1))
             self.tok_per_split[nsplit] = t
@@ -650,6 +659,15 @@ def _load_kernel():
             # tcgen05 needs the arch-specific target
             ["-O3", "-std=c++20", "--use_fast_math", gencode(arch_specific=True)],
             ["-lcuda"],
+        )
+    elif gpu_family() is GpuFamily.SM70:
+        # V100 (told sm_80 by volta-forever): the mma.sync kernel's bf16 tensor-core
+        # products, ldmatrix and cp.async are emulated with scalar code there, so
+        # the FMA edition (same cache layout, launch contract and partials).
+        ext = load_extension(
+            f"olala_tpa_factor_decode_volta_sm{sm_arch()}",
+            "tpa_factor_decode_volta.cu",
+            ["-O3", "-std=c++20", "--use_fast_math", gencode()],
         )
     else:
         ext = load_extension(
