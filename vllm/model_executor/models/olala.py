@@ -64,6 +64,10 @@ from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     moe_cat_shared,
 )
 from vllm.model_executor.layers.mamba.olala.latent_moe_fused import olala_moe_fused
+from vllm.model_executor.layers.mamba.olala.router_volta import (
+    router_chain,
+    router_chain_ok,
+)
 from vllm.model_executor.layers.mamba.olala.latent_moe_updown import (
     UPDOWN_ENABLED,
     olala_moe_updown,
@@ -261,6 +265,11 @@ def _olala_router_logits(
         # Volta (OlalaLatentMoE._volta_router): the same bf16x2 product as an
         # FMA GEMV over hi + lo (exact in fp32), without cuBLAS bf16.
         return volta_gemv(hidden_states, decode_weight, torch.float32)
+    if router_chain_ok(hidden_states, weight, num_experts):
+        # SM70 family, 33..2048 rows: cuBLAS runs this bf16 GEMM as fp32 SIMT
+        # chains (magma) with few CTAs; the same chains and add, bit for bit,
+        # in a kernel tiled for the batch (router_volta.py).
+        return router_chain(hidden_states, weight, num_experts)
     out = torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
     if weight.shape[0] == num_experts:
         return out
