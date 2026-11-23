@@ -10,6 +10,8 @@
 // Per position it writes the column-t state (ssm, rotated B, x, angle) and the output row. The token rows of position
 // t + 1 are prefetched (cp.async) while position t computes. The math is the fp32 pipelined step of mamba3_step.cu,
 // operation for operation, so the outputs and states are bit-identical to chaining that kernel over the positions.
+// VERIFY_VOLTA builds (V100, natively or through volta-forever) launch mamba3_verify_volta_kernel instead: the same
+// protocol with the arithmetic of the Volta decode step (STEP_VOLTA builds of mamba3_step.cu), see below.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -268,6 +270,196 @@ __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const 
   for (int tok = tail + blockIdx.x / H; tok < a.N; tok += nb_stride)
     for (int i = t; i < D; i += NT) a.y[((size_t)tok * H + h) * D + i] = __float2bfloat16(0.f);
 }
+
+#ifdef VERIFY_VOLTA
+// ---------------------------------------------------------------------------------------------------------------------
+// Volta edition (VERIFY_VOLTA builds, mamba3_step_cuda.py on the SM70 family). sm_70 has no bf16 mma.sync, ldmatrix or
+// cp.async: through volta-forever the kernel above runs them emulated with scalar code. This kernel keeps the column-slot
+// protocol and the state in registers across the positions, but each position is the arithmetic of the Volta decode
+// step (mamba3_step_volta_kernel in mamba3_step.cu, its STEP_F32_FMA code: fp32 FMA update and C dot over the same
+// fragment layout, rows p0 and p0 + 8, columns jt * 8 + 2 qd + {0, 1}), operation for operation and in the same order.
+// So on Volta too the outputs and the written states are bit-identical to chaining the CUDA decode step over the
+// positions (the decode step a request takes without speculation), and nothing in the verify is emulated.
+struct __align__(16) VSmem {
+  __nv_bfloat16 bm[R * S];     // token B rows (pre bias / rotary)
+  __nv_bfloat16 cm[R * S];     // token C rows
+  __nv_bfloat16 x[D], z[D];
+  __nv_bfloat16 angp[NA];
+  __nv_bfloat16 bst0[R * S];   // previous rotated B of the initial state (k_pool), position 0 only
+  __nv_bfloat16 xprev[2][D];   // previous x: [0] from v_pool for position 0, then ping-pong
+  float angst0[NA];            // angle state of the initial state, position 0 only
+  float xproj[R * D], zproj[R * D], outproj[R * D];   // this CTA's head
+  float sCos[NA], sSin[NA], sTheta[NA];
+  __nv_bfloat16 sBk[8][LDB];   // rows 0..3 rotated B of this position, 4..7 of the previous one
+  __nv_bfloat16 sCb[4][LDB];   // rotated C
+};
+
+constexpr int VTHREADS = 128;
+
+// The state access of the Volta edition: the only code that reads or writes the pools. A slot (a column of
+// cols[r]) holds the state after one position of its request: the SSM state ssm[slot, h] (D x S fp32), the rotated
+// B' of that position k[slot, :, h] (R x S bf16), its x v[slot, h] (D bf16) and its rotary phase angle[slot, h]
+// (NA fp32). Thread t owns the SSM state elements of rows p0 and p0 + 8 at columns jt * 8 + 2 qd + {0, 1}
+// (jt = 0..15): its fragment, hs[e][jt] for row p0 + 8 e, which stays in registers across the positions. A codec
+// (the 16-bit state of SM70, an anchored layout) replaces these two functions and leaves the arithmetic alone.
+//
+// vstate_load: the start state of a request into hs (fragment) and S_.bst0 / S_.xprev[0] / S_.angst0.
+__device__ __forceinline__ void vstate_load(const Args& a, VSmem& S_, int slot, int h, int t, int p0, int qd,
+                                            float2 (&hs)[2][16]) {
+  const float* src = a.ssm + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+  for (int e = 0; e < 2; ++e)
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt) hs[e][jt] = *reinterpret_cast<const float2*>(src + (p0 + e * 8) * S + jt * 8 + 2 * qd);
+  if (t < 64) { const int rr = t >> 4, q = t & 15; *reinterpret_cast<uint4*>(S_.bst0 + rr * S + q * 8) = *reinterpret_cast<const uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)rr * H + h) * S + q * 8); }
+  else if (t < 72) *reinterpret_cast<uint4*>(S_.xprev[0] + (t - 64) * 8) = *reinterpret_cast<const uint4*>(a.vp + (size_t)slot * a.vp_sst + (size_t)h * D + (t - 64) * 8);
+  else if (t < 80) *reinterpret_cast<float4*>(S_.angst0 + (t - 72) * 4) = *reinterpret_cast<const float4*>(a.angle + (size_t)slot * a.ang_sst + (size_t)h * NA + (t - 72) * 4);
+}
+
+// vstate_store: the state after the current position into column `slot`: hs, the rotated B' (S_.sBk rows 0..3),
+// x (S_.x) and the phase (S_.sTheta).
+__device__ __forceinline__ void vstate_store(const Args& a, const VSmem& S_, int slot, int h, int t, int p0, int qd,
+                                             const float2 (&hs)[2][16]) {
+  float* dst = a.ssm + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+  for (int e = 0; e < 2; ++e)
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt) *reinterpret_cast<float2*>(dst + (p0 + e * 8) * S + jt * 8 + 2 * qd) = hs[e][jt];
+  if (t < 64) { const int rr = t >> 4, q = t & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)rr * H + h) * S + q * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[rr][q * 8]); }
+  if (t < D) a.vp[(size_t)slot * a.vp_sst + (size_t)h * D + t] = S_.x[t];
+  if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
+}
+
+__global__ void __launch_bounds__(VTHREADS, 3) mamba3_verify_volta_kernel(const Args a) {
+  __shared__ VSmem S_;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int qd = lane & 3, p0 = warp * 16 + (lane >> 2);
+  const int h = blockIdx.x % H, nb_stride = gridDim.x / H;
+  for (int i = t; i < R * D; i += VTHREADS) {   // per-head constants (fixed per CTA)
+    const size_t g = ((size_t)(i / D) * H + h) * D + i % D;
+    S_.xproj[i] = a.xproj[g]; S_.zproj[i] = a.zproj[g]; S_.outproj[i] = a.outproj[g];
+  }
+  auto bias_k = [&](int r, int j) -> float { return __ldg(a.bias_k + ((size_t)r * H + h) * S + j); };
+  auto bias_q = [&](int r, int j) -> float { return __ldg(a.bias_q + ((size_t)r * H + h) * S + j); };
+  const float Dh = a.Dp[h];
+  __syncthreads();
+  for (int r = blockIdx.x / H; r < a.lanes; r += nb_stride) {
+    const int start = a.qsl[r];
+    const int qlen = min(a.qsl[r + 1] - start, a.ncols);
+    if (qlen <= 0) continue;
+    const int c0 = max(a.num_accepted[r] - 1, 0);
+    const int in_slot = a.cols[(size_t)r * a.cols_stride + c0];
+    if (in_slot < 0 || in_slot >= a.P) {   // no state to start from: zero outputs, no writes
+      for (int i = t; i < qlen * D; i += VTHREADS) a.y[((size_t)(start + i / D) * H + h) * D + i % D] = __float2bfloat16(0.f);
+      continue;
+    }
+    float2 hs[2][16];   // the thread's fragment of the SSM state, in registers across the positions
+    vstate_load(a, S_, in_slot, h, t, p0, qd, hs);
+    for (int pos = 0; pos < qlen; ++pos) {
+      const int tok = start + pos;
+      const int out_slot = a.cols[(size_t)r * a.cols_stride + pos];
+      const bool wr = out_slot >= 0 && out_slot < a.P;
+      // token rows of this position: 148 16-byte chunks (B 64, C 64, x 8, z 8, angle_proj 4)
+      for (int c = t; c < 148; c += VTHREADS) {
+        if (c < 64) *reinterpret_cast<uint4*>(S_.bm + c * 8) = *reinterpret_cast<const uint4*>(a.Bm + (size_t)tok * a.bc_bstride + c * 8);
+        else if (c < 128) *reinterpret_cast<uint4*>(S_.cm + (c - 64) * 8) = *reinterpret_cast<const uint4*>(a.Cm + (size_t)tok * a.bc_bstride + (c - 64) * 8);
+        else if (c < 136) *reinterpret_cast<uint4*>(S_.x + (c - 128) * 8) = *reinterpret_cast<const uint4*>(a.x + ((size_t)tok * H + h) * D + (c - 128) * 8);
+        else if (c < 144) *reinterpret_cast<uint4*>(S_.z + (c - 136) * 8) = *reinterpret_cast<const uint4*>(a.z + ((size_t)tok * H + h) * D + (c - 136) * 8);
+        else *reinterpret_cast<uint4*>(S_.angp + (c - 144) * 8) = *reinterpret_cast<const uint4*>(a.angp + (size_t)tok * a.angp_stride + (c - 144) * 8);
+      }
+      const float dt = a.dt[(size_t)tok * H + h], A = a.A[(size_t)tok * H + h], trap = a.trap[(size_t)tok * H + h];
+      __syncthreads();
+      const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
+      // ---- preamble: angles, bias + rotary on B/C (bf16-rounded), the Volta step's expressions
+      if (t < NA) {
+        const float prev = pos == 0 ? S_.angst0[t] : S_.sTheta[t];
+        float th = prev + tanhf(bf2f(S_.angp[t])) * dt * 3.14159265358979323846f;
+        th -= 6.283185307179586f * floorf(th / 6.283185307179586f);
+        S_.sTheta[t] = th; sincosf(th, &S_.sSin[t], &S_.sCos[t]);
+      }
+      __syncthreads();
+      for (int i = t; i < R * (S / 2); i += VTHREADS) {
+        const int rr = i / (S / 2), j = i % (S / 2);
+        // the previous position's rotated B moves to rows 4..7 (each element is owned by one thread)
+        const __nv_bfloat16 plo = pos == 0 ? S_.bst0[rr * S + j] : S_.sBk[rr][j];
+        const __nv_bfloat16 phi = pos == 0 ? S_.bst0[rr * S + j + 64] : S_.sBk[rr][j + 64];
+        float blo = bf2f(S_.bm[rr * S + j]) + bias_k(rr, j), bhi = bf2f(S_.bm[rr * S + j + 64]) + bias_k(rr, j + 64);
+        float clo = bf2f(S_.cm[rr * S + j]) + bias_q(rr, j), chi = bf2f(S_.cm[rr * S + j + 64]) + bias_q(rr, j + 64);
+        if (j < NA) {
+          const float c = S_.sCos[j], s_ = S_.sSin[j];
+          const float b0 = blo * c - bhi * s_, b1 = blo * s_ + bhi * c, c0 = clo * c - chi * s_, c1 = clo * s_ + chi * c;
+          blo = b0; bhi = b1; clo = c0; chi = c1;
+        }
+        S_.sBk[4 + rr][j] = plo; S_.sBk[4 + rr][j + 64] = phi;
+        S_.sBk[rr][j] = __float2bfloat16(blo); S_.sBk[rr][j + 64] = __float2bfloat16(bhi);
+        S_.sCb[rr][j] = __float2bfloat16(clo); S_.sCb[rr][j + 64] = __float2bfloat16(chi);
+      }
+      __syncthreads();
+      // ---- h_new = alpha h + sum_k A[p][k] Bk[k][s] in fp32, then o[p][r] = sum_s h_new[p][s] C'[r][s] reduced over
+      // the 4 qd lanes (mamba3_step_volta_kernel's code)
+      const __nv_bfloat16* xs_buf = S_.xprev[pos & 1];
+      float av[2][8];
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int p = p0 + e * 8;
+        const float xp = bf2f(S_.x[p]), xs = bf2f(xs_buf[p]);
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) { const float xpj = S_.xproj[rr * D + p]; av[e][rr] = gamma * xp * xpj; av[e][4 + rr] = beta * xs * xpj; }
+      }
+      float o[2][R];
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) o[e][rr] = 0.f;
+#pragma unroll
+      for (int jt = 0; jt < 16; ++jt) {
+        const int n = jt * 8 + 2 * qd;
+        float2 bk[8], cr[R];
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) bk[kk] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sBk[kk][n]));
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) cr[rr] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sCb[rr][n]));
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          float2 hv = hs[e][jt];
+          hv.x *= alpha; hv.y *= alpha;
+#pragma unroll
+          for (int kk = 0; kk < 8; ++kk) { hv.x = fmaf(av[e][kk], bk[kk].x, hv.x); hv.y = fmaf(av[e][kk], bk[kk].y, hv.y); }
+          hs[e][jt] = hv;
+#pragma unroll
+          for (int rr = 0; rr < R; ++rr) o[e][rr] = fmaf(hv.x, cr[rr].x, fmaf(hv.y, cr[rr].y, o[e][rr]));
+        }
+      }
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) { o[e][rr] += __shfl_xor_sync(0xffffffffu, o[e][rr], 1); o[e][rr] += __shfl_xor_sync(0xffffffffu, o[e][rr], 2); }
+      float ys[2];
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {   // lane qd takes r = qd
+        const int p = p0 + e * 8;
+        const float xp = bf2f(S_.x[p]), zp = bf2f(S_.z[p]);
+        float orr = o[e][0];
+#pragma unroll
+        for (int rr = 1; rr < R; ++rr) orr = (qd == rr) ? o[e][rr] : orr;
+        orr += Dh * xp * S_.xproj[qd * D + p];
+        const float zv = zp * S_.zproj[qd * D + p];
+        orr *= __fdividef(zv, 1.f + __expf(-zv));
+        ys[e] = orr * S_.outproj[qd * D + p];
+        ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
+      }
+      if (qd == 0) { a.y[((size_t)tok * H + h) * D + p0] = __float2bfloat16(ys[0]); a.y[((size_t)tok * H + h) * D + p0 + 8] = __float2bfloat16(ys[1]); }
+      if (wr) vstate_store(a, S_, out_slot, h, t, p0, qd, hs);   // column pos
+      if (t < D) S_.xprev[(pos + 1) & 1][t] = S_.x[t];
+      __syncthreads();   // the token rows, sBk / sCb / sTheta and xprev[pos & 1] are reused by the next position
+    }
+  }
+  // rows past the last request (CUDA graph padding) get a zero output
+  const int tail = a.qsl[a.lanes];
+  for (int tok = tail + blockIdx.x / H; tok < a.N; tok += nb_stride)
+    for (int i = t; i < D; i += VTHREADS) a.y[((size_t)tok * H + h) * D + i] = __float2bfloat16(0.f);
+}
+#endif  // VERIFY_VOLTA
 }  // namespace
 
 void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tensor v_pool, torch::Tensor angle_pool,
@@ -303,6 +495,18 @@ void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Ten
   TORCH_CHECK(qsl.size(0) >= a.lanes + 1 && num_accepted.size(0) >= a.lanes);
   a.pdl = pdl ? 1 : 0;
   if (a.N == 0) return;
+#ifdef VERIFY_VOLTA
+  {   // static shared memory; head h = blockIdx.x % H stays fixed per CTA, so the grid is a multiple of H
+    const c10::cuda::CUDAGuard device_guard(x.device());
+    int nsm = 80; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, x.get_device());
+    int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, mamba3_verify_volta_kernel, VTHREADS, 0);
+    const int cps = std::max(1, std::min<int>((int)ctas_per_sm, fit));
+    const int items = std::max(1, a.lanes) * H;
+    int grid = std::min<int>(items, nsm * cps); grid = std::max(H, (grid / H) * H);
+    mamba3_verify_volta_kernel<<<grid, VTHREADS, 0, c10::cuda::getCurrentCUDAStream()>>>(a);
+    return;
+  }
+#endif
   const int smem = (int)sizeof(Smem);
   // Launch on x's device; the smem opt-in is a per-device function attribute.
   const c10::cuda::CUDAGuard device_guard(x.device());

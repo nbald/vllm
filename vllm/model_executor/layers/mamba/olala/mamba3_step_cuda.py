@@ -162,11 +162,17 @@ def mamba3_step_cuda_raw(ssm_pool, k_pool, v_pool, angle_pool, zxdt, bc, dt_bias
 def _load_verify():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    return load_extension(
-        f"olala_mamba3_verify_sm{sm_arch()}",
-        "mamba3_verify.cu",
-        ["-O3", "-std=c++20", gencode()],
-    )
+    name = f"olala_mamba3_verify_sm{sm_arch()}"
+    flags = ["-O3", "-std=c++20", gencode()]
+    if gpu_family() is GpuFamily.SM70:
+        # V100 (told sm_80 by volta-forever): the tensor-core kernel's bf16 mma.sync /
+        # ldmatrix / cp.async are emulated there; build the Volta edition instead
+        # (VERIFY_VOLTA, csrc/mamba3_verify.cu): the arithmetic of the Volta decode step
+        # (STEP_VOLTA builds of mamba3_step.cu) per position, so the verify stays
+        # bit-identical to chaining the decode step that _load() builds on Volta.
+        name += "_volta"
+        flags.append("-DVERIFY_VOLTA")
+    return load_extension(name, "mamba3_verify.cu", flags)
 
 
 @lru_cache(maxsize=1)

@@ -53,6 +53,8 @@ own paths replace emulated tensor-core code with fp32 FMA code:
   bits; `OLALA_STEP_PIPE=0` keeps that one);
 - the TPA-factor decode attention has an FMA kernel (`tpa_factor_decode_volta.cu`), with one-tile splits and a
   4-head split merge;
+- the speculative verify of the Mamba-3 layers runs that step's FMA arithmetic at every draft position
+  (`mamba3_verify.cu`, `-DVERIFY_VOLTA`), so a verified position is bit for bit the chained `STEP_VOLTA` step;
 - the latent-MoE small path covers up to 32 tokens; above, the medium path's projections take the same GEMV
   dispatch and its grouped GEMMs one 16x64x32 single-stage tile;
 - the Mamba-3 prefill's chunk-state and output-pass kernels and the DiffTPA prefill attention have FMA editions
