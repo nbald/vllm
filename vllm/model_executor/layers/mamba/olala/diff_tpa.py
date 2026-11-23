@@ -35,6 +35,7 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     decode_gemv,
 )
 from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+from vllm.model_executor.layers.mamba.olala.volta_tc import bf16_linear, tc_enabled
 from vllm.model_executor.layers.mamba.olala.w8a16_layers import (
     cat_int8_rows_shared,
     is_int8_quant_method,
@@ -451,8 +452,11 @@ class OlalaDiffTPAAttention(PluggableLayer):
                 allp = decode_gemv(hidden_states, w_all)
             else:
                 # also batch 1 on datacenter Blackwell: cuBLAS streams the aligned width
-                # faster than the Triton GEMV (5.8 vs 6.3 us; 9.1 unaligned)
-                allp = F.linear(hidden_states, self._decode_proj_w_padded)[:, : w_all.shape[0]]
+                # faster than the Triton GEMV (5.8 vs 6.3 us; 9.1 unaligned); OLALA_VOLTA_TC:
+                # the fp16 tensor cores (volta_tc.py)
+                allp = bf16_linear(hidden_states, w_all) if tc_enabled("bf16") else None
+                if allp is None:
+                    allp = F.linear(hidden_states, self._decode_proj_w_padded)[:, : w_all.shape[0]]
             parts = torch.split(allp, self._decode_proj_sizes, dim=-1)
             q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]
             shift_alphas = tuple(parts[6:]) if self.token_shift else None

@@ -255,6 +255,14 @@ def _int8_skip_layers() -> frozenset[int]:
     return frozenset(int(x) for x in raw.replace(" ", "").split(",") if x)
 
 
+@functools.cache
+def _volta_tc_bf16() -> bool:
+    """OLALA_VOLTA_TC with bf16 projections on the SM70 family (volta_tc.py)."""
+    from vllm.model_executor.layers.mamba.olala.volta_tc import tc_enabled
+
+    return tc_enabled("bf16")
+
+
 def _olala_router_logits(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -640,7 +648,10 @@ class OlalaLatentMoE(nn.Module):
                 self.routed_scaling_factor,
                 x_in=x_in,
             )
-        if self._fused_proj and hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS:
+        if self._fused_proj and (
+            hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS or _volta_tc_bf16()
+        ):
+            # OLALA_VOLTA_TC: prefill batches too, through the two tensor-core projections
             w_in, w_out = self._small_path_weights()
             x_in = decode_gemv(hidden_states, w_in)
             latent = x_in[:, : self.latent_size].contiguous()
@@ -1590,14 +1601,18 @@ class OlalaForCausalLM(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         lp, head = self.logits_processor, self.lm_head
-        if (
+        plain_head = (
             hidden_states.dim() == 2
-            and hidden_states.shape[0] <= 16
             and not lp.logits_as_input
             and lp.head_dtype in (None, hidden_states.dtype)
             and head.tp_size == 1
             and isinstance(head.quant_method, UnquantizedEmbeddingMethod)
             and hidden_states.dtype == head.weight.dtype
+        )
+        logits = None
+        if (
+            plain_head
+            and hidden_states.shape[0] <= 16
             and volta_gemv_ok(hidden_states, head.weight)
         ):
             # Volta, up to 16 sequences: cuBLAS has no Volta bf16 GEMM kernel
@@ -1606,7 +1621,14 @@ class OlalaForCausalLM(
             # graphed, us: 1 row 693 -> 536, 2: 3417 -> 555, 8: 2962 -> 787,
             # 16: 2973 -> 1476 (from 24 rows cuBLAS is as fast). Same output
             # dtype as cuBLAS (fp32 accumulation, logits rounded to bf16).
-            logits = decode_gemv(hidden_states, head.weight)[..., : lp.org_vocab_size]
+            logits = decode_gemv(hidden_states, head.weight)
+        elif plain_head and gpu_family() is GpuFamily.SM70:
+            # OLALA_VOLTA_TC=1: the fp16 tensor cores, exactly scaled (volta_tc.py)
+            from vllm.model_executor.layers.mamba.olala.volta_tc import bf16_linear
+
+            logits = bf16_linear(hidden_states, head.weight)
+        if logits is not None:
+            logits = logits[..., : lp.org_vocab_size]
             if lp.soft_cap is not None:
                 logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
             if lp.scale != 1.0:
@@ -1812,6 +1834,11 @@ class OlalaForCausalLM(
         for module in self.modules():
             if isinstance(module, (OlalaMamba3Mixer, OlalaDiffTPAAttention, OlalaLatentMoE)):
                 module.refresh_weight_caches()
+        if _volta_tc_bf16():
+            # fp16 copies of the bf16 projections (volta_tc.py), before the KV cache is sized
+            from vllm.model_executor.layers.mamba.olala.volta_tc import prepare_bf16
+
+            prepare_bf16(self)
         return loaded
 
     def _maybe_prenormalize_embeddings(self) -> None:

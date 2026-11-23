@@ -64,8 +64,8 @@ DEFAULT_KINDS = ("int8", "bf16")  # OLALA_VOLTA_TC=1
 @functools.cache
 def _kinds() -> frozenset[str]:
     """OLALA_VOLTA_TC on the SM70 family (V100, native or through volta-forever): "1" = the
-    DEFAULT_KINDS, or a comma list of KINDS ("int8": W8A16 linears, "bf16": bf16 weights
-    registered with register_bf16)."""
+    DEFAULT_KINDS, or a comma list of KINDS ("int8": W8A16 linears, "bf16": the bf16 model's dense
+    projections)."""
     raw = os.environ.get("OLALA_VOLTA_TC", "0").strip()
     if raw in ("", "0") or not torch.cuda.is_available() or gpu_family() is not GpuFamily.SM70:
         return frozenset()
@@ -460,6 +460,79 @@ def tc_linear(
         T=T, SCALE=int8, WINV=not int8, BN=bn, BK=bkf, num_warps=nw,
     )
     return y
+
+
+_lazy_warned = False
+
+
+def bf16_linear(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor | None:
+    """``x @ weight.T`` for a bf16 weight on the tensor cores, or None (the caller keeps its
+    path). Weights not registered by prepare_bf16 are registered here outside graph capture."""
+    global _lazy_warned
+    if not tc_enabled("bf16") or weight.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
+        return None
+    if x.dim() != 2 or x.shape[0] < min(_bf16_rows_cfg()):
+        return None
+    if lookup(weight) is None:
+        if _capturing() or not register_bf16(weight, 1, f"lazy {tuple(weight.shape)}"):
+            return None
+        if not _lazy_warned:
+            _lazy_warned = True
+            logger.warning("Olala Volta TC: bf16 weight %s registered at its first call",
+                           tuple(weight.shape))
+    return tc_linear(x, weight, out=out)
+
+
+def dense_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``F.linear(x, weight)`` (bf16, no bias), on the fp16 tensor cores when OLALA_VOLTA_TC
+    applies."""
+    y = bf16_linear(x, weight) if tc_enabled("bf16") else None
+    return y if y is not None else torch.nn.functional.linear(x, weight)
+
+
+def prepare_bf16(model: torch.nn.Module) -> None:
+    """Register the bf16 weights the Olala layers send to the tensor cores (at the end of
+    loading: before the profiling run sizes the KV cache, and before graph capture), with the
+    exact activation terms each needs: the block gate / output projections (Mamba-3 output
+    rows: 3 terms), the Mamba-3 in_proj caches, the DiffTPA input projections, the latent MoE's
+    [fc1 ; shared up] and [fc2 | shared down] (the ReLU² half: 2 terms), the lm_head."""
+    from vllm.model_executor.layers.mamba.olala.diff_tpa import OlalaDiffTPAAttention
+    from vllm.model_executor.layers.mamba.olala.mamba3 import OlalaMamba3Mixer
+    from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+    from vllm.model_executor.models.olala import OlalaLatentMoE, OlalaMonoBlock
+
+    if not tc_enabled("bf16"):
+        return
+    for name, mod in model.named_modules():
+        if isinstance(mod, OlalaMonoBlock):
+            if mod.use_gate and mod._plain_gate_proj:
+                register_bf16(mod.gate_proj.weight, 1, f"{name}.gate_proj")
+            if mod._plain_mixer_proj:
+                t = getattr(mod.mixer_proj, "olala_tc_terms", 1)
+                register_bf16(mod.mixer_proj.weight, t, f"{name}.mixer_proj")
+        elif isinstance(mod, OlalaMamba3Mixer):
+            if mod._in_proj_cat_ok:
+                register_bf16(mod._in_proj_cat_weight(), 1, f"{name}.in_proj+dyn")
+                dev = mod.in_proj.weight.device
+                if mod._hybrid_ok and mod._pf_split_ok(dev):
+                    register_bf16(mod._pf_in_weight(), 1, f"{name}.in_proj prefill")
+        elif isinstance(mod, OlalaDiffTPAAttention):
+            if mod._proj_concat_ok:
+                register_bf16(mod._decode_proj_weight(), 1, f"{name}.proj")
+        elif isinstance(mod, OlalaLatentMoE):
+            if not mod._int8 and mod._fused_proj:
+                w_in, w_out = mod._small_path_weights()
+                register_bf16(w_in, 1, f"{name}.w_in")
+                register_bf16(w_out, 2, f"{name}.w_out")
+    head = getattr(model, "lm_head", None)
+    if (
+        head is not None
+        and isinstance(getattr(head, "quant_method", None), UnquantizedEmbeddingMethod)
+        and head.weight.dtype == torch.bfloat16
+    ):
+        register_bf16(head.weight, 1, "lm_head")
 
 
 def stats() -> dict[str, list[int]]:

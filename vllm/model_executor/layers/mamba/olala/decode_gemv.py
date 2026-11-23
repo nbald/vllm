@@ -518,6 +518,14 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             return _decode_gemv_sm120(x, weight)
         return _decode_gemv_blackwell(x, weight) if M == 1 else F.linear(x, weight)
     N, K = weight.shape
+    if family is GpuFamily.SM70 and M > 8 and x.dtype == weight.dtype == torch.bfloat16:
+        # OLALA_VOLTA_TC=1: bf16 weights on the fp16 tensor cores, exactly scaled (volta_tc.py)
+        from vllm.model_executor.layers.quantization.utils.w8a16_utils import volta_tc
+
+        tc = volta_tc()
+        y = tc.bf16_linear(x, weight) if tc is not None else None
+        if y is not None:
+            return y
     if _DISABLED or not x.is_cuda or x.dtype != weight.dtype or K % 128 != 0 or M > SKINNY_MAX_M:
         return F.linear(x, weight)
     if (

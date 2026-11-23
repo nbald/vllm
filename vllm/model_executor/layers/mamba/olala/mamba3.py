@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     cat_rows_shared,
     decode_gemv,
 )
+from vllm.model_executor.layers.mamba.olala.volta_tc import dense_linear
 from vllm.model_executor.layers.mamba.olala.w8a16_layers import (
     cat_int8_rows_shared,
     int8_apply,
@@ -1068,8 +1069,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         K = torch.empty(T, R, S, device=dev, dtype=torch.bfloat16)
         ang = torch.empty(T, self.num_rope_angles, device=dev, dtype=torch.float32)
         if self._pf_split_ok(dev):
-            # one GEMM, x / z stay in its output (row-strided views)
-            cat = F.linear(h, self._pf_in_weight())
+            # one GEMM, x / z stay in its output (row-strided views); OLALA_VOLTA_TC: on the
+            # fp16 tensor cores (volta_tc.py)
+            cat = dense_linear(h, self._pf_in_weight())
             z = cat[:, : H * D].view(T, H, D)
             x = cat[:, H * D : 2 * H * D].view(T, H, D)
             BT = 32
@@ -1087,7 +1089,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 # in_proj_dyn (1056 rows) alone fills 1.3 waves on 56 SMs; the prologue reads
                 # both outputs through their row strides
                 n1, n2 = self.in_proj.weight.shape[0], self.in_proj_dyn.weight.shape[0]
-                y = F.linear(h, self._in_proj_cat_weight())
+                y = dense_linear(h, self._in_proj_cat_weight())
                 zxdt, bc = y[:, :n1], y[:, n1 : n1 + n2]
             elif self._int8_in_proj:
                 zxdt, bc = self._int8_parts(h)
