@@ -35,6 +35,8 @@ A rounding-level change against the emulated kernels (fp32 tensor-core sums in c
 instead of one fp32 chain): outputs stay at the CPU-bf16 level of the checkpoints, and
 ``OLALA_VOLTA_TC=0`` gives the previous outputs bit for bit. The routed experts ("moe") are
 opt-in only: on chat_math they moved one confident prompt position per quantized checkpoint.
+``VF_SAFE=1`` (volta-forever's conservative switch) turns the whole edition off: HMMA truncates
+its fp32 sums, a bias toward zero that leaves the conservative reference class.
 ``OLALA_VOLTA_TC_STATS=1`` counts the rows per number of terms and the fallback rows per linear
 (device counters; read with ``stats()``).
 """
@@ -69,11 +71,20 @@ DEFAULT_KINDS = ("int8", "bf16")
 
 
 @functools.cache
+def vf_safe() -> bool:
+    """VF_SAFE, volta-forever's conservative switch: only the exact value "1" turns it on (unset,
+    empty, "0", "true", ... do not). It means no path whose results leave the conservative
+    reference class; read once per process."""
+    return os.environ.get("VF_SAFE") == "1"
+
+
+@functools.cache
 def _kinds() -> frozenset[str]:
     """OLALA_VOLTA_TC on the SM70 family (V100, native or through volta-forever): unset or "1" =
     the DEFAULT_KINDS, "0" (or empty) = off, or a comma list of KINDS ("int8": W8A16 linears,
     "bf16": the bf16 model's dense projections, "moe": the weight-only routed experts above the
-    small path). Never on other GPUs."""
+    small path). Never on other GPUs, and off under VF_SAFE=1 whatever OLALA_VOLTA_TC says: HMMA
+    truncates the tensor-core sums (a bias toward zero), outside VF_SAFE's reference class."""
     raw = os.environ.get("OLALA_VOLTA_TC")
     raw = "1" if raw is None else raw.strip()
     if raw in ("", "0") or not torch.cuda.is_available() or gpu_family() is not GpuFamily.SM70:
@@ -82,6 +93,9 @@ def _kinds() -> frozenset[str]:
     unknown = kinds - set(KINDS)
     if unknown:
         raise ValueError(f"OLALA_VOLTA_TC: unknown kinds {sorted(unknown)} (known: {KINDS})")
+    if vf_safe():
+        logger.info("VF_SAFE=1: the fp16 tensor-core edition is off")
+        return frozenset()
     return kinds
 
 

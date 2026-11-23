@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The Volta fp16 tensor-core edition (olala/volta_tc.py, OLALA_VOLTA_TC, on by default on this
-family): the switch on this GPU, W8A16 and bf16 linears against fp64, the exactness of the
-activation terms, the per-row fallback (rows the terms do not cover, non-finite rows), CUDA-graph
-replay against eager, the W8A16 dispatch, and the routed-expert kernel (INT8 per row and INT4
-affine experts) against fp64. SM70 family only (a V100, natively or through volta-forever)."""
+family, off under VF_SAFE=1): the switch on this GPU, W8A16 and bf16 linears against fp64, the
+exactness of the activation terms, the per-row fallback (rows the terms do not cover, non-finite
+rows), CUDA-graph replay against eager, the W8A16 dispatch, and the routed-expert kernel (INT8
+per row and INT4 affine experts) against fp64. SM70 family only (a V100, natively or through
+volta-forever)."""
 
 import pytest
 import torch
@@ -23,24 +24,34 @@ def tc(monkeypatch):
     import vllm.model_executor.layers.quantization.utils.w8a16_utils as wu
 
     monkeypatch.setenv("OLALA_VOLTA_TC", "int8,bf16,moe")
+    monkeypatch.delenv("VF_SAFE", raising=False)
     volta_tc._kinds.cache_clear()
+    volta_tc.vf_safe.cache_clear()
     wu.volta_tc.cache_clear()
     yield volta_tc
     volta_tc._kinds.cache_clear()
+    volta_tc.vf_safe.cache_clear()
     wu.volta_tc.cache_clear()
 
 
-@pytest.mark.parametrize("raw,on", [(None, True), ("1", True), ("0", False)])
-def test_switch_on_this_gpu(monkeypatch, raw, on):
-    """Unset = on (int8 and bf16, not moe), "0" = off: the dispatch reads it."""
+@pytest.mark.parametrize(
+    "raw,safe,on",
+    [(None, None, True), ("1", None, True), ("0", None, False), (None, "1", False),
+     ("int8,moe", "1", False), (None, "true", True)],
+)
+def test_switch_on_this_gpu(monkeypatch, raw, safe, on):
+    """Unset = on (int8 and bf16, not moe), "0" = off, VF_SAFE=1 = off whatever OLALA_VOLTA_TC
+    says: the dispatch reads it."""
     from vllm.model_executor.layers.mamba.olala import volta_tc
     import vllm.model_executor.layers.quantization.utils.w8a16_utils as wu
 
-    if raw is None:
-        monkeypatch.delenv("OLALA_VOLTA_TC", raising=False)
-    else:
-        monkeypatch.setenv("OLALA_VOLTA_TC", raw)
+    for var, value in (("OLALA_VOLTA_TC", raw), ("VF_SAFE", safe)):
+        if value is None:
+            monkeypatch.delenv(var, raising=False)
+        else:
+            monkeypatch.setenv(var, value)
     volta_tc._kinds.cache_clear()
+    volta_tc.vf_safe.cache_clear()
     wu.volta_tc.cache_clear()
     try:
         assert (wu.volta_tc() is not None) == on
@@ -48,6 +59,7 @@ def test_switch_on_this_gpu(monkeypatch, raw, on):
         assert not volta_tc.tc_enabled("moe")
     finally:
         volta_tc._kinds.cache_clear()
+        volta_tc.vf_safe.cache_clear()
         wu.volta_tc.cache_clear()
 
 

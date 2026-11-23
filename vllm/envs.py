@@ -2522,6 +2522,11 @@ def compile_factors() -> dict[str, object]:
     # the new default (a constant: other GPUs recompile once, nothing else changes).
     if "OLALA_VOLTA_TC" not in os.environ:
         factors["OLALA_VOLTA_TC"] = "default:int8,bf16"
+    # VF_SAFE=1 (volta-forever's conservative switch; only the exact value "1")
+    # turns that edition off: key it too, so that graphs built with it on are not
+    # reused (other values change nothing, and add no factor).
+    if os.environ.get("VF_SAFE") == "1":
+        factors["VF_SAFE"] = "1"
     if "VOLTA_FOREVER" in os.environ:
         factors["VOLTA_FOREVER"] = True
 
