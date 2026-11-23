@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.model_executor.layers.mamba.olala import volta_cuda
 from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
@@ -1585,6 +1586,14 @@ def olala_moe_small_int8_volta(
     S = shared_up.n
     assert M <= VOLTA_SMALL_MAX_TOKENS
     assert w2.k == N1 and shared_down.k == S and (fc2.n, fc2.k) == (H, D2)
+    if config is None and volta_cuda.moe_small_ok(
+        M, hidden, x_in, router_logits, router_logits_lo, e_score_bias, w13, w2, shared_up, shared_down, fc2, top_k
+    ):
+        # the CUDA editions of the three launches below, bit for bit (volta_cuda.py)
+        return volta_cuda.moe_small(
+            hidden, x_in, router_logits, router_logits_lo, e_score_bias, w13, w2, shared_up, shared_down, fc2,
+            top_k, routed_scale,
+        )
     assert shared_up.fmt != FMT_INT4 and shared_down.fmt != FMT_INT4 and fc2.fmt != FMT_INT4
     dev = hidden.device
     MK = M * top_k
