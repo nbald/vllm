@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUDA editions of Triton kernels for Volta (V100, natively or through volta-forever) that return the Triton
-kernels' bits: the geodesic norm (csrc/geodesic_volta.cu) and the weight-only latent-MoE small path from 4 tokens
+kernels' bits: the geodesic norm (csrc/geodesic_volta.cu) and the weight-only latent-MoE small path from 17 tokens
 (csrc/moe_small_volta.cu). Each reproduces its Triton kernels' per-output arithmetic (the same fp32 chains, the same
 reduction tree as the Triton layout, the same rounding instructions) with another work decomposition, so they are
 on by default on the SM70 family; OLALA_GEODESIC_CUDA=0 / OLALA_VOLTA_MOE_CUDA=0 keep the Triton kernels (part of
@@ -96,11 +96,13 @@ def _int4_affine(w, n: int, k: int, experts: int) -> bool:
 
 
 # Token counts from which the CUDA small path is dispatched (its kernels cover 3..32 tokens: the Triton tiles of 3..32
-# tokens share their per-output structure; 1-2 tokens keep the Triton path). V100 through volta-forever, graphed,
-# rotated weight sets, us per layer, Triton -> CUDA: INT8 experts 3 tokens 70.8 -> 77.4, 4: 73.6 -> 72.3, 8: 103.7 ->
-# 99.0, 16: 164.9 -> 125.0, 32: 307.6 -> 183.2; INT4 affine experts 8: 114.6 -> 127.5, 9: 143.6 -> 137.1, 16: 201.1 ->
-# 173.4, 32: 407.3 -> 256.8.
-MOE_SMALL_MIN_TOKENS = {"int8": 4, "int4": 9}
+# tokens share their per-output structure; below the threshold the Triton path runs). V100 through volta-forever,
+# graphed, rotated weight sets, us per layer, Triton -> CUDA: INT8 experts 4 tokens 73.6 -> 72.3, 8: 103.7 -> 99.0,
+# 16: 164.9 -> 125.0, 32: 307.6 -> 183.2; INT4 affine experts 9: 143.6 -> 137.1, 16: 201.1 -> 173.4, 32: 407.3 ->
+# 256.8. In the server's decode graph both paths cost more, the CUDA one most (nsys, Q8, per layer: 4 tokens 76.8 ->
+# 100.6, 8: 102.1 -> 119.7; the routing launch alone 18.5-19.8), and steady decode at 4 / 8 / 16 requests was 11.7 /
+# 6.9 % slower / equal with this path; from 17 tokens the Triton path runs the 32-token tile (300-400 us per layer).
+MOE_SMALL_MIN_TOKENS = {"int8": 17, "int4": 17}
 
 
 def moe_small_ok(M, hidden, x_in, router_logits, router_logits_lo, e_score_bias, w13, w2, shared_up, shared_down, fc2,
