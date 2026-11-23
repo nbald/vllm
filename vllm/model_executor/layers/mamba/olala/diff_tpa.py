@@ -172,6 +172,10 @@ def _token_shift_decode_kernel(
 # Speculative verify batches run the fused decode preamble too
 # (tpa_decode_qkv_spec); OLALA_TPA_SPEC_FUSED=0 keeps the eager per-op path.
 _FUSED_SPEC = os.environ.get("OLALA_TPA_SPEC_FUSED", "1") != "0"
+# OLALA_TPA_MIXED_FUSED=1 (opt-in): in a step that mixes prefill and verify rows,
+# the verify rows keep the fused spec path (tpa_decode_qkv_spec, as in a pure
+# verify step); only the prefill rows take the op-by-op path.
+_MIXED_FUSED = os.environ.get("OLALA_TPA_MIXED_FUSED", "0") == "1"
 
 
 class OlalaTokenShiftState(nn.Module, MambaBase):
@@ -504,6 +508,15 @@ class OlalaDiffTPAAttention(PluggableLayer):
             attn_metadata = get_forward_context().attn_metadata
             if attn_metadata is not None and self._ts_md_key in attn_metadata:
                 md = attn_metadata[self._ts_md_key]
+                if (
+                    _MIXED_FUSED and _FUSED_SPEC and md.spec is not None
+                    and md.num_prefills != 0 and md.num_decodes != 0
+                ):
+                    self._forward_mixed_fused(
+                        md, positions, out, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                        lam_all, shift_alphas,
+                    )
+                    return
                 if md.num_prefills != 0 or (md.spec is not None and not _FUSED_SPEC):
                     md = None
         if md is not None:
@@ -583,6 +596,82 @@ class OlalaDiffTPAAttention(PluggableLayer):
         lam = lam_all.view(n, self.num_noise_heads_local, 1, 1)
         diff = sig - torch.sigmoid(lam) * noi
         out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
+
+    def _common_fused_args(self, k_pool, v_pool) -> tuple:
+        return (
+            k_pool, v_pool,
+            self.q_norm.norm.weight, self.k_norm.norm.weight,
+            self.q_norm.norm.eps, self.softmax_scaler,
+            float(getattr(self.config, "sliding_window_size", 0) or 0),
+            self.num_kv_heads_local, self.snr + 1, self.rank, self.head_dim,
+        )
+
+    def _mixed_fused_qkv(
+        self, md, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, shift_alphas
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q / k / v of a mixed (verify + prefill) batch: the verify rows through
+        the fused spec kernel, the prefill rows (and any cudagraph padding rows
+        after them) through the op-by-op path."""
+        n = q_all.shape[0]
+        ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
+        spec = md.spec
+        k_cols, v_cols = self._ts_kv(spec=True)
+        q_d, k_d, v_d = tpa_decode_qkv_spec(
+            q_all[:ndt], A_k_all[:ndt], A_v_all[:ndt], B_k_all[:ndt], B_v_all[:ndt],
+            shift_alphas[0][:ndt], shift_alphas[1][:ndt], positions[:ndt],
+            spec.query_start_loc_d, spec.state_cols, spec.num_accepted_tokens,
+            *self._common_fused_args(k_cols, v_cols),
+        )
+        rows = slice(ndt, n)
+        m = n - ndt
+        H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
+        q = q_all[rows].view(m, self.num_attention_heads_local, D)
+        k = torch.bmm(A_k_all[rows].view(m, H, R), B_k_all[rows].view(m, R, D)).div_(R)
+        v = torch.bmm(A_v_all[rows].view(m, H, R), B_v_all[rows].view(m, R, D)).div_(R)
+        pos = positions[rows]
+        if self.token_shift:
+            k_pool, v_pool = self._ts_kv()
+            k_s, v_s = self._alloc_shift(k, v, npt)
+            self._shift_prefill_rows(
+                md, k, v, md.state_indices_tensor, k_pool, v_pool,
+                shift_alphas[0][rows], shift_alphas[1][rows], pos,
+                md.num_decodes, md.num_prefills, 0, npt, k_s, v_s,
+            )
+            k, v = k_s, v_s
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q_p = q.reshape(m, self.q_size_local)
+        k_p = k.reshape(m, self.kv_size_local)
+        v_p = v.reshape(m, self.kv_size_local)
+        if self.rotary_emb is not None:
+            q_p, k_p = self.rotary_emb(pos, q_p, k_p)
+        if self.scalable_softmax:
+            p1 = (pos.float() + 1.0).clamp_min(1.0)
+            wsize = float(getattr(self.config, "sliding_window_size", 0) or 0)
+            log_pos = p1.clamp_max(wsize).log() if wsize > 0 else p1.log()
+            scale = self.softmax_scaler.to(q_p.dtype) * log_pos.to(q_p.dtype).unsqueeze(-1)
+            q_p = q_p.view(m, self.num_attention_heads_local, D)
+            q_p = (q_p * scale.unsqueeze(-1)).reshape(m, self.q_size_local)
+        return torch.cat([q_d, q_p]), torch.cat([k_d, k_p]), torch.cat([v_d, v_p])
+
+    def _forward_mixed_fused(
+        self, md, positions, out, q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all,
+        shift_alphas,
+    ) -> None:
+        n = q_all.shape[0]
+        ndt = md.num_decode_tokens
+        q_flat, k_flat, v_flat = self._mixed_fused_qkv(
+            md, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, shift_alphas
+        )
+        attn_out = self.attn(q_flat, k_flat, v_flat)  # (N, H_local*D)
+        tpa_diff_combine(attn_out[:ndt], lam_all[:ndt], out[:ndt], self.num_noise_heads_local,
+                         self.snr, self.head_dim)
+        m = n - ndt
+        a = attn_out[ndt:].view(m, self.num_noise_heads_local, self.snr + 1, self.head_dim)
+        lam = lam_all[ndt:].view(m, self.num_noise_heads_local, 1, 1)
+        diff = a[:, :, : self.snr, :] - torch.sigmoid(lam) * a[:, :, self.snr :, :]
+        out[ndt:].copy_(diff.reshape(m, self.num_signal_heads_local * self.head_dim))
 
     # ------------------------------------------------------------------
     # TPA-factorized KV cache path
