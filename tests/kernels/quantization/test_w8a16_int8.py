@@ -61,6 +61,29 @@ def test_int8_linear(n, k, m, group):
     _close(int8_linear(x, Int8Weight(q, scale)), x.float() @ ref_w.T)
 
 
+@pytest.mark.parametrize("group", [0, 32])
+@pytest.mark.parametrize(
+    "n,k", [(6144, 1536), (1536, 3072), (1536, 4608), (384, 1536), (1536, 384)]
+)
+@pytest.mark.parametrize("m", [1, 2, 3, 8, 9, 16, 32])
+def test_volta_gemv_int8(n, k, m, group):
+    """The FMA GEMVs that Volta takes for W8A16 decode batches (plain Triton, any GPU): per-row
+    scales on the fp32 row sums, per-group scales on the weights, written into a column slice
+    of a wider output."""
+    from vllm.model_executor.layers.mamba.olala.decode_gemv import volta_gemv
+
+    gen = torch.Generator(device="cuda").manual_seed(n + k + m + group + 1)
+    q, scale, ref_w = _int8(n, k, gen, group)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=gen)
+    out = torch.zeros(m, n + 64, device="cuda", dtype=torch.float32)
+    volta_gemv(x, q, torch.float32, scale, out=out[:, 64:])
+    ref = x.float() @ ref_w.T
+    err = (out[:, 64:] - ref).abs().max() / ref.abs().max()
+    assert err < 1e-5, err
+    assert out[:, :64].abs().max() == 0
+    _close(volta_gemv(x, q, torch.bfloat16, scale), ref)
+
+
 @pytest.mark.parametrize("split", [2, 3, 6])
 @pytest.mark.parametrize("m", [3, 32])
 def test_split_k(split, m):

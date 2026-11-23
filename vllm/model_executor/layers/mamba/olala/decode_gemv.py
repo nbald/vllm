@@ -180,11 +180,44 @@ def _decode_gemv_sm120(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 # TPA mixer 193 -> 40, w_in 1920x1536 67 -> 16; 32 rows: mixer_proj 197 -> 94, in_proj 175 -> 165.
 VOLTA_ROWS_MAX_M = 32
 
+# Weight scales of the Volta GEMVs (constexpr SCALE): none (bf16 / fp32 weights), one fp32 scale
+# per output row (INT8 W8A16 per channel: applied to the fp32 row sum), one scale per G weights
+# along K (INT8 W8A16 per group: applied to the fp32 weight before the FMAs).
+VOLTA_SCALE_NONE, VOLTA_SCALE_ROW, VOLTA_SCALE_GROUP = 0, 1, 2
+
+
+@triton.jit
+def _volta_w_tile(
+    w_ptr, s_ptr, offs_n, n_mask, offs_k, mask, stride_wn, stride_sn,
+    SCALE: tl.constexpr, G: tl.constexpr,
+):
+    """A [BN, BK] weight tile as fp32 (INT8 codes are exact), group scales applied."""
+    w = tl.load(
+        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :], mask=mask, other=0.0,
+    ).to(tl.float32)
+    if SCALE == 2:
+        # one scale per G codes, gathered per element (L1 hits): no reshape of the tile
+        s = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + (offs_k // G)[None, :], mask=mask, other=0.0,
+        ).to(tl.float32)
+        w = w * s
+    return w
+
+
+@triton.jit
+def _volta_row_sum(acc, s_ptr, offs_n, n_mask, SCALE: tl.constexpr):
+    """Row sums of the per-lane partial sums, per-row scales applied."""
+    y = tl.sum(acc, axis=1)
+    if SCALE == 1:
+        y = y * tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)
+    return y
+
 
 @triton.jit
 def _gemv_m1_volta_kernel(
-    x_ptr, w_ptr, y_ptr, N, K, stride_wn,
+    x_ptr, w_ptr, y_ptr, s_ptr, N, K, stride_wn, stride_sn,
     BN: tl.constexpr, BK: tl.constexpr, KMASK: tl.constexpr,
+    SCALE: tl.constexpr = 0, G: tl.constexpr = 1,
 ):
     """One-row GEMV for Volta: partial sums per (n, k) lane, reduced once after the K loop; the
     optional K mask lets K = 1920 (MoE w_out) use 512-wide blocks."""
@@ -196,23 +229,37 @@ def _gemv_m1_volta_kernel(
         offs_k = k0 + tl.arange(0, BK)
         if KMASK:
             k_mask = offs_k < K
-            w = tl.load(
-                w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
-                mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+            w = _volta_w_tile(
+                w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None] & k_mask[None, :],
+                stride_wn, stride_sn, SCALE, G,
             )
             x = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0)
         else:
-            w = tl.load(
-                w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
-                mask=n_mask[:, None], other=0.0,
+            w = _volta_w_tile(
+                w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None], stride_wn, stride_sn,
+                SCALE, G,
             )
             x = tl.load(x_ptr + offs_k)
-        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
-    tl.store(y_ptr + offs_n, tl.sum(acc, axis=1).to(y_ptr.dtype.element_ty), mask=n_mask)
+        acc += w * x.to(tl.float32)[None, :]
+    y = _volta_row_sum(acc, s_ptr, offs_n, n_mask, SCALE)
+    tl.store(y_ptr + offs_n, y.to(y_ptr.dtype.element_ty), mask=n_mask)
+
+
+def _volta_scale_args(weight: torch.Tensor, scale: torch.Tensor | None) -> tuple:
+    """(scale pointer, its row stride, SCALE, G) of a Volta GEMV launch."""
+    if scale is None:
+        return weight, 0, VOLTA_SCALE_NONE, 1
+    if scale.dim() == 1:
+        return scale, 0, VOLTA_SCALE_ROW, 1
+    return scale, scale.stride(0), VOLTA_SCALE_GROUP, weight.shape[1] // scale.shape[1]
 
 
 def _gemv_m1_volta(
-    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # V100 through volta-forever, graphed, weights from DRAM: one weight row per 4-warp
     # program, 512-wide K blocks, against the GH200 configs of _gemv_m1, us: in_proj
@@ -220,9 +267,11 @@ def _gemv_m1_volta(
     # 23.5 -> 19.2, MoE w_out 1536x1920 13.7 -> 9.3 (512-wide blocks need the K mask),
     # fp32 router 256x1536 5.0 -> 3.9.
     N, K = weight.shape
-    y = torch.empty(1, N, dtype=out_dtype or x.dtype, device=x.device)
+    y = torch.empty(1, N, dtype=out_dtype or x.dtype, device=x.device) if out is None else out
+    s, ss, mode, g = _volta_scale_args(weight, scale)
     _gemv_m1_volta_kernel[(N,)](
-        x, weight, y, N, K, weight.stride(0), BN=1, BK=512, KMASK=K % 512 != 0, num_warps=4,
+        x, weight, y, s, N, K, weight.stride(0), ss, BN=1, BK=512, KMASK=K % 512 != 0,
+        SCALE=mode, G=g, num_warps=4,
     )
     return y
 
@@ -234,15 +283,18 @@ def _rows_acc(acc, w, x_ptr, m: tl.constexpr, stride_xm, offs_k, M):
 
 
 @triton.jit
-def _rows_store(y_ptr, acc, m: tl.constexpr, stride_ym, offs_n, n_mask, M):
-    tl.store(y_ptr + m * stride_ym + offs_n, tl.sum(acc, axis=1).to(y_ptr.dtype.element_ty),
-             mask=n_mask & (m < M))
+def _rows_store(
+    y_ptr, acc, m: tl.constexpr, stride_ym, offs_n, n_mask, M, s_ptr, SCALE: tl.constexpr,
+):
+    y = _volta_row_sum(acc, s_ptr, offs_n, n_mask, SCALE)
+    tl.store(y_ptr + m * stride_ym + offs_n, y.to(y_ptr.dtype.element_ty), mask=n_mask & (m < M))
 
 
 @triton.jit
 def _gemv_rows_kernel(
-    x_ptr, w_ptr, y_ptr, M, N, K, stride_xm, stride_wn, stride_ym,
+    x_ptr, w_ptr, y_ptr, s_ptr, M, N, K, stride_xm, stride_wn, stride_ym, stride_sn,
     MB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    SCALE: tl.constexpr = 0, G: tl.constexpr = 1,
 ):
     """``y = x @ w.T`` for M <= MB <= 8 rows with FMAs (Volta): each [BN, BK] weight tile is
     loaded once and used for every row; per-row partial sums stay per (n, k) lane across the K
@@ -260,9 +312,9 @@ def _gemv_rows_kernel(
     a7 = tl.zeros([BN, BK], dtype=tl.float32)
     for k0 in range(0, K, BK):
         offs_k = k0 + tl.arange(0, BK)
-        w = tl.load(
-            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :], mask=n_mask[:, None], other=0.0,
-        ).to(tl.float32)
+        w = _volta_w_tile(
+            w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None], stride_wn, stride_sn, SCALE, G,
+        )
         a0 = _rows_acc(a0, w, x_ptr, 0, stride_xm, offs_k, M)
         a1 = _rows_acc(a1, w, x_ptr, 1, stride_xm, offs_k, M)
         if MB > 2:
@@ -273,22 +325,23 @@ def _gemv_rows_kernel(
             a5 = _rows_acc(a5, w, x_ptr, 5, stride_xm, offs_k, M)
             a6 = _rows_acc(a6, w, x_ptr, 6, stride_xm, offs_k, M)
             a7 = _rows_acc(a7, w, x_ptr, 7, stride_xm, offs_k, M)
-    _rows_store(y_ptr, a0, 0, stride_ym, offs_n, n_mask, M)
-    _rows_store(y_ptr, a1, 1, stride_ym, offs_n, n_mask, M)
+    _rows_store(y_ptr, a0, 0, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+    _rows_store(y_ptr, a1, 1, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
     if MB > 2:
-        _rows_store(y_ptr, a2, 2, stride_ym, offs_n, n_mask, M)
-        _rows_store(y_ptr, a3, 3, stride_ym, offs_n, n_mask, M)
+        _rows_store(y_ptr, a2, 2, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a3, 3, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
     if MB > 4:
-        _rows_store(y_ptr, a4, 4, stride_ym, offs_n, n_mask, M)
-        _rows_store(y_ptr, a5, 5, stride_ym, offs_n, n_mask, M)
-        _rows_store(y_ptr, a6, 6, stride_ym, offs_n, n_mask, M)
-        _rows_store(y_ptr, a7, 7, stride_ym, offs_n, n_mask, M)
+        _rows_store(y_ptr, a4, 4, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a5, 5, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a6, 6, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
+        _rows_store(y_ptr, a7, 7, stride_ym, offs_n, n_mask, M, s_ptr, SCALE)
 
 
 @triton.jit
 def _gemv_rows_many_kernel(
-    x_ptr, w_ptr, y_ptr, M, N, K, stride_xm, stride_wn, stride_ym,
+    x_ptr, w_ptr, y_ptr, s_ptr, M, N, K, stride_xm, stride_wn, stride_ym, stride_sn,
     MB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    SCALE: tl.constexpr = 0, G: tl.constexpr = 1,
 ):
     """The same for 9..32 rows (Volta): one [MB, BN, BK] product per K step, partial sums kept
     across the loop (more separate row accumulators would spill)."""
@@ -300,14 +353,16 @@ def _gemv_rows_many_kernel(
     acc = tl.zeros([MB, BN, BK], dtype=tl.float32)
     for k0 in range(0, K, BK):
         offs_k = k0 + tl.arange(0, BK)
-        w = tl.load(
-            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :], mask=n_mask[:, None], other=0.0,
+        w = _volta_w_tile(
+            w_ptr, s_ptr, offs_n, n_mask, offs_k, n_mask[:, None], stride_wn, stride_sn, SCALE, G,
         )
         x = tl.load(
             x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :], mask=m_mask[:, None], other=0.0,
         )
-        acc += x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :]
+        acc += x.to(tl.float32)[:, None, :] * w[None, :, :]
     y = tl.sum(acc, axis=2)
+    if SCALE == 1:
+        y = y * tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
     tl.store(
         y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :], y.to(y_ptr.dtype.element_ty),
         mask=m_mask[:, None] & n_mask[None, :],
@@ -315,22 +370,29 @@ def _gemv_rows_many_kernel(
 
 
 def _decode_gemv_volta(
-    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """1..VOLTA_ROWS_MAX_M rows on Volta (K % 128 == 0, unit inner strides); x and weight may be
-    any float dtypes (fp32 accumulation), the output is ``out_dtype`` (default x's)."""
+    any float dtypes, or an INT8 weight with ``scale`` (fp32 [N] per row, or [N, K // G] per
+    group); fp32 accumulation, the output is ``out_dtype`` (default x's), or written into
+    ``out`` (an (M, N) view with unit column stride, e.g. a column slice of a wider buffer)."""
     M, K = x.shape
     N = weight.shape[0]
     if M == 1:
-        return _gemv_m1_volta(x, weight, out_dtype)
-    y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device)
+        return _gemv_m1_volta(x, weight, out_dtype, scale, out)
+    y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device) if out is None else out
     if M <= 8:
         kernel, bn, bk, nw = _gemv_rows_kernel, 16, 128, 8
     else:
         kernel, bn, bk, nw = _gemv_rows_many_kernel, 8, 64, 4
+    s, ss, mode, g = _volta_scale_args(weight, scale)
     kernel[(triton.cdiv(N, bn),)](
-        x, weight, y, M, N, K, x.stride(0), weight.stride(0), y.stride(0),
-        MB=triton.next_power_of_2(M), BN=bn, BK=bk, num_warps=nw,
+        x, weight, y, s, M, N, K, x.stride(0), weight.stride(0), y.stride(0), ss,
+        MB=triton.next_power_of_2(M), BN=bn, BK=bk, SCALE=mode, G=g, num_warps=nw,
     )
     return y
 
@@ -344,10 +406,18 @@ def volta_gemv_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
-def volta_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+def volta_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+    scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``x @ weight.T`` in fp32 FMAs, stored as ``out_dtype``, for any float x / weight dtypes
-    (e.g. bf16 activations against the fp32 router weight). Requires volta_gemv_ok()."""
-    return _decode_gemv_volta(x, weight, out_dtype)
+    (e.g. bf16 activations against the fp32 router weight) or an INT8 weight with its W8A16
+    ``scale`` (per row: on the fp32 row sum; per group: on the weight); ``out``: write into this
+    (M, N) view instead. Requires volta_gemv_ok()."""
+    return _decode_gemv_volta(x, weight, out_dtype, scale, out)
 
 
 def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
