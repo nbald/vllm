@@ -49,6 +49,7 @@ def sm80(monkeypatch):
     )
     monkeypatch.delenv("OLALA_REPLAY_SSM", raising=False)
     monkeypatch.delenv("OLALA_MAMBA3_VERIFY", raising=False)
+    monkeypatch.setenv("OLALA_VOLTA", "0")  # not SM70, also under volta-forever
 
 
 def _bytes(shapes, dtypes):
@@ -132,3 +133,13 @@ def test_light_page_and_fold_sizes(monkeypatch, sm80, k):
     ts = _bytes(ts_shapes, ts_dtypes)
     assert ts_shapes[0] == (1 + k, 12, 128)  # one buffer per column, 12 kv heads
     assert ts < 0.03 * light
+
+
+def test_sm70_keeps_column_slots(monkeypatch, sm80):
+    """V100 (natively or through volta-forever): the Volta verify kernel implements the column-slot protocol
+    only, so the light layout stays off there."""
+    monkeypatch.setenv("OLALA_SPEC_LIGHT", "1")
+    monkeypatch.setenv("OLALA_VOLTA", "1")
+    assert st.spec_light_cols(_cfg(k=5)) == 0
+    monkeypatch.setenv("OLALA_VOLTA", "0")
+    assert st.spec_light_cols(_cfg(k=5)) == 6
