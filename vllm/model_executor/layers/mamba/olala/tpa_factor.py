@@ -747,13 +747,15 @@ def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, nactive_ptr, o_pt
 
 @lru_cache(maxsize=1)
 def _volta_split_ctas() -> int:
-    """OLALA_TPA_SPLIT_CTAS=<n> (Volta, opt-in): KV splits for about n decode CTAs from 32 requests on, e.g. 512:
-    4 splits at 128 requests, 16 at 32. V100 through volta-forever, ~480-735-token contexts, kernel + combine, us:
-    128 requests 1075.7 (1 split, the default) -> 886.2 (4); 64: 580.6 (1) -> 478.2 (8); 32: 311.2 (2) -> 260.4 (16).
-    The partials merge differently: the outputs change at rounding level (bf16 output rounding vs fp64 alike)."""
+    """Volta: KV splits for about OLALA_TPA_SPLIT_CTAS decode CTAs from 32 requests on (default 512: 16 splits at 32
+    requests, 8 at 64, 4 at 128; 0 keeps the one-wave rule below). V100 through volta-forever, ~480-735-token
+    contexts, kernel + combine, us: 128 requests 1075.7 (1 split) -> 886.2 (4); 64: 580.6 (1) -> 478.2 (8); 32:
+    311.2 (2) -> 260.4 (16); Q8 server: steady decode at 32 requests on ~3,800-token prompts 24.66 -> 25.57 tok/s
+    per request, 128-request bursts 7.86 -> 7.91. The partials merge differently, so the outputs change at rounding
+    level; teacher forcing through CPU fp32 at 32-128 requests stays at the one-wave rule's level."""
     if gpu_family() is not GpuFamily.SM70:
         return 0
-    return int(os.environ.get("OLALA_TPA_SPLIT_CTAS", "0") or 0)
+    return int(os.environ.get("OLALA_TPA_SPLIT_CTAS", "512") or 0)
 
 
 def num_splits_for_batch(batch: int) -> int:
@@ -767,8 +769,8 @@ def num_splits_for_batch(batch: int) -> int:
         return 1 << (want - 1).bit_length()
     volta = _volta_split_ctas()
     if volta and batch >= 32:
-        # opt-in (OLALA_TPA_SPLIT_CTAS): about that many CTAs (power-of-two splits); the default (one wave of the
-        # resident CTAs) leaves the Volta kernel, at 1 CTA per SM, with 1-2 CTAs per request from 32 requests on
+        # Volta (OLALA_TPA_SPLIT_CTAS, default 512): about that many CTAs (power-of-two splits); the one-wave rule
+        # below leaves the Volta kernel, at 1 CTA per SM, with 1-2 CTAs per request from 32 requests on
         want = max(1, min(128, volta // batch))
         return 1 << (want.bit_length() - 1)
     table = _split_table()
