@@ -75,6 +75,10 @@ class Mamba3AttentionMetadata:
     has_initial_state_cpu: torch.Tensor | None = None
     has_initial_any: bool = False
     query_start_loc_p_cpu: torch.Tensor | None = None
+    # Prefill state slots on the CPU: read by the V layers whose token-shift
+    # buffer is folded into this layer's page (OLALA_TS_FOLD); None under
+    # OLALA_PREFILL_NOSYNC (the V layers then index with the device slots).
+    state_indices_p_cpu: list[int] | None = None
 
     # Speculative decoding (verify batches, column-slot protocol). None when
     # spec decode is off or the batch has no decode rows.
@@ -107,6 +111,13 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             vllm_config.scheduler_config.max_num_seqs,
             dtype=torch.int32,
             device=device,
+        )
+        # Only the V layers of the token-shift fold read state_indices_p_cpu.
+        from vllm.model_executor.layers.mamba.olala.state import ts_fold_active
+
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        self._ts_fold = hf_config is not None and ts_fold_active(
+            hf_config, vllm_config.parallel_config.pipeline_parallel_size
         )
 
     @classmethod
@@ -170,6 +181,7 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
         has_initial_state_cpu = None
         has_initial_any = False
         query_start_loc_p_cpu = None
+        state_indices_p_cpu = None
         if num_prefills > 0:
             # Prefills sit after decodes by the common batch reorder.
             has_initial_state = m.compute_num_computed_tokens()[num_decodes:] > 0
@@ -186,6 +198,8 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             else:
                 # One sync here, on prefill steps only, instead of one per layer.
                 has_initial_state_cpu = has_initial_state.to("cpu")
+                if self._ts_fold:
+                    state_indices_p_cpu = state_indices_tensor[num_decodes:].tolist()
             has_initial_any = bool(has_initial_state_cpu.any())
             qsl_cpu = m.query_start_loc_cpu[num_decodes:]
             query_start_loc_p_cpu = qsl_cpu - qsl_cpu[0]
@@ -202,5 +216,6 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             has_initial_state_cpu=has_initial_state_cpu,
             has_initial_any=has_initial_any,
             query_start_loc_p_cpu=query_start_loc_p_cpu,
+            state_indices_p_cpu=state_indices_p_cpu,
             spec=spec,
         )

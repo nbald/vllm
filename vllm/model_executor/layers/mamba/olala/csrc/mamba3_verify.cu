@@ -10,6 +10,15 @@
 // Per position it writes the column-t state (ssm, rotated B, x, angle) and the output row. The token rows of position
 // t + 1 are prefetched (cp.async) while position t computes. The math is the fp32 pipelined step of mamba3_step.cu,
 // operation for operation, so the outputs and states are bit-identical to chaining that kernel over the positions.
+//
+// Light-column layout (LIGHT = true, OLALA_SPEC_LIGHT): one state page per request instead of 1 + k. The page holds
+// the fp32 SSM state once and 1 + k "light" columns of the small per-position pieces (angle, rotated B, x and the
+// position's (alpha, gamma, beta)). Position 0 (always accepted) writes the SSM state in place and its small pieces
+// to column 0; positions t >= 1 write only their small pieces to column t. Next step, the a = num_accepted - 1
+// accepted drafts are committed first: the state is advanced from column 0 by the same update (same operands, same
+// instruction order) for t = 1..a, so the state entering position 0 is bit-identical to the column-a state of the
+// column-slot protocol, and the rejected positions cost nothing. Memory: ~1.82 MB per layer and request at k = 3
+// against 4 x 1.63 MB; traffic: one state read + one state write per step against one read + (1 + k) writes.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -37,6 +46,7 @@ struct __align__(128) Smem {
   __nv_bfloat16 sCb[8][LDB];    // rotated C, rows 4..7 zero
   float sCos[NA], sSin[NA];
   float sTheta[NA];             // angle state after this position
+  __nv_bfloat16 cx[2][D];       // LIGHT commit: x of position j - 1 / j
 };
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
@@ -74,6 +84,8 @@ struct Args {
   const int* num_accepted; // (lanes)
   __nv_bfloat16* y; int N; int lanes;
   int pdl;
+  // LIGHT: column strides (elements) of the small pools, the (alpha, gamma, beta, -) pool and its strides
+  long long kp_cst, vp_cst, ang_cst; float* agb; long long agb_sst, agb_cst; int light_cols;
 };
 
 // Token rows of one position: 148 16-byte chunks (B 64, C 64, x 8, z 8, angle_proj 4).
@@ -91,6 +103,7 @@ template <int NT> __device__ __forceinline__ void issue_tok(const Args& a, TokSt
 // measured no faster at batch 1 (the per-position chain latency dominates, not the state stores) and
 // would race on the shared per-position B / x / angle columns.
 constexpr int WARPS = 4;
+template <bool LIGHT>
 __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const Args a) {
   constexpr int NT = 32 * WARPS;
   extern __shared__ __align__(128) char smem_raw[];
@@ -116,18 +129,23 @@ __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const 
     const int start = a.qsl[r];
     const int qlen = min(a.qsl[r + 1] - start, a.ncols);
     if (qlen <= 0) continue;
-    const int c0 = max(a.num_accepted[r] - 1, 0);
-    const int in_slot = a.cols[(size_t)r * a.cols_stride + c0];
+    // LIGHT: one slot per request, the current small pieces in light column c0 of that slot (the SSM state in
+    // the slot itself, advanced over columns 1..c0 below); otherwise column c0 of the column-slot protocol.
+    const int c0 = LIGHT ? min(max(a.num_accepted[r] - 1, 0), a.light_cols - 1) : max(a.num_accepted[r] - 1, 0);
+    const int in_slot = a.cols[(size_t)r * a.cols_stride + (LIGHT ? 0 : c0)];
     if (in_slot < 0 || in_slot >= a.P) {   // no state to start from: zero outputs, no writes
       for (int i = t; i < qlen * D; i += NT) a.y[((size_t)(start + i / D) * H + h) * D + i % D] = __float2bfloat16(0.f);
       continue;
     }
+    const long long kp_in = (long long)in_slot * a.kp_sst + (LIGHT ? (long long)c0 * a.kp_cst : 0);
+    const long long vp_in = (long long)in_slot * a.vp_sst + (LIGHT ? (long long)c0 * a.vp_cst : 0);
+    const long long ang_in = (long long)in_slot * a.ang_sst + (LIGHT ? (long long)c0 * a.ang_cst : 0);
     // position 0 token rows + the initial state's small pieces, then the state rows straight into registers
     issue_tok<NT>(a, S_.tk[0], start, h, t);
     for (int c = t; c < 80; c += NT) {
-      if (c < 64) { const int rr = c >> 4, q = c & 15; cp16(S_.bst0 + rr * S + q * 8, a.kp + (size_t)in_slot * a.kp_sst + ((size_t)rr * H + h) * S + q * 8); }
-      else if (c < 72) cp16(S_.xprev[0] + (c - 64) * 8, a.vp + (size_t)in_slot * a.vp_sst + (size_t)h * D + (c - 64) * 8);
-      else cp16(S_.angst0 + (c - 72) * 4, a.angle + (size_t)in_slot * a.ang_sst + (size_t)h * NA + (c - 72) * 4);
+      if (c < 64) { const int rr = c >> 4, q = c & 15; cp16(S_.bst0 + rr * S + q * 8, a.kp + kp_in + ((size_t)rr * H + h) * S + q * 8); }
+      else if (c < 72) cp16(S_.xprev[0] + (c - 64) * 8, a.vp + vp_in + (size_t)h * D + (c - 64) * 8);
+      else cp16(S_.angst0 + (c - 72) * 4, a.angle + ang_in + (size_t)h * NA + (c - 72) * 4);
     }
     cp_commit();
     float acc[16][4];
@@ -141,12 +159,66 @@ __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const 
         acc[jt][0] = h0.x; acc[jt][1] = h0.y; acc[jt][2] = h1.x; acc[jt][3] = h1.y;
       }
     }
+    if constexpr (LIGHT) {
+      // Deferred commit of last step's accepted drafts: position j's update from its light column (rotated B and
+      // x of j and j - 1, alpha / gamma / beta of j), the same operands and operation order as the main loop.
+      // It reads the per-head constants (xproj): wait for their cp.async group (only the position-0 group may
+      // stay in flight); the __syncthreads below publishes them.
+      if (c0 > 0) cp_wait<1>();
+      for (int j = 1; j <= c0; ++j) {
+        const long long kj = (long long)in_slot * a.kp_sst + (long long)j * a.kp_cst;
+        const long long kq = kj - a.kp_cst;
+        for (int i = t; i < R * S; i += NT) {
+          const int rr = i / S, e = i % S;
+          S_.sBk[rr][e] = a.kp[kj + ((size_t)rr * H + h) * S + e];
+          S_.sBk[4 + rr][e] = a.kp[kq + ((size_t)rr * H + h) * S + e];
+        }
+        const long long vj = (long long)in_slot * a.vp_sst + (long long)j * a.vp_cst + (long long)h * D;
+        for (int i = t; i < D; i += NT) { S_.cx[1][i] = a.vp[vj + i]; S_.cx[0][i] = a.vp[vj - a.vp_cst + i]; }
+        const float* g = a.agb + (long long)in_slot * a.agb_sst + (long long)j * a.agb_cst + (long long)h * 4;
+        const float alpha = g[0], gamma = g[1], beta = g[2];
+        __syncthreads();
+        uint32_t ah[3][4];
+        {
+          float av[2][2];
+#pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            const int p = p0 + e * 8;
+            const float xp = bf2f(S_.cx[1][p]), xs = bf2f(S_.cx[0][p]);
+#pragma unroll
+            for (int jj = 0; jj < 2; ++jj) {
+              const int kk = 2 * qd + jj, rr = kk & 3;
+              const float xpj = S_.xproj[rr * D + p];
+              av[e][jj] = (kk < 4) ? gamma * xp * xpj : beta * xs * xpj;
+            }
+          }
+#pragma unroll
+          for (int e = 0; e < 2; ++e) split3_x2(av[e][0], av[e][1], ah[0][e], ah[1][e], ah[2][e]);
+#pragma unroll
+          for (int q = 0; q < 3; ++q) { ah[q][2] = 0u; ah[q][3] = 0u; }
+        }
+#pragma unroll
+        for (int jt = 0; jt < 16; ++jt) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) acc[jt][e] = alpha * acc[jt][e];
+        }
+#pragma unroll
+        for (int jp = 0; jp < 8; ++jp) {
+          uint32_t bfr[4];
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                       : "=r"(bfr[0]), "=r"(bfr[1]), "=r"(bfr[2]), "=r"(bfr[3]) : "r"(smem_u32(&S_.sBk[(mi & 1) * 8 + li][jp * 16 + (mi >> 1) * 8])));
+#pragma unroll
+          for (int q = 2; q >= 0; --q) { mma16816(acc[2 * jp], ah[q], bfr); mma16816(acc[2 * jp + 1], ah[q], bfr + 2); }
+        }
+        __syncthreads();   // sBk / cx are reloaded by the next j (and sBk rewritten by position 0)
+      }
+    }
     // dt / A / trap of position 0; later positions are loaded one position ahead
     float dt_n = a.dt[(size_t)start * H + h], A_n = a.A[(size_t)start * H + h], trap_n = a.trap[(size_t)start * H + h];
     for (int pos = 0; pos < qlen; ++pos) {
       const int tok = start + pos;
-      const int out_slot = a.cols[(size_t)r * a.cols_stride + pos];
-      const bool wr = out_slot >= 0 && out_slot < a.P;
+      const int out_slot = LIGHT ? in_slot : a.cols[(size_t)r * a.cols_stride + pos];
+      const bool wr = out_slot >= 0 && out_slot < a.P && (!LIGHT || pos < a.light_cols);
       const bool more = pos + 1 < qlen;
       if (more) issue_tok<NT>(a, S_.tk[(pos + 1) & 1], tok + 1, h, t);
       cp_commit();
@@ -214,7 +286,7 @@ __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const 
 #pragma unroll
         for (int q = 2; q >= 0; --q) { mma16816(acc[2 * jp], ah[q], bfr); mma16816(acc[2 * jp + 1], ah[q], bfr + 2); }
       }
-      if (wr) {
+      if (wr && (!LIGHT || pos == 0)) {   // LIGHT: positions >= 1 keep only their light column
         float* dst = a.ssm + (size_t)out_slot * a.ssm_sst + ((size_t)h * D) * S;
 #pragma unroll
         for (int jt = 0; jt < 16; ++jt) {
@@ -255,9 +327,16 @@ __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const 
       if (qd == 0) { a.y[((size_t)tok * H + h) * D + p0] = __float2bfloat16(ys[0]); a.y[((size_t)tok * H + h) * D + p0 + 8] = __float2bfloat16(ys[1]); }
       for (int i = t; i < D; i += NT) S_.xprev[(pos + 1) & 1][i] = st.x[i];
       if (wr) {
-        for (int c = t; c < 64; c += NT) { const int rr = c >> 4, q = c & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)out_slot * a.kp_sst + ((size_t)rr * H + h) * S + q * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[rr][q * 8]); }
-        for (int i = t; i < D; i += NT) a.vp[(size_t)out_slot * a.vp_sst + (size_t)h * D + i] = st.x[i];
-        if (t < NA) a.angle[(size_t)out_slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
+        const long long kq = (long long)out_slot * a.kp_sst + (LIGHT ? (long long)pos * a.kp_cst : 0);
+        const long long vq = (long long)out_slot * a.vp_sst + (LIGHT ? (long long)pos * a.vp_cst : 0);
+        const long long aq = (long long)out_slot * a.ang_sst + (LIGHT ? (long long)pos * a.ang_cst : 0);
+        for (int c = t; c < 64; c += NT) { const int rr = c >> 4, q = c & 15; *reinterpret_cast<uint4*>(a.kp + kq + ((size_t)rr * H + h) * S + q * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[rr][q * 8]); }
+        for (int i = t; i < D; i += NT) a.vp[vq + (size_t)h * D + i] = st.x[i];
+        if (t < NA) a.angle[aq + (size_t)h * NA + t] = S_.sTheta[t];
+        if (LIGHT && t == 0) {
+          float* g = a.agb + (long long)out_slot * a.agb_sst + (long long)pos * a.agb_cst + (long long)h * 4;
+          g[0] = alpha; g[1] = gamma; g[2] = beta; g[3] = 0.f;
+        }
       }
       __syncthreads();   // this stage, sBk / sCb / sTheta and xprev[pos & 1] are reused by the next position
     }
@@ -274,12 +353,24 @@ void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Ten
                         torch::Tensor A, torch::Tensor Bm, torch::Tensor Cm, torch::Tensor Dp, torch::Tensor x, torch::Tensor dt,
                         torch::Tensor trap, torch::Tensor xproj, torch::Tensor zproj, torch::Tensor outproj, torch::Tensor z,
                         torch::Tensor bias_q, torch::Tensor bias_k, torch::Tensor angle_proj, torch::Tensor qsl,
-                        torch::Tensor cols, torch::Tensor num_accepted, torch::Tensor y, int64_t ctas_per_sm, bool pdl) {
+                        torch::Tensor cols, torch::Tensor num_accepted, torch::Tensor y, int64_t ctas_per_sm, bool pdl,
+                        c10::optional<torch::Tensor> agb_pool) {
+  // LIGHT layout: k_pool (P, C, R, H, S), v_pool (P, C, H, D), angle_pool (P, C, H, NA), agb_pool (P, C, H, 4) fp32,
+  // with C = 1 + k light columns per slot and cols (lanes, >= 1) holding the slot in column 0.
+  const bool light = agb_pool.has_value();
+  const int cd = light ? 1 : 0;   // extra column dim
   TORCH_CHECK(ssm_pool.dtype() == torch::kFloat32, "verify kernel: fp32 SSM state only");
   TORCH_CHECK(k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
+  TORCH_CHECK(k_pool.dim() == 4 + cd && v_pool.dim() == 3 + cd && angle_pool.dim() == 3 + cd, "pool ranks");
   TORCH_CHECK(ssm_pool.stride(1) == D * S && ssm_pool.stride(2) == S && ssm_pool.stride(3) == 1, "ssm_pool inner dims must be contiguous");
-  TORCH_CHECK(k_pool.stride(1) == H * S && k_pool.stride(2) == S && k_pool.stride(3) == 1, "k_pool inner dims must be contiguous");
-  TORCH_CHECK(v_pool.stride(1) == D && v_pool.stride(2) == 1 && angle_pool.stride(1) == NA && angle_pool.stride(2) == 1);
+  TORCH_CHECK(k_pool.stride(1 + cd) == H * S && k_pool.stride(2 + cd) == S && k_pool.stride(3 + cd) == 1, "k_pool inner dims must be contiguous");
+  TORCH_CHECK(v_pool.stride(1 + cd) == D && v_pool.stride(2 + cd) == 1 && angle_pool.stride(1 + cd) == NA && angle_pool.stride(2 + cd) == 1);
+  if (light) {
+    const torch::Tensor& g = *agb_pool;
+    TORCH_CHECK(g.dtype() == torch::kFloat32 && g.dim() == 4 && g.size(2) == H && g.size(3) == 4 && g.stride(3) == 1 && g.stride(2) == 4);
+    TORCH_CHECK(k_pool.size(1) == v_pool.size(1) && k_pool.size(1) == angle_pool.size(1) && k_pool.size(1) == g.size(1));
+    TORCH_CHECK((k_pool.stride(1) * 2) % 16 == 0 && (v_pool.stride(1) * 2) % 16 == 0 && (angle_pool.stride(1) * 4) % 16 == 0, "light column strides must be 16B aligned");
+  }
   TORCH_CHECK((ssm_pool.stride(0) * 4) % 16 == 0 && (k_pool.stride(0) * 2) % 16 == 0 && (v_pool.stride(0) * 2) % 16 == 0 && (angle_pool.stride(0) * 4) % 16 == 0, "pool slot strides must be 16B aligned");
   TORCH_CHECK(Bm.stride(1) == S && Bm.stride(2) == 1 && Cm.stride(0) == Bm.stride(0) && Cm.stride(1) == S && Cm.stride(2) == 1);
   TORCH_CHECK((Bm.stride(0) * 2) % 16 == 0 && angle_proj.stride(1) == 1 && (angle_proj.stride(0) * 2) % 16 == 0, "B/C / angle_proj row strides must be 16B aligned");
@@ -297,7 +388,12 @@ void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Ten
   a.angp = reinterpret_cast<const __nv_bfloat16*>(angle_proj.data_ptr()); a.angp_stride = angle_proj.stride(0);
   a.Dp = Dp.data_ptr<float>(); a.xproj = xproj.data_ptr<float>(); a.zproj = zproj.data_ptr<float>(); a.outproj = outproj.data_ptr<float>();
   a.bias_q = bias_q.data_ptr<float>(); a.bias_k = bias_k.data_ptr<float>();
-  a.qsl = qsl.data_ptr<int>(); a.cols = cols.data_ptr<int>(); a.cols_stride = cols.stride(0); a.ncols = cols.size(1);
+  a.qsl = qsl.data_ptr<int>(); a.cols = cols.data_ptr<int>(); a.cols_stride = cols.stride(0);
+  a.ncols = light ? (int)k_pool.size(1) : (int)cols.size(1);
+  a.light_cols = light ? (int)k_pool.size(1) : 0;
+  a.kp_cst = light ? k_pool.stride(1) : 0; a.vp_cst = light ? v_pool.stride(1) : 0; a.ang_cst = light ? angle_pool.stride(1) : 0;
+  a.agb = light ? agb_pool->data_ptr<float>() : nullptr;
+  a.agb_sst = light ? agb_pool->stride(0) : 0; a.agb_cst = light ? agb_pool->stride(1) : 0;
   a.num_accepted = num_accepted.data_ptr<int>();
   a.y = reinterpret_cast<__nv_bfloat16*>(y.data_ptr()); a.N = x.size(0); a.lanes = cols.size(0);
   TORCH_CHECK(qsl.size(0) >= a.lanes + 1 && num_accepted.size(0) >= a.lanes);
@@ -307,14 +403,15 @@ void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Ten
   // Launch on x's device; the smem opt-in is a per-device function attribute.
   const c10::cuda::CUDAGuard device_guard(x.device());
   constexpr int kMaxDevices = 64;
-  static bool attr_done[kMaxDevices] = {};
+  auto kern = light ? mamba3_verify_f32_kernel<true> : mamba3_verify_f32_kernel<false>;
+  static bool attr_done[2][kMaxDevices] = {};
   const int dev = x.get_device();
-  if (dev >= kMaxDevices || !attr_done[dev]) {
-    cudaFuncSetAttribute(mamba3_verify_f32_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    if (dev < kMaxDevices) attr_done[dev] = true;
+  if (dev >= kMaxDevices || !attr_done[light][dev]) {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (dev < kMaxDevices) attr_done[light][dev] = true;
   }
   int nsm = 132; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
-  int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, mamba3_verify_f32_kernel, 32 * WARPS, smem);
+  int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, kern, 32 * WARPS, smem);
   const int cps = std::max(1, std::min<int>((int)ctas_per_sm, fit));
   const int items = std::max(1, a.lanes) * H;
   int grid = std::min<int>(items, nsm * cps); grid = std::max(H, (grid / H) * H);
@@ -324,14 +421,15 @@ void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Ten
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr; cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg, mamba3_verify_f32_kernel, a);
+    cudaLaunchKernelEx(&cfg, kern, a);
   } else {
-    mamba3_verify_f32_kernel<<<grid, 32 * WARPS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
+    kern<<<grid, 32 * WARPS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
   }
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("verify", &mamba3_verify_cuda, py::arg("ssm"), py::arg("kp"), py::arg("vp"), py::arg("angle"), py::arg("A"),
         py::arg("Bm"), py::arg("Cm"), py::arg("Dp"), py::arg("x"), py::arg("dt"), py::arg("trap"), py::arg("xproj"),
         py::arg("zproj"), py::arg("outproj"), py::arg("z"), py::arg("bias_q"), py::arg("bias_k"), py::arg("angle_proj"),
-        py::arg("qsl"), py::arg("cols"), py::arg("num_accepted"), py::arg("y"), py::arg("ctas_per_sm"), py::arg("pdl"));
+        py::arg("qsl"), py::arg("cols"), py::arg("num_accepted"), py::arg("y"), py::arg("ctas_per_sm"), py::arg("pdl"),
+        py::arg("agb") = py::none());
 }

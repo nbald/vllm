@@ -11,6 +11,14 @@ Olala carries two kinds of paged recurrent state, both allocated through
 
 These live here rather than in the shared ``mamba_utils`` calculators so the
 fork touches one fewer upstream file.
+
+Token-shift fold (``OLALA_TS_FOLD=1``, opt-in): the hybrid allocator gives
+every state layer one full page per request (and per speculative column), the
+size of a Mamba3 state (~1.6 MB), although a token-shift buffer is 6 KB. With
+the fold, every Mamba3 layer's page also carries one token-shift buffer (it
+fits in the padding the page already has), the V layer uses the buffer of the
+Mamba3 layer right before it, and the token-shift layers drop out of the KV
+cache groups: two groups and their pages per request disappear.
 """
 
 import os
@@ -18,7 +26,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
-
 from vllm.config.cache import MambaDType
 from vllm.config.model import ModelDType
 from vllm.distributed import divide
@@ -72,10 +79,52 @@ def replay_config() -> ReplayConfig | None:
     return ReplayConfig(buffer_len=L, read_fp8=read == "fp8")
 
 
+def spec_light_cols(vllm_config) -> int:
+    """Columns per state page under speculative decoding with light columns
+    (``OLALA_SPEC_LIGHT=1``, opt-in): ``1 + k``, or 0 for the column-slot
+    layout (one state page per column, ``1 + k`` pages per request).
+
+    With light columns a request owns one page per layer: the fp32 SSM state
+    once, plus ``1 + k`` columns of the per-position small pieces (angle,
+    rotated B, x, and (alpha, gamma, beta)); the verify kernel commits last
+    step's accepted drafts from them before verifying (csrc/mamba3_verify.cu).
+    Needs the fp32 SSM state of the verify kernel, not ReplaySSM.
+    """
+    if os.environ.get("OLALA_SPEC_LIGHT", "0") != "1":
+        return 0
+    k = int(getattr(vllm_config, "num_speculative_tokens", 0) or 0)
+    if k <= 0 or replay_config() is not None:
+        return 0
+    if vllm_config.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32"):
+        return 0
+    # Only the fused verify kernel (csrc/mamba3_verify.cu) implements the commit:
+    # its shapes (48 local heads, head_dim 64, d_state 128, mimo 4, 32 angles),
+    # sm_80+, OLALA_MAMBA3_VERIFY=cuda. Elsewhere keep the column-slot layout,
+    # whose per-position chain is the fallback.
+    hf = vllm_config.model_config.hf_config
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    d_state = getattr(hf, "mamba_d_state", 0)
+    shapes_ok = (
+        getattr(hf, "mamba_headdim", 0) == 64
+        and d_state == 128
+        and getattr(hf, "mamba_mimo_dim", 0) == 4
+        and 2 * getattr(hf, "hidden_size", 0) // 64 == 48 * tp
+    )
+    if not shapes_ok or os.environ.get("OLALA_MAMBA3_VERIFY", "cuda") != "cuda":
+        return 0
+    from vllm.platforms import current_platform
+
+    # NVML-based: no CUDA context in the API server process
+    if not current_platform.has_device_capability(80):
+        return 0
+    return 1 + k
+
+
 def mamba3_state_dtype(
     model_dtype: ModelDType | torch.dtype,
     mamba_cache_dtype: MambaDType,
     mamba_ssm_cache_dtype: MambaDType,
+    light_cols: int = 0,
 ) -> tuple[torch.dtype, ...]:
     """Dtypes of ``(angle, ssm, k, v)``, then the ReplaySSM tensors if enabled
     (see ``mamba3_state_shape``).
@@ -98,6 +147,9 @@ def mamba3_state_dtype(
     else:
         ssm_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
     dtypes = (torch.float32, ssm_dtype, state_dtype, state_dtype)
+    if light_cols:
+        # light columns: + (alpha, gamma, beta, -) per column (spec_light_cols)
+        return dtypes + (torch.float32,)
     if rc is not None:
         dtypes += (torch.bfloat16, torch.bfloat16, torch.float32, torch.int32)
         if rc.read_fp8:
@@ -112,8 +164,13 @@ def mamba3_state_shape(
     d_state: int,
     mimo_dim: int,
     num_rope_angles: int,
+    light_cols: int = 0,
 ) -> tuple[tuple[int, ...], ...]:
     """Shapes of ``(angle, ssm, k, v)`` per request slot.
+
+    With ``light_cols`` C > 0 (spec_light_cols): ``angle (C, nh, A)``, ``ssm``
+    once, ``k (C, mimo, nh, d_state)``, ``v (C, nh, head_dim)`` and
+    ``(alpha, gamma, beta, -) (C, nh, 4)``; column 0 is the committed state.
 
     With ReplaySSM, ``ssm`` is the checkpoint anchor and the ring follows:
     ``x (nh, L, head_dim)``, the biased + rotated ``B' (nh, L, mimo_dim,
@@ -123,6 +180,15 @@ def mamba3_state_shape(
     per-row scales ``(nh, head_dim)`` if enabled.
     """
     nh = divide(num_heads, tp_world_size)
+    if light_cols:
+        C = light_cols
+        return (
+            (C, nh, num_rope_angles),
+            (nh, head_dim, d_state),
+            (C, mimo_dim, nh, d_state),
+            (C, nh, head_dim),
+            (C, nh, 4),
+        )
     shapes: tuple[tuple[int, ...], ...] = (
         (nh, num_rope_angles),
         (nh, head_dim, d_state),
@@ -143,6 +209,39 @@ def mamba3_state_shape(
     return shapes
 
 
+def ts_fold_active(hf_config, pp_size: int = 1) -> bool:
+    """Whether the V layers' token-shift buffers ride in the Mamba3 pages (see
+    the module docstring). Needs token shift, a single pipeline stage, and a
+    Mamba3 layer right before every V layer (MMMMV... in Olala 7A1B)."""
+    if os.environ.get("OLALA_TS_FOLD", "0") != "1":
+        return False
+    if not getattr(hf_config, "token_shift_attn", False) or pp_size != 1:
+        return False
+    pattern = getattr(hf_config, "layers_config", "") or ""
+    if "V" not in pattern:
+        return False
+    return all(
+        i > 0 and pattern[i - 1] == "M" for i, c in enumerate(pattern) if c == "V"
+    )
+
+
+def folded_token_shift_layout(
+    hf_config, tp_world_size: int, model_dtype, mamba_cache_dtype, light_cols: int = 0
+) -> tuple[tuple[tuple[int, ...], ...], tuple[torch.dtype, ...]]:
+    """Shapes and dtypes appended to every Mamba3 state when folding: the
+    four-tensor ``(k_last, v_last, A_k_last, A_v_last)`` layout of the factor
+    cache (the dense path uses the first two; the A tensors cost 192 bytes)."""
+    num_heads = hf_config.num_attention_heads
+    signal = getattr(hf_config, "num_signal_heads_diff", 0) or num_heads // 2
+    num_kv_heads = num_heads - signal
+    rank = int(getattr(hf_config, "tpa_rank", 0) or 0) or 1
+    shapes = token_shift_state_shape(
+        tp_world_size, num_kv_heads, hf_config.head_dim, rank, light_cols
+    )
+    dtypes = token_shift_state_dtype(model_dtype, mamba_cache_dtype, rank)
+    return shapes, dtypes
+
+
 def token_shift_state_dtype(
     model_dtype: ModelDType | torch.dtype,
     mamba_cache_dtype: MambaDType,
@@ -158,7 +257,8 @@ def token_shift_state_shape(
     num_kv_heads: int,
     head_dim: int,
     rank: int = 0,
-) -> tuple[tuple[int, int], ...]:
+    light_cols: int = 0,
+) -> tuple[tuple[int, ...], ...]:
     """Shapes of the Differential-TPA ``(k_last, v_last)`` buffer.
 
     With ``rank`` > 0 (TPA-factorized KV cache) the previous token's rank
@@ -166,7 +266,10 @@ def token_shift_state_shape(
     token ``t`` carries ``alpha_t * A[t-1]`` for the token-shift term.
     """
     kv = divide(num_kv_heads, tp_world_size)
-    shapes: tuple[tuple[int, int], ...] = ((kv, head_dim), (kv, head_dim))
+    shapes: tuple[tuple[int, ...], ...] = ((kv, head_dim), (kv, head_dim))
     if rank:
         shapes += ((kv, rank), (kv, rank))
+    if light_cols:
+        # one buffer per speculative column inside the page (spec_light_cols)
+        shapes = tuple((light_cols, *sh) for sh in shapes)
     return shapes

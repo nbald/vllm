@@ -157,7 +157,7 @@ def _tpa_decode_qkv_spec_kernel(
     alk_ptr, alv_ptr, sal_n,
     pos_ptr,
     qsl_ptr, cols_ptr, scol, ncols, acc_ptr, lanes, N,
-    kpool_ptr, vpool_ptr, sp_n, sp_h, P,
+    kpool_ptr, vpool_ptr, sp_n, sp_h, sp_c, P,
     qw_ptr, kw_ptr, eps,
     scaler_ptr, wsize,
     qo_ptr, ko_ptr, vo_ptr,
@@ -165,6 +165,7 @@ def _tpa_decode_qkv_spec_kernel(
     GQ: tl.constexpr,
     R: tl.constexpr,
     D: tl.constexpr,
+    LIGHT: tl.constexpr,
 ):
     """Spec-decode verify rows (column-slot protocol, see olala_spec_utils):
     one program per (request, kv head) walks the request's positions in order.
@@ -179,10 +180,18 @@ def _tpa_decode_qkv_spec_kernel(
         start = tl.load(qsl_ptr + r)
         qlen = tl.minimum(tl.load(qsl_ptr + r + 1) - start, ncols)
         c0 = tl.maximum(tl.load(acc_ptr + r) - 1, 0)
-        init = tl.load(cols_ptr + r * scol + c0)
-        irow = tl.minimum(tl.maximum(init, 0), P - 1).to(tl.int64)
-        kprev = tl.load(kpool_ptr + irow * sp_n + h * sp_h + offs).to(tl.float32)
-        vprev = tl.load(vpool_ptr + irow * sp_n + h * sp_h + offs).to(tl.float32)
+        if LIGHT:
+            # light columns (state.py): one slot, column c0 inside its page
+            c0 = tl.minimum(c0, ncols - 1)
+            init = tl.load(cols_ptr + r * scol)
+            irow = tl.minimum(tl.maximum(init, 0), P - 1).to(tl.int64)
+            ioff = irow * sp_n + c0.to(tl.int64) * sp_c
+        else:
+            init = tl.load(cols_ptr + r * scol + c0)
+            irow = tl.minimum(tl.maximum(init, 0), P - 1).to(tl.int64)
+            ioff = irow * sp_n
+        kprev = tl.load(kpool_ptr + ioff + h * sp_h + offs).to(tl.float32)
+        vprev = tl.load(vpool_ptr + ioff + h * sp_h + offs).to(tl.float32)
         for t in range(qlen):
             n = start + t
             k, v = _tpa_raw_kv(
@@ -194,9 +203,12 @@ def _tpa_decode_qkv_spec_kernel(
                 qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr, ko_ptr, vo_ptr,
                 HKV, GQ, D,
             )
-            dst = tl.load(cols_ptr + r * scol + t)
-            drow = tl.minimum(tl.maximum(dst, 0), P - 1).to(tl.int64)
-            dpos = drow * sp_n + h * sp_h + offs
+            if LIGHT:
+                doff = irow * sp_n + t * sp_c
+            else:
+                dst = tl.load(cols_ptr + r * scol + t)
+                doff = tl.minimum(tl.maximum(dst, 0), P - 1).to(tl.int64) * sp_n
+            dpos = doff + h * sp_h + offs
             tl.store(kpool_ptr + dpos, k.to(kpool_ptr.dtype.element_ty))
             tl.store(vpool_ptr + dpos, v.to(vpool_ptr.dtype.element_ty))
             kprev = k
@@ -266,24 +278,31 @@ def tpa_decode_qkv_spec(q_all, A_k, A_v, B_k, B_v, alpha_k, alpha_v, positions,
                         scaler, wsize, hkv, gq, rank, d):
     """tpa_decode_qkv for a verify batch (decode rows only, ragged per request):
     ``qsl`` (lanes + 1,) decode-token offsets, ``cols`` (lanes, 1 + k) pool
-    columns, ``num_accepted`` (lanes,) previous acceptance."""
+    columns, ``num_accepted`` (lanes,) previous acceptance. With light columns
+    (4-D pools (slots, 1 + k, kv, D)) ``cols`` holds the slot in column 0."""
     n = q_all.shape[0]
     dt = q_all.dtype
     q_out = torch.empty(n, hkv * gq * d, dtype=dt, device=q_all.device)
     k_out = torch.empty(n, hkv * d, dtype=dt, device=q_all.device)
     v_out = torch.empty(n, hkv * d, dtype=dt, device=q_all.device)
     lanes = cols.shape[0]
+    # light columns (state.py): pools (slots, 1 + k, kv, D), cols holds the slot in column 0
+    light = k_pool.dim() == 4
+    ncols = k_pool.shape[1] if light else cols.shape[1]
+    sp_h = k_pool.stride(2) if light else k_pool.stride(1)
+    sp_c = k_pool.stride(1) if light else 0
+    assert v_pool.stride() == k_pool.stride()
     _tpa_decode_qkv_spec_kernel[(lanes + 1, hkv)](
         q_all, q_all.stride(0), d,
         A_k, A_v, A_k.stride(0),
         B_k, B_v, B_k.stride(0),
         alpha_k, alpha_v, alpha_k.stride(0),
         positions,
-        qsl, cols, cols.stride(0), cols.shape[1], num_accepted, lanes, n,
-        k_pool, v_pool, k_pool.stride(0), k_pool.stride(1), k_pool.shape[0],
+        qsl, cols, cols.stride(0), ncols, num_accepted, lanes, n,
+        k_pool, v_pool, k_pool.stride(0), sp_h, sp_c, k_pool.shape[0],
         q_w, k_w, eps, scaler, float(wsize),
         q_out, k_out, v_out,
-        HKV=hkv, GQ=gq, R=rank, D=d, num_warps=2,
+        HKV=hkv, GQ=gq, R=rank, D=d, LIGHT=light, num_warps=2,
     )
     return q_out, k_out, v_out
 

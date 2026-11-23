@@ -16,6 +16,7 @@ indexing the state pools in place.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 
@@ -72,9 +73,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
 from vllm.model_executor.layers.mamba.olala.state import (
+    folded_token_shift_layout,
     mamba3_state_dtype,
     mamba3_state_shape,
     replay_config,
+    spec_light_cols,
+    ts_fold_active,
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -408,6 +412,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self.cache_config = vllm_config.cache_config
         tp = get_tensor_model_parallel_world_size()
         self.tp_size = tp
+        # Token-shift fold (state.py): the page also carries one V layer's
+        # (k_last, v_last, A_k_last, A_v_last) after the Mamba3 tensors.
+        self.ts_fold = ts_fold_active(config, vllm_config.parallel_config.pipeline_parallel_size)
+        # Speculative light columns (state.py: spec_light_cols): 1 + k columns
+        # of small pieces in one page, 0 = one page per column.
+        self.light_cols = spec_light_cols(vllm_config)
 
         self.d_model = config.hidden_size
         self.d_inner = 2 * self.d_model
@@ -578,10 +588,13 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
+            self.light_cols,
         )
         # The CuteDSL step kernel indexes the pools in place, so their dtypes
         # are a hard precondition rather than something we can cast around.
         _, ssm_dtype, k_dtype, v_dtype = dtypes[:4]
+        if self.ts_fold:
+            dtypes = tuple(dtypes) + self._ts_fold_layout()[1]
         if ssm_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
                 f"Olala mamba3 supports an fp32 or bf16 SSM state, got "
@@ -595,7 +608,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             )
         return dtypes
 
-    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+    def _own_state_shape(self) -> tuple[tuple[int, ...], ...]:
         return mamba3_state_shape(
             tp_world_size=self.tp_size,
             num_heads=self.nheads,
@@ -603,7 +616,46 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             d_state=self.d_state,
             mimo_dim=self.mimo_dim,
             num_rope_angles=self.num_rope_angles,
+            light_cols=self.light_cols,
         )
+
+    def _ts_fold_layout(self):
+        return folded_token_shift_layout(
+            self.config, self.tp_size, self.model_config.dtype, self.cache_config.mamba_cache_dtype,
+            self.light_cols,
+        )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if self.light_cols and spec is not None:
+            # every speculative column lives inside the one page
+            spec = dataclasses.replace(spec, num_speculative_blocks=0)
+        return spec
+
+    def _base_pools(self) -> tuple[torch.Tensor, ...]:
+        """(angle, ssm, k, v) of the committed state: column 0 with light columns."""
+        own = tuple(self.kv_cache[: self.num_own_state_tensors])
+        if self.light_cols:
+            angle, ssm, k, v = own[:4]
+            return (angle[:, 0], ssm, k[:, 0], v[:, 0])
+        return own[:4]
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        shapes = self._own_state_shape()
+        if self.ts_fold:
+            shapes = tuple(shapes) + self._ts_fold_layout()[0]
+        return shapes
+
+    @property
+    def num_own_state_tensors(self) -> int:
+        """Mamba3 tensors at the head of ``kv_cache`` (the folded token-shift
+        buffers, if any, follow)."""
+        return len(self._own_state_shape())
+
+    def folded_token_shift_pools(self) -> tuple[torch.Tensor, ...]:
+        """The (k_last, v_last, A_k_last, A_v_last) views of this page (fold only)."""
+        assert self.ts_fold
+        return tuple(self.kv_cache[self.num_own_state_tensors :])
 
     # -- Forward ------------------------------------------------------------
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -661,7 +713,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 and self._replay is None
                 and n <= GEO_LINEAR_MAX_TOKENS
                 and self._in_proj_cat_ok
-                and self._raw_step_ok(tuple(self.kv_cache[:4]))
+                and self._raw_step_ok(self._base_pools())
             ):
                 cat = geo_linear(
                     hidden_states, g, self._pre_geo, self._in_proj_cat_weight(),
@@ -671,7 +723,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 ndt = md.num_decode_tokens
                 self._decode_raw_step(
                     None, out[:ndt], md.state_indices_tensor[: md.num_decodes],
-                    tuple(self.kv_cache[:4]),
+                    self._base_pools(),
                     zxdt_bc=(cat[:ndt, :n1], cat[:ndt, n1:]),
                 )
                 return
@@ -685,14 +737,19 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             return
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
-        all_pools = self.kv_cache
-        pools = tuple(all_pools[:4])  # (angle, ssm, k, v); ReplaySSM tensors follow
+        all_pools = tuple(self.kv_cache[: self.num_own_state_tensors])
+        # (angle, ssm, k, v); ReplaySSM tensors follow. With light columns the
+        # verify kernel takes the whole page, everything else column 0.
+        pools = self._base_pools()
         slots = md.state_indices_tensor
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
         if md.num_decodes > 0:
             if md.spec is not None:
-                self._decode_spec(hidden_states[:ndt], out[:ndt], md.spec, pools)
+                self._decode_spec(
+                    hidden_states[:ndt], out[:ndt], md.spec,
+                    all_pools if self.light_cols else pools,
+                )
             elif self._replay is not None:
                 self._decode_replay(
                     hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], all_pools
@@ -922,10 +979,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if n == 0 or torch.cuda.is_current_stream_capturing():
             out.zero_()
             return
-        pools = tuple(
+        full = tuple(
             torch.zeros((1, *shape), dtype=dtype, device=h.device)
             for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
-        )[:4]
+        )
+        # light columns: the prefill sees column 0, as on the real pages (_base_pools)
+        pools = (full[0][:, 0], full[1], full[2][:, 0], full[3][:, 0]) if self.light_cols else full[:4]
         slots = torch.zeros(1, dtype=torch.long, device=h.device)
         qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
         self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
@@ -1247,7 +1306,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         Always uses the fused rotary (correct at any batch size) so the angle
         pool follows the same column protocol.
         """
-        angle_pool, ssm_pool, k_pool, v_pool = pools
+        angle_pool, ssm_pool, k_pool, v_pool = pools[:4]
+        agb_pool = pools[4] if self.light_cols else None
         H, D = self.nheads_local, self.headdim
         R, S = self.mimo_dim, self.d_state
         if not (self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)):
@@ -1280,7 +1340,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 ssm_pool, k_pool, v_pool, angle_pool, _A, bn_cn[:, 0],
                 bn_cn[:, 1], self.D, x, DT, trap, xpj, zpj, outpj, z, bias_q,
                 bias_k, angle, spec.query_start_loc_d, spec.state_cols,
-                spec.num_accepted_tokens, y,
+                spec.num_accepted_tokens, y, agb=agb_pool,
             )  # fmt: skip
             if not direct:
                 y = y.reshape(ndt, H * D)
@@ -1288,6 +1348,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                     y = self.output_norm(y)
                 out.copy_(y.to(out.dtype))
             return
+        if self.light_cols:
+            raise NotImplementedError(
+                "Light speculative columns (OLALA_SPEC_LIGHT) need the fused verify kernel "
+                "(OLALA_MAMBA3_VERIFY=cuda, sm_80+ build); set OLALA_SPEC_LIGHT=0 for the chain."
+            )
         self._decode_spec_chain(
             u, out, spec, pools, x, z, _A, DT, trap, bn_cn, angle
         )

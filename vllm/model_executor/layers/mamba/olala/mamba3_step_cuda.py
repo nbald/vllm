@@ -197,7 +197,7 @@ def verify_supported(
 def mamba3_verify_cuda(
     ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj,
     outproj, z, bias_q, bias_k, angle_proj, qsl, cols, num_accepted, y,
-    ctas_per_sm: int = 4,
+    ctas_per_sm: int = 4, agb=None,
 ) -> None:  # fmt: skip
     """All draft positions of every request in one launch (column-slot protocol).
 
@@ -205,11 +205,17 @@ def mamba3_verify_cuda(
     int32 state slot columns (unit inner stride); ``num_accepted``: (lanes,)
     int32, the current state is column ``max(num_accepted - 1, 0)``. B, C:
     (N, R, S) views; angle_proj: (N, 32) view; A / dt / trap: (N, H) fp32;
-    x, z, y: (N, H, D)."""
+    x, z, y: (N, H, D).
+
+    ``agb`` given: light columns (state.py: spec_light_cols). ``k_pool``
+    (P, C, R, H, S), ``v_pool`` (P, C, H, D), ``angle_pool`` (P, C, H, A),
+    ``agb`` (P, C, H, 4) fp32, ``cols`` (lanes, >= 1) with the slot in column
+    0; last step's accepted drafts are committed from the light columns
+    first."""
     _load_verify().verify(
         ssm_pool, k_pool, v_pool, angle_pool, _as_f32(A), B, C, _fp32(Dp), x,
         _as_f32(dt), _as_f32(trap), xproj, zproj, outproj, z, bias_q, bias_k,
-        angle_proj, qsl, cols, num_accepted, y, ctas_per_sm, pdl_enabled(),
+        angle_proj, qsl, cols, num_accepted, y, ctas_per_sm, pdl_enabled(), agb,
     )  # fmt: skip
 
 
