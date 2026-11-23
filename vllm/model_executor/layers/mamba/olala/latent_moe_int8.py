@@ -1550,12 +1550,12 @@ def _volta_small_cfg(mb: int) -> dict:
     (UP_BN / UP_BK, DOWN_BN / DOWN_BK), shared up (SH_BN / SH_BK) and exit (EX_BN, EX_BK) as
     multi-row blocks (_volta_rows_dot)."""
     # V100 through volta-forever, graphed sweeps (us per layer, INT8 per row): 1 token 29,
-    # 2: 40, 4: 73, 8: 106, 16: 164, 32: 325 (stock small path: 100 / 109 at 1 / 2 tokens).
+    # 2: 39, 4: 73, 8: 106, 16: 164, 32: 325 (stock small path: 100 / 109 at 1 / 2 tokens).
     if mb == 1:
-        return dict(UP_BN=8, UP_BK=128, DOWN_BN=8, DOWN_BK=256, SH_BN=16, SH_BK=256, EX_BN=8,
+        return dict(UP_BN=8, UP_BK=128, DOWN_BN=8, DOWN_BK=256, SH_BN=8, SH_BK=128, EX_BN=1,
                     EX_BK=128)
     if mb == 2:
-        return dict(UP_BN=32, UP_BK=64, DOWN_BN=8, DOWN_BK=256, SH_BN=16, SH_BK=64, EX_BN=8,
+        return dict(UP_BN=32, UP_BK=64, DOWN_BN=8, DOWN_BK=256, SH_BN=8, SH_BK=256, EX_BN=1,
                     EX_BK=128)
     rows = {4: (16, 64), 8: (8, 64), 16: (8, 32)}.get(mb, (4, 32))
     return dict(UP_BN=32, UP_BK=128, DOWN_BN=8, DOWN_BK=256, SH_BN=rows[0], SH_BK=rows[1],
