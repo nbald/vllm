@@ -25,8 +25,9 @@ tile are token-major t*R + r):
      read from / written back to the request's pool slot; a chunk's local state is rotated by the
      phase prefix (rot(a + b) = rot(a) rot(b)).
   3. outputs: every chunk is an independent virtual sequence starting from S_in[c]: CUDA ``scan``
-     (sm90 wgmma; sm100 / sm103 tcgen05 with 32-token groups, ``OLALA_SCAN_TC=0`` to skip) or the
-     TileLang ``mamba_mimo_fwd_v2`` kernel (``OLALA_TL_V2=0``: v1).
+     (sm90 wgmma; sm100 / sm103 tcgen05 with 32-token groups, ``OLALA_SCAN_TC=0`` to skip; sm8x mma.sync,
+     on the SM70 family its FMA edition mamba3_scan_prefill_volta.cu) or the TileLang
+     ``mamba_mimo_fwd_v2`` kernel (``OLALA_TL_V2=0``: v1).
   4. ``_ssd_pool_tail``: final angle / K / V of every sequence into its pool slot.
 Rotary columns are four NQ = N/4 wide groups: g0/g2 rotate together, g1/g3 do not.
 """
@@ -55,10 +56,11 @@ _SCAN_EXT = None
 _CS_SM80_EXT = None
 _SCAN_SM80_EXT = None
 # SM70 family (V100 through volta-forever, which emulates the sm8x kernels' bf16 mma.sync / ldmatrix with scalar
-# code): FMA edition of the chunk-state kernel, same arguments and values.
-# OLALA_VOLTA_PREFILL=0 keeps the sm8x kernel there.
+# code): FMA editions of the chunk-state and output-pass kernels, same arguments and values.
+# OLALA_VOLTA_PREFILL=0 keeps the sm8x kernels there.
 _VOLTA_PREFILL = _os.environ.get("OLALA_VOLTA_PREFILL", "1") == "1"
 _CS_VOLTA_EXT = None
+_SCAN_VOLTA_EXT = None
 
 
 def _scan_cuda_ok(dev) -> bool:
@@ -114,6 +116,17 @@ def _cs_volta_ext(dev):
                                        "mamba3_chunk_state_volta.cu",
                                        ["-O3", "-std=c++20", "--use_fast_math", gencode(dev)])
     return _CS_VOLTA_EXT
+
+
+def _scan_volta_ext(dev):
+    """FMA edition of the sm8x output pass for the SM70 family (olala/csrc/mamba3_scan_prefill_volta.cu)."""
+    global _SCAN_VOLTA_EXT
+    if _SCAN_VOLTA_EXT is None:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+        _SCAN_VOLTA_EXT = load_extension(f"olala_mamba3_scan_prefill_volta_sm{sm_arch(dev)}",
+                                         "mamba3_scan_prefill_volta.cu",
+                                         ["-O3", "-std=c++20", "--use_fast_math", gencode(dev)])
+    return _SCAN_VOLTA_EXT
 
 
 def xz_strided_ok(dev) -> bool:
@@ -531,8 +544,9 @@ def mamba3_mimo_hybrid_pools(
                          m_start, m_len, m_last, SinT, out, k_fin, NC)
     elif scan_sm80:
         k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)
-        _scan_sm80_ext(dev).scan(Q, K, V, Z, q_bias, k_bias, psi, phi, zeta, D, thl, Ain, DA_CS, DA_CS_REV, ts, gam,
-                                 m_start, m_len, m_last, SinT, out, k_fin, NC)
+        ext = _scan_volta_ext(dev) if _volta_prefill(dev) else _scan_sm80_ext(dev)
+        ext.scan(Q, K, V, Z, q_bias, k_bias, psi, phi, zeta, D, thl, Ain, DA_CS, DA_CS_REV, ts, gam,
+                 m_start, m_len, m_last, SinT, out, k_fin, NC)
     elif _TL_V2:
         zk, zv = _zero_kv(NC, R, H, N, P, dev, Q.dtype)
         # v2: chunk-local phases + per-chunk offset in-kernel, segsum inline, no qk_dot GEMM
