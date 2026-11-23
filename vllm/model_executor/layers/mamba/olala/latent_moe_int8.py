@@ -900,7 +900,23 @@ def olala_moe_small_int8(
     gemv: bool = False,
 ) -> torch.Tensor:
     """Small-batch (M <= 16) latent MoE with weight-only quantized (or bf16)
-    routed experts, shared expert and fc2_latent."""
+    routed experts, shared expert and fc2_latent. On Volta without explicit
+    configs: olala_moe_small_int8_volta (FMA kernels; ``gemv`` does not apply)."""
+    if configs is None and gpu_family(hidden.device) is GpuFamily.SM70:
+        return olala_moe_small_int8_volta(
+            hidden,
+            x_in,
+            router_logits,
+            e_score_bias,
+            w13,
+            w2,
+            shared_up,
+            shared_down,
+            fc2,
+            top_k,
+            routed_scale,
+            router_logits_lo=router_logits_lo,
+        )
     M, H = hidden.shape
     E, N1, D1 = w13.weight.shape[0], w13.n, w13.k
     D2 = w2.n
@@ -1039,7 +1055,23 @@ def olala_moe_medium_int8(
     router_logits_lo: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Medium-batch latent MoE: routing, compaction, grouped up GEMM (+ shared
-    up), grouped down GEMM, exit GEMM (top-k sum + fc2_latent + shared down)."""
+    up), grouped down GEMM, exit GEMM (top-k sum + fc2_latent + shared down).
+    On Volta without explicit configs: _olala_moe_medium_int8_volta."""
+    if configs is None and gpu_family(hidden.device) is GpuFamily.SM70:
+        return _olala_moe_medium_int8_volta(
+            hidden,
+            x_in,
+            router_logits,
+            e_score_bias,
+            w13,
+            w2,
+            shared_up,
+            shared_down,
+            fc2,
+            top_k,
+            routed_scale,
+            router_logits_lo,
+        )
     from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
         _latent_moe_epilogue_kernel,
     )
@@ -1885,3 +1917,44 @@ def wq_routed_experts(
         part, out, routed_scale, M, D=D2, K=top_k, BR=BR, BD=128, num_warps=4
     )
     return out
+
+
+def _wq_dense_mm(x: torch.Tensor, w: WqWeight) -> torch.Tensor:
+    """``x @ deq(W).T`` (bf16) for a dense FMT_BF16 / FMT_ROW / FMT_GROUP weight."""
+    if w.fmt == FMT_BF16:
+        return x @ w.weight.t()
+    from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
+        Int8Weight,
+        int8_mm,
+    )
+
+    return int8_mm(x, Int8Weight(w.weight, w.scale))
+
+
+def _olala_moe_medium_int8_volta(
+    hidden: torch.Tensor,
+    x_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    e_score_bias: torch.Tensor,
+    w13: WqWeight,
+    w2: WqWeight,
+    shared_up: WqWeight,
+    shared_down: WqWeight,
+    fc2: WqWeight,
+    top_k: int,
+    routed_scale: float,
+    router_logits_lo: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """olala_moe_medium_int8 on Volta, where its grouped GEMMs run emulated bf16
+    mma.sync and volta-forever refuses the down GEMM (redux.sync on a reused mask
+    register): the prefill path's pieces, i.e. the routed experts of
+    wq_routed_experts (Volta tiles) and the W8A16 linears. The serving path does
+    not call it on Volta (OlalaLatentMoE turns the medium path off there); it keeps
+    the function's contract. Within bf16 rounding of the stock path (the shared
+    and fc2 GEMMs are rounded to bf16 before their sum)."""
+    logits = router_logits if router_logits_lo is None else router_logits + router_logits_lo
+    lat = x_in[:, : w13.k].to(torch.bfloat16)  # the stock kernels round x_in to bf16 on load
+    routed = wq_routed_experts(lat, logits, e_score_bias, w13, w2, top_k, routed_scale)
+    s = _wq_dense_mm(hidden, shared_up).float()
+    s = torch.relu(s).square().to(torch.bfloat16)
+    return _wq_dense_mm(routed, fc2) + _wq_dense_mm(s, shared_down)
