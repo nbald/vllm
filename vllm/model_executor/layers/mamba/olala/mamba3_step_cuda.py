@@ -148,6 +148,71 @@ def mamba3_step_cuda_raw(ssm_pool, k_pool, v_pool, angle_pool, zxdt, bc, dt_bias
                  pdl_enabled())
 
 
+# -- Speculative verify (csrc/mamba3_verify.cu) -------------------------------
+
+
+@lru_cache(maxsize=1)
+def _load_verify():
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+    return load_extension(
+        f"olala_mamba3_verify_sm{sm_arch()}",
+        "mamba3_verify.cu",
+        ["-O3", "-std=c++20", gencode()],
+    )
+
+
+@lru_cache(maxsize=1)
+def verify_kernel_enabled() -> bool:
+    """OLALA_MAMBA3_VERIFY=cuda (default): the fused multi-position verify
+    kernel; any other value keeps the per-position chain of step launches."""
+    if os.environ.get("OLALA_MAMBA3_VERIFY", "cuda") != "cuda" or not has_bf16_mma():
+        return False
+    try:
+        _load_verify()
+    except Exception as e:  # noqa: BLE001 - any build/load failure falls back
+        warn_slow_path(
+            "Fused Mamba-3 verify kernel disabled",
+            f"JIT build of mamba3_verify.cu failed: {e}",
+            "per-position verify chain: ~20 launches per draft position and layer",
+            "the JIT needs an nvcc of torch's CUDA major; set OLALA_JIT_CUDA_HOME",
+        )
+        return False
+    return True
+
+
+def verify_supported(
+    ssm_pool, k_pool, v_pool, angle_pool, num_heads, head_dim, d_state, rank, num_angles
+) -> bool:
+    """The kernel's compiled shapes (Olala 7A1B at TP=1) and an fp32 state."""
+    return (
+        (num_heads, head_dim, d_state, rank, num_angles) == (48, 64, 128, 4, 32)
+        and ssm_pool.dtype == torch.float32
+        and k_pool.dtype == torch.bfloat16
+        and v_pool.dtype == torch.bfloat16
+        and angle_pool.dtype == torch.float32
+    )
+
+
+def mamba3_verify_cuda(
+    ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj,
+    outproj, z, bias_q, bias_k, angle_proj, qsl, cols, num_accepted, y,
+    ctas_per_sm: int = 4,
+) -> None:  # fmt: skip
+    """All draft positions of every request in one launch (column-slot protocol).
+
+    ``qsl``: (lanes + 1,) int32 decode-token offsets; ``cols``: (lanes, 1 + k)
+    int32 state slot columns (unit inner stride); ``num_accepted``: (lanes,)
+    int32, the current state is column ``max(num_accepted - 1, 0)``. B, C:
+    (N, R, S) views; angle_proj: (N, 32) view; A / dt / trap: (N, H) fp32;
+    x, z, y: (N, H, D)."""
+    _load_verify().verify(
+        ssm_pool, k_pool, v_pool, angle_pool, _as_f32(A), B, C, _fp32(Dp), x,
+        _as_f32(dt), _as_f32(trap), xproj, zproj, outproj, z, bias_q, bias_k,
+        angle_proj, qsl, cols, num_accepted, y, ctas_per_sm, pdl_enabled(),
+    )  # fmt: skip
+
+
 # -- ReplaySSM (csrc/mamba3_replay_step.cu) ----------------------------------
 
 
