@@ -167,12 +167,150 @@ def _decode_gemv_sm120(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.linear(x, weight)
 
 
+# -- Volta (V100), natively or through volta-forever ------------------------------------------
+# volta-forever tells the process sm_80 (so bf16 stays on), and on sm_70 tl.dot's bf16 mma.sync is
+# emulated with scalar code (~200 instructions per m16n8k16, 64 of them FMAs) while plain FMA code
+# runs natively. The skinny kernel pays that for 16 padded rows per real row (~170 GB/s whatever
+# M), and cuBLAS has no Volta bf16 GEMM kernels (F.linear: 70-300 us per decode projection). So on
+# Volta decode GEMVs take FMA kernels: one row the GEMV below at any K; 2..32 rows the kernels
+# below, which load each weight tile once for all rows and keep fp32 partial sums per lane until a
+# single reduction. V100 through volta-forever, graphed, weights from DRAM, us (skinny -> FMA):
+# 1 row: in_proj 7344x1536 124 -> 30, mixer_proj 1536x3072 121 -> 14, TPA mixer 1536x4608
+# 178 -> 20, MoE w_out 1536x1920 77 -> 14; 8 rows: in_proj 134 -> 50, mixer_proj 130 -> 28,
+# TPA mixer 193 -> 40, w_in 1920x1536 67 -> 16; 32 rows: mixer_proj 197 -> 94, in_proj 175 -> 165.
+VOLTA_ROWS_MAX_M = 32
+
+
+@triton.jit
+def _rows_acc(acc, w, x_ptr, m: tl.constexpr, stride_xm, offs_k, M):
+    x = tl.load(x_ptr + m * stride_xm + offs_k, mask=(offs_k * 0 + m) < M, other=0.0)
+    return acc + w * x.to(tl.float32)[None, :]
+
+
+@triton.jit
+def _rows_store(y_ptr, acc, m: tl.constexpr, stride_ym, offs_n, n_mask, M):
+    tl.store(y_ptr + m * stride_ym + offs_n, tl.sum(acc, axis=1).to(y_ptr.dtype.element_ty),
+             mask=n_mask & (m < M))
+
+
+@triton.jit
+def _gemv_rows_kernel(
+    x_ptr, w_ptr, y_ptr, M, N, K, stride_xm, stride_wn, stride_ym,
+    MB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """``y = x @ w.T`` for M <= MB <= 8 rows with FMAs (Volta): each [BN, BK] weight tile is
+    loaded once and used for every row; per-row partial sums stay per (n, k) lane across the K
+    loop and are reduced once at the end."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    n_mask = offs_n < N
+    a0 = tl.zeros([BN, BK], dtype=tl.float32)
+    a1 = tl.zeros([BN, BK], dtype=tl.float32)
+    a2 = tl.zeros([BN, BK], dtype=tl.float32)
+    a3 = tl.zeros([BN, BK], dtype=tl.float32)
+    a4 = tl.zeros([BN, BK], dtype=tl.float32)
+    a5 = tl.zeros([BN, BK], dtype=tl.float32)
+    a6 = tl.zeros([BN, BK], dtype=tl.float32)
+    a7 = tl.zeros([BN, BK], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        w = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :], mask=n_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        a0 = _rows_acc(a0, w, x_ptr, 0, stride_xm, offs_k, M)
+        a1 = _rows_acc(a1, w, x_ptr, 1, stride_xm, offs_k, M)
+        if MB > 2:
+            a2 = _rows_acc(a2, w, x_ptr, 2, stride_xm, offs_k, M)
+            a3 = _rows_acc(a3, w, x_ptr, 3, stride_xm, offs_k, M)
+        if MB > 4:
+            a4 = _rows_acc(a4, w, x_ptr, 4, stride_xm, offs_k, M)
+            a5 = _rows_acc(a5, w, x_ptr, 5, stride_xm, offs_k, M)
+            a6 = _rows_acc(a6, w, x_ptr, 6, stride_xm, offs_k, M)
+            a7 = _rows_acc(a7, w, x_ptr, 7, stride_xm, offs_k, M)
+    _rows_store(y_ptr, a0, 0, stride_ym, offs_n, n_mask, M)
+    _rows_store(y_ptr, a1, 1, stride_ym, offs_n, n_mask, M)
+    if MB > 2:
+        _rows_store(y_ptr, a2, 2, stride_ym, offs_n, n_mask, M)
+        _rows_store(y_ptr, a3, 3, stride_ym, offs_n, n_mask, M)
+    if MB > 4:
+        _rows_store(y_ptr, a4, 4, stride_ym, offs_n, n_mask, M)
+        _rows_store(y_ptr, a5, 5, stride_ym, offs_n, n_mask, M)
+        _rows_store(y_ptr, a6, 6, stride_ym, offs_n, n_mask, M)
+        _rows_store(y_ptr, a7, 7, stride_ym, offs_n, n_mask, M)
+
+
+@triton.jit
+def _gemv_rows_many_kernel(
+    x_ptr, w_ptr, y_ptr, M, N, K, stride_xm, stride_wn, stride_ym,
+    MB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """The same for 9..32 rows (Volta): one [MB, BN, BK] product per K step, partial sums kept
+    across the loop (more separate row accumulators would spill)."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    offs_m = tl.arange(0, MB)
+    n_mask = offs_n < N
+    m_mask = offs_m < M
+    acc = tl.zeros([MB, BN, BK], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        w = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :], mask=n_mask[:, None], other=0.0,
+        )
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :], mask=m_mask[:, None], other=0.0,
+        )
+        acc += x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :]
+    y = tl.sum(acc, axis=2)
+    tl.store(
+        y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :], y.to(y_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def _decode_gemv_volta(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """1..VOLTA_ROWS_MAX_M rows on Volta (K % 128 == 0, unit inner strides); x and weight may be
+    any float dtypes (fp32 accumulation), the output is ``out_dtype`` (default x's)."""
+    M, K = x.shape
+    N = weight.shape[0]
+    if M == 1:
+        return _gemv_m1(x, weight, out_dtype)
+    y = torch.empty(M, N, dtype=out_dtype or x.dtype, device=x.device)
+    if M <= 8:
+        kernel, bn, bk, nw = _gemv_rows_kernel, 16, 128, 8
+    else:
+        kernel, bn, bk, nw = _gemv_rows_many_kernel, 8, 64, 4
+    kernel[(triton.cdiv(N, bn),)](
+        x, weight, y, M, N, K, x.stride(0), weight.stride(0), y.stride(0),
+        MB=triton.next_power_of_2(M), BN=bn, BK=bk, num_warps=nw,
+    )
+    return y
+
+
+def volta_gemv_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """The Volta FMA GEMV applies (decode-sized x, K % 128 == 0, unit inner strides)."""
+    return (
+        x.is_cuda and not _DISABLED and x.dim() == 2 and x.shape[0] <= VOLTA_ROWS_MAX_M
+        and weight.shape[1] % 128 == 0 and x.stride(-1) == 1 and weight.stride(-1) == 1
+        and gpu_family() is GpuFamily.SM70
+    )
+
+
+def volta_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """``x @ weight.T`` in fp32 FMAs, stored as ``out_dtype``, for any float x / weight dtypes
+    (e.g. bf16 activations against the fp32 router weight). Requires volta_gemv_ok()."""
+    return _decode_gemv_volta(x, weight, out_dtype)
+
+
 def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` for ``x: (M, K)``, ``weight: (N, K)``: the skinny kernel up to
     SKINNY_MAX_M rows (bf16), except single rows with K <= 1536 (triton GEMV, as fast there);
     F.linear otherwise. At one row the GEMV's 128-wide K blocks are slow for K = 1920 (w_out:
     53 % of the copy bandwidth vs 89 % on an A4500). Datacenter Blackwell keeps its own dispatch
-    (the full-K GEMV at one row, F.linear otherwise), and so does consumer Blackwell."""
+    (the full-K GEMV at one row, F.linear otherwise), and so does consumer Blackwell. Volta takes
+    FMA kernels up to VOLTA_ROWS_MAX_M rows."""
     M = x.shape[0]
     family = gpu_family() if x.is_cuda else None
     if family in (GpuFamily.SM100, GpuFamily.SM120):
@@ -184,6 +322,11 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     N, K = weight.shape
     if _DISABLED or not x.is_cuda or x.dtype != weight.dtype or K % 128 != 0 or M > SKINNY_MAX_M:
         return F.linear(x, weight)
+    if (
+        family is GpuFamily.SM70 and M <= VOLTA_ROWS_MAX_M
+        and x.stride(-1) == 1 and weight.stride(-1) == 1
+    ):
+        return _decode_gemv_volta(x, weight)
     if (M != 1 or K > 1536) and _skinny_ok(x, weight):
         return skinny_linear(x, weight)
     if M != 1:
@@ -191,9 +334,11 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _gemv_m1(x, weight)
 
 
-def _gemv_m1(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _gemv_m1(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
     N, K = weight.shape
-    y = torch.empty(1, N, dtype=x.dtype, device=x.device)
+    y = torch.empty(1, N, dtype=out_dtype or x.dtype, device=x.device)
     # HBM-streaming configs measured on GH200 (36 distinct weights, graphed):
     # wide outputs like 8 rows/program; narrow outputs want more programs.
     if N >= 4096:
