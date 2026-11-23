@@ -314,7 +314,7 @@ def _ssd_state_pass_pool(
     has_initial_state is false) and writing the final SSM state back into it; the final angle goes
     to fin_ang (written to the pool later: other programs of this sequence still read it).
 
-    SCALED (OLALA_VOLTA_STATE16=fp16, SM70 family): the pool holds fp16 rows (h, p) whose inverse
+    SCALED (OLALA_VOLTA_STATE16=fp16sr / fp16, SM70 family): the pool holds fp16 rows (h, p) whose inverse
     power-of-two scales are in sc_pool (slots, H, P) fp32, as the 16-bit Volta decode step stores them:
     read as fp16 * scale; written as fp16(S * 2^(14 - e)), e the exponent of the row's max |S| (a zero
     row: e = -110), scale 2^(e - 14). A bf16 pool needs no flag (widened on load, rounded to nearest
@@ -485,7 +485,7 @@ def mamba3_mimo_hybrid_pools(
     """:func:`mamba3_mimo_hybrid` reading the entering states from and writing the final states to
     the request pool slots in place (``has_init`` None: every sequence starts from zero).
 
-    ``ssm_scale`` (OLALA_VOLTA_STATE16=fp16): the per-row inverse scales (slots, H, P) fp32 of an fp16
+    ``ssm_scale`` (OLALA_VOLTA_STATE16=fp16sr / fp16): the per-row inverse scales (slots, H, P) fp32 of an fp16
     ssm pool (``_ssd_state_pass_pool`` SCALED)."""
     from .mimo_fwd_varlen import mamba_mimo_forward_varlen
     from .segsum import compute_dacs_segsum_triton_varlen

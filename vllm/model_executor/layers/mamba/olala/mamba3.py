@@ -727,7 +727,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
 
         all_pools = self.kv_cache
         pools = tuple(all_pools[:4])  # (angle, ssm, k, v); ReplaySSM tensors follow
-        # OLALA_VOLTA_STATE16=fp16: the per-row scales of the fp16 state follow
+        # OLALA_VOLTA_STATE16=fp16sr / fp16: the per-row scales of the fp16 state follow
         ssm_scale = all_pools[4] if self._s16_scaled else None
         slots = md.state_indices_tensor
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
@@ -1433,7 +1433,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         out: torch.Tensor,  # (N, d_inner_local)
         slots: torch.Tensor,  # (N,)
         pools: tuple[torch.Tensor, ...],
-        ssm_scale: torch.Tensor | None = None,  # OLALA_VOLTA_STATE16=fp16: per-row scales
+        ssm_scale: torch.Tensor | None = None,  # OLALA_VOLTA_STATE16=fp16sr / fp16: per-row scales
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         H, D = self.nheads_local, self.headdim

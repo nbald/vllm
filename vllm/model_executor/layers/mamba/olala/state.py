@@ -183,8 +183,9 @@ def mamba3_state_shape(
     (nh, 2)``; then the fp8 read copy ``(nh, head_dim, d_state)`` and its
     per-row scales ``(nh, head_dim)`` if enabled.
 
-    With ``OLALA_VOLTA_STATE16=fp16`` a fifth tensor ``(nh, head_dim)`` holds
-    the inverse power-of-two scale of each fp16 state row.
+    With ``OLALA_VOLTA_STATE16=fp16sr`` (the default format) or ``fp16`` a fifth
+    tensor ``(nh, head_dim)`` holds the inverse power-of-two scale of each fp16
+    state row.
     """
     nh = divide(num_heads, tp_world_size)
     shapes: tuple[tuple[int, ...], ...] = (
