@@ -16,11 +16,52 @@ buffer *contents* at stable addresses. The chain itself derives everything
 (active masks, gather rows, in/out slots) in-graph from these tensors.
 """
 
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
+
+
+@lru_cache(maxsize=1)
+def prefill_nosync() -> bool:
+    """OLALA_PREFILL_NOSYNC=1: the Olala builders take the prefill rows'
+    computed-token counts from the CPU (``prefill_computed_cpu``) and no longer
+    copy state slots back to the host, so a prefill step builds its metadata
+    without a device-to-host sync (each one waits for the previous step's GPU
+    work, then the GPU idles through the rest of the input prep)."""
+    return os.environ.get("OLALA_PREFILL_NOSYNC", "0") == "1"
+
+
+def prefill_computed_cpu(
+    m: CommonAttentionMetadata, num_decodes: int, num_prefills: int
+) -> torch.Tensor | None:
+    """(num_prefills,) CPU tokens already computed for each prefill row, or
+    None when the batch carries no CPU sequence lengths (capture dummies).
+
+    Exact: ``seq_lens_cpu_upper_bound`` is the runner's CPU ``num_computed_tokens``
+    plus the scheduled tokens, both exact for prefill rows (it is only an upper
+    bound for async speculative decode rows), and ``query_start_loc_cpu`` holds
+    the scheduled tokens. ``OLALA_PREFILL_NOSYNC_CHECK=1`` compares it with the
+    device value (``seq_lens - query_lens``, one sync) on every call."""
+    ub = m.seq_lens_cpu_upper_bound
+    if ub is None or num_prefills == 0:
+        return None
+    end = num_decodes + num_prefills
+    qsl = m.query_start_loc_cpu
+    computed = ub[num_decodes:end].to(torch.int64) - (
+        qsl[num_decodes + 1 : end + 1] - qsl[num_decodes:end]
+    ).to(torch.int64)
+    if os.environ.get("OLALA_PREFILL_NOSYNC_CHECK") == "1":
+        ref = m.compute_num_computed_tokens()[num_decodes:end].to("cpu", torch.int64)
+        if not torch.equal(computed, ref):
+            raise AssertionError(
+                f"OLALA_PREFILL_NOSYNC: CPU computed tokens {computed.tolist()} "
+                f"!= device {ref.tolist()}"
+            )
+    return computed
 
 
 @dataclass

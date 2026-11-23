@@ -703,10 +703,20 @@ class OlalaDiffTPAAttention(PluggableLayer):
         for L in lengths:
             cu_k.append(cu_k[-1] + L)
         nk = len(keep)
-        meta = torch.tensor([qsl[r] for r in keep] + [qsl[r + 1] for r in keep] + [int(pslots[r]) for r in keep]
+        if pslots is None:
+            # OLALA_PREFILL_NOSYNC: slots stay on the device (no host copy).
+            dev_slots = ms.state_indices_tensor[bt0 : bt0 + nreq]
+            if nk < nreq:
+                dev_slots = dev_slots[torch.tensor(keep, dtype=torch.long).to(dev, non_blocking=True)]
+            pslots_cpu = [0] * nk
+        else:
+            pslots_cpu = [int(pslots[r]) for r in keep]
+        meta = torch.tensor([qsl[r] for r in keep] + [qsl[r + 1] for r in keep] + pslots_cpu
                             + [int(bool(has_init[r])) for r in keep] + [int(x) for x in qsl] + cu_k,
                             dtype=torch.int64).to(dev, non_blocking=True)
         starts, ends, pslots_t = meta[:nk], meta[nk:2 * nk], meta[2 * nk:3 * nk]
+        if pslots is None:
+            pslots_t = dev_slots.to(torch.int64)
         init_t = meta[3 * nk:4 * nk].bool()
         cu_q_dev = meta[4 * nk:4 * nk + nreq + 1].to(torch.int32)
         cu_k_dev = meta[4 * nk + nreq + 1:].to(torch.int32)
@@ -1196,6 +1206,18 @@ class OlalaDiffTPAAttention(PluggableLayer):
         k_prev = torch.empty_like(k_pref)
         v_prev = torch.empty_like(v_pref)
 
+        if md.state_indices_p_cpu is None:
+            # OLALA_PREFILL_NOSYNC: no host copy of the slots; the same copies
+            # with device indices, for every request at once.
+            self._seed_prefill_rows_dev(
+                md, k_pref, v_pref, k_prev, v_prev, slots, k_pool, v_pool, nd, np_
+            )
+            self._blend(
+                k_shift[rows], v_shift[rows], k_pref, v_pref, k_prev, v_prev,
+                alpha_k_all[rows], alpha_v_all[rows], positions[rows],
+            )
+            return
+
         qsl = md.query_start_loc_p_cpu.tolist()
         has_init = md.has_initial_state_cpu.tolist()
         pslots = md.state_indices_p_cpu
@@ -1227,6 +1249,36 @@ class OlalaDiffTPAAttention(PluggableLayer):
             alpha_v_all[rows],
             positions[rows],
         )
+
+    @staticmethod
+    def _seed_prefill_rows_dev(
+        md, k_pref, v_pref, k_prev, v_prev, slots, k_pool, v_pool, nd: int, np_: int
+    ) -> None:
+        """Previous-token K/V of the prefill rows and the pool update, from device
+        slots: row s of a request is seeded from its pool slot (or zero without an
+        initial state), every other row from the row before; each request's last
+        raw K/V is then stored to its slot. Same values as the per-request loop
+        (copies only; the slots of one step are distinct)."""
+        qsl = md.query_start_loc_p_cpu.tolist()
+        keep = [r for r in range(np_) if qsl[r + 1] > qsl[r]]
+        if not keep:
+            return
+        qsl_d = md.query_start_loc_p
+        pslots = slots[nd : nd + np_]
+        init = md.has_initial_state[:np_]
+        starts, ends = qsl_d[:np_], qsl_d[1 : np_ + 1]
+        if len(keep) < np_:
+            idx = torch.tensor(keep, dtype=torch.long).to(k_pref.device, non_blocking=True)
+            pslots, init, starts, ends = pslots[idx], init[idx], starts[idx], ends[idx]
+        pslots, starts, ends = pslots.long(), starts.long(), ends.long()
+        if k_pref.shape[0] > 1:
+            k_prev[1:] = k_pref[:-1]
+            v_prev[1:] = v_pref[:-1]
+        m = init.view(-1, *([1] * (k_pref.dim() - 1)))
+        k_prev.index_copy_(0, starts, torch.where(m, k_pool[pslots].to(k_pref.dtype), 0))
+        v_prev.index_copy_(0, starts, torch.where(m, v_pool[pslots].to(v_pref.dtype), 0))
+        k_pool[pslots] = k_pref[ends - 1].to(k_pool.dtype)
+        v_pool[pslots] = v_pref[ends - 1].to(v_pool.dtype)
 
 
 def olala_diff_tpa(

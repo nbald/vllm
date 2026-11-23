@@ -25,6 +25,8 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.olala_spec_utils import (
     OlalaSpecMetadata,
     build_olala_spec_metadata,
+    prefill_computed_cpu,
+    prefill_nosync,
 )
 from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
@@ -173,8 +175,17 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             has_initial_state = m.compute_num_computed_tokens()[num_decodes:] > 0
             qsl = m.query_start_loc[num_decodes:]
             query_start_loc_p = qsl - qsl[0]
-            # One sync here, on prefill steps only, instead of one per layer.
-            has_initial_state_cpu = has_initial_state.to("cpu")
+            computed_cpu = (
+                prefill_computed_cpu(m, num_decodes, num_prefills)
+                if prefill_nosync()
+                else None
+            )
+            if computed_cpu is not None:
+                # OLALA_PREFILL_NOSYNC: from the CPU, no device-to-host copy.
+                has_initial_state_cpu = computed_cpu > 0
+            else:
+                # One sync here, on prefill steps only, instead of one per layer.
+                has_initial_state_cpu = has_initial_state.to("cpu")
             has_initial_any = bool(has_initial_state_cpu.any())
             qsl_cpu = m.query_start_loc_cpu[num_decodes:]
             query_start_loc_p_cpu = qsl_cpu - qsl_cpu[0]

@@ -236,8 +236,19 @@ class OlalaTPAFactorMetadataBuilder(AttentionMetadataBuilder[OlalaTPAFactorMetad
         if np_ > 0:
             qsl_cpu = m.query_start_loc_cpu[nd:]
             qsl_p = (qsl_cpu - qsl_cpu[0]).tolist()
-            seq_p = m.seq_lens[nd:].tolist()
-            computed = m.compute_num_computed_tokens()[nd:].tolist()
+            from vllm.v1.attention.backends.olala_spec_utils import (
+                prefill_computed_cpu,
+                prefill_nosync,
+            )
+
+            computed_t = prefill_computed_cpu(m, nd, np_) if prefill_nosync() else None
+            if computed_t is not None:
+                # OLALA_PREFILL_NOSYNC: CPU values (exact for prefill rows), no sync.
+                computed = computed_t.tolist()
+                seq_p = (computed_t + torch.diff(qsl_cpu[: np_ + 1])).tolist()
+            else:
+                seq_p = m.seq_lens[nd:].tolist()
+                computed = m.compute_num_computed_tokens()[nd:].tolist()
             init_p = [c > 0 for c in computed]
             pos_p = computed
         return OlalaTPAFactorMetadata(
