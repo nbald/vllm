@@ -40,14 +40,23 @@ own paths replace emulated tensor-core code with fp32 FMA code:
 
 - the decode projections take FMA GEMVs up to 32 rows, and so do the router at decode sizes (the hi + lo halves
   of its bf16x2 split as one fp32 weight) and the LM head up to 16 sequences;
-- the Mamba-3 decode step runs its scalar-FMA update (`-DSTEP_VOLTA`, two CTAs per SM);
+- the router of 33-2048-token batches runs fp32 FMA chains (`router_chain_volta.cu`) that return cuBLAS's logits
+  bit for bit (cuBLAS runs this bf16 GEMM as fp32 SIMT chains on a V100, with few CTAs); `OLALA_ROUTER_CHAIN=0`
+  keeps cuBLAS;
+- the Mamba-3 decode step runs its scalar-FMA update (`-DSTEP_VOLTA`); with an fp32 state, the state goes straight
+  to registers, all loads in flight at once, three CTAs per SM (`mamba3_step_volta_kernel`, the 1-stage kernel's
+  bits; `OLALA_STEP_PIPE=0` keeps that one);
 - the TPA-factor decode attention has an FMA kernel (`tpa_factor_decode_volta.cu`), with one-tile splits and a
   4-head split merge;
 - the latent-MoE small path covers up to 32 tokens; above, the medium path's projections take the same GEMV
   dispatch and its grouped GEMMs one 16x64x32 single-stage tile;
 - the Mamba-3 prefill's chunk-state and output-pass kernels and the DiffTPA prefill attention have FMA editions
   (`mamba3_chunk_state_volta.cu`, `mamba3_scan_prefill_volta.cu`, `tpa_prefill_attn_volta.cu`) that return the SM80
-  kernels' and FlashAttention-2's values, bit for bit through volta-forever (`OLALA_VOLTA_PREFILL=0` keeps those).
+  kernels' and FlashAttention-2's values, bit for bit through volta-forever (`OLALA_VOLTA_PREFILL=0` keeps those);
+- unquantized routed experts above the medium path (prefill chunks) take 16-row single-stage tiles in vLLM's fused
+  MoE kernel (same bits as its default tiles);
+- the Triton kernels that the first requests would compile (Mamba-3 and TPA-factor prefill, LM head, logprobs) are
+  compiled at start for every specialization a batch can hit (`vllm/model_executor/warmup/olala_triton_warmup.py`).
 
 On a V100-SXM2-32GB through volta-forever this takes the bf16 model from 55 to 174 tok/s of decode at one
 request, from 12.6 to 72 tok/s per request at eight, and its prefill (480-token prompts) from ~1590 to ~2700
