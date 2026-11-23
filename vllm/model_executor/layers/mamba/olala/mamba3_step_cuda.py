@@ -11,6 +11,10 @@ per layer vs 57 us (CuteDSL); B=16: 11.4 vs 15.1; B=1: 3.8 vs 6.1.
 An fp32 SSM pool runs the update and the C dot as fp32 FMAs on the unrounded
 state (matches the CuteDSL fp32 step to ~1e-4 relative). GH200, B=64: 73 us
 vs 80 us (CuteDSL); B=16: 17.5 vs 18.5.
+
+On the SM70 family, ``OLALA_VOLTA_STATE16`` stores the state in 16 bits (bf16,
+or fp16 with per-row power-of-two scales) and the Volta step computes it in
+fp32, rounding only what it stores (``state16`` below).
 """
 
 from __future__ import annotations
@@ -93,7 +97,8 @@ def _load():
 def cuda_step_supported(ssm_pool, k_pool, v_pool, angle_pool, B, C, angle, num_heads, head_dim, d_state, rank, num_angles) -> bool:
     return (
         num_heads == 48 and head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
-        and ssm_pool.dtype in (torch.float32, torch.bfloat16) and k_pool.dtype == torch.bfloat16 and v_pool.dtype == torch.bfloat16
+        and ssm_pool.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and k_pool.dtype == torch.bfloat16 and v_pool.dtype == torch.bfloat16
         and angle_pool.dtype == torch.float32
         and B.dim() == 3 and B.stride(1) == d_state and B.stride(2) == 1 and (B.stride(0) * 2) % 16 == 0
         and C.stride() == B.stride() and angle.stride(1) == 1 and (angle.stride(0) * 2) % 16 == 0
@@ -128,10 +133,21 @@ def _as_f32(t: torch.Tensor) -> torch.Tensor:
 
 
 def mamba3_step_cuda(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
-                     bias_q, bias_k, angle_proj, slots, y, ctas_per_sm: int = 4) -> None:
-    """B, C: (N, R, S) views (any batch stride); angle_proj: (N, 32) view; everything else contiguous."""
+                     bias_q, bias_k, angle_proj, slots, y, ctas_per_sm: int = 4, ssm_scale=None,
+                     state16: int = 0) -> None:
+    """B, C: (N, R, S) views (any batch stride); angle_proj: (N, 32) view; everything else contiguous.
+
+    ``state16`` (SM70 family, ``OLALA_VOLTA_STATE16``, see ``state.volta_state16``): 1 = bf16 state pool, 2 = fp16
+    state pool with the per-row inverse scales in ``ssm_scale`` (P, H, D) fp32, 3 / 4 = the same with stochastic
+    rounding. The step then computes in fp32 and rounds only the stored state (``mamba3_step_volta16_kernel``), at
+    any batch size."""
     Dp = _fp32(Dp)
     A, dt, trap = _as_f32(A), _as_f32(dt), _as_f32(trap)
+    if state16:
+        _load().step(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
+                     bias_q, bias_k, angle_proj, slots, y, ctas_per_sm, pdl=pdl_enabled(), ssm_scale=ssm_scale,
+                     state16=state16)
+        return
     _load().step(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
                  bias_q, bias_k, angle_proj, slots, y, ctas_per_sm, pdl=pdl_enabled())
 
