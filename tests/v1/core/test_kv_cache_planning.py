@@ -1705,6 +1705,34 @@ def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
     assert unified_draft_spec.page_size_bytes == target_spec.page_size_bytes
 
 
+@pytest.mark.parametrize("floor_scale", [None, "0", "1"])
+def test_unify_kv_cache_page_size_floor_scale_is_opt_in(monkeypatch, floor_scale):
+    """VLLM_UNIFY_FLOOR_SCALE=1 scales a much smaller, non-dividing attention page
+    by the whole page ratio before padding the remainder (a 4-KV-head drafter
+    next to a 12-KV-head target page that is not an exact multiple); unset or 0,
+    the page is padded as is."""
+    if floor_scale is None:
+        monkeypatch.delenv("VLLM_UNIFY_FLOOR_SCALE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_UNIFY_FLOOR_SCALE", floor_scale)
+    target_spec = new_kv_cache_spec(
+        block_size=16, num_kv_heads=13, head_size=128, dtype=torch.bfloat16
+    )
+    draft_spec = new_kv_cache_spec(
+        block_size=16, num_kv_heads=4, head_size=128, dtype=torch.bfloat16
+    )
+    unified = kv_cache_planning.unify_kv_cache_spec_page_size(
+        {"target_attn": target_spec, "draft_attn": draft_spec}
+    )
+    assert unified["target_attn"] == target_spec
+    draft = unified["draft_attn"]
+    assert draft.page_size_bytes == target_spec.page_size_bytes
+    ratio = 3 if floor_scale == "1" else 1  # 13 // 4 whole drafter pages per target page
+    assert draft.block_size == ratio * draft_spec.block_size
+    assert draft.real_page_size_bytes == ratio * draft_spec.real_page_size_bytes
+    assert draft.page_size_padded == target_spec.page_size_bytes
+
+
 def test_unify_hybrid_kv_cache_specs():
     # 1. has_full_attention and has_sliding_window
     before_spec_1 = new_kv_cache_spec(block_size=64)
