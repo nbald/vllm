@@ -76,11 +76,16 @@ def _load():
     # One build per arch: the build directory is shared (e.g. a cache volume
     # mounted on H100 and A4500 nodes alike); sm_90 keeps its historical name.
     name = "olala_mamba3_step" if sm == "90" else f"olala_mamba3_step_sm{sm}"
-    return load_extension(
-        name,
-        "mamba3_step.cu",
-        ["-O3", "-std=c++20", gencode()],
-    )
+    flags = ["-O3", "-std=c++20", gencode()]
+    if gpu_family() is GpuFamily.SM70:
+        # V100 (told sm_80 by volta-forever): the bf16 mma.sync / ldmatrix of the
+        # fp32-state step are emulated with scalar code there, so build the scalar
+        # FMA update (STEP_VOLTA, csrc/mamba3_step.cu). V100 through volta-forever,
+        # fp32 state, graphed: 63 -> 12 us per layer at batch 1, 682 -> 87 us at 8,
+        # 1296 -> 162 us at 16.
+        name += "_volta"
+        flags.append("-DSTEP_VOLTA")
+    return load_extension(name, "mamba3_step.cu", flags)
 
 
 def cuda_step_supported(ssm_pool, k_pool, v_pool, angle_pool, B, C, angle, num_heads, head_dim, d_state, rank, num_angles) -> bool:

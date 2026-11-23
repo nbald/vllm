@@ -12,6 +12,14 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+// STEP_VOLTA (mamba3_step_cuda.py on a V100, natively or through volta-forever): sm_70 has no bf16 mma.sync, ldmatrix
+// or cp.async, so volta-forever emulates them with scalar code (one bf16 m16n8k16 ~ 200 instructions, cp.async as a
+// synchronous copy) while plain fp32 FMA runs natively. The fp32-state step then takes the scalar FMA update + C dot
+// (STEP_F32_FMA, same math as the tensor-core split) in the 1-stage kernel instead of the tensor-core pipeline.
+#if defined(STEP_VOLTA) && !defined(STEP_F32_FMA)
+#define STEP_F32_FMA
+#endif
+
 namespace {
 constexpr int H = 48, D = 64, S = 128, R = 4, NA = 32;
 #ifndef STEP_NST
@@ -676,9 +684,15 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
       kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
     }
   };
-  // fp32 state, preamble done upstream: the pipelined kernel (OLALA_STEP_PIPE=0 keeps the 1-stage one)
+  // fp32 state, preamble done upstream: the pipelined kernel (OLALA_STEP_PIPE=0 keeps the 1-stage one); on Volta
+  // the 1-stage kernel with the FMA update (the pipelined one is tensor-core code throughout)
+#ifdef STEP_VOLTA
+  constexpr bool volta = true;
+#else
+  constexpr bool volta = false;
+#endif
   static const bool pipe = [] { const char* e = getenv("OLALA_STEP_PIPE"); return !(e && e[0] == '0'); }();
-  if (f32 && !a.raw && pipe) launch(mamba3_step_f32_pipe_kernel, (int)sizeof(SmemP));
+  if (f32 && !a.raw && pipe && !volta) launch(mamba3_step_f32_pipe_kernel, (int)sizeof(SmemP));
   else if (f32) launch(mamba3_step_cuda_kernel<true>, (int)sizeof(Smem<true>));
   else launch(mamba3_step_cuda_kernel<false>, (int)sizeof(Smem<false>));
 }
