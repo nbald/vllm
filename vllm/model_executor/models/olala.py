@@ -30,7 +30,6 @@ import functools
 import math
 import os
 from collections.abc import Callable, Iterable
-from itertools import islice
 
 import torch
 import torch.nn.functional as F
@@ -111,9 +110,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
 )
@@ -1257,7 +1258,7 @@ class OlalaMonoBlock(nn.Module):
         "inputs_embeds": 0,
     }
 )
-class OlalaModel(nn.Module):
+class OlalaModel(nn.Module, EagleModelMixin):
     """Token embedding, a stack of :class:`OlalaMonoBlock`, optional norm."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1333,8 +1334,16 @@ class OlalaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        # Speculative drafters (EAGLE-3 / DFlash) read the residual stream after
+        # some layers. Index l + 1 in aux_hidden_state_layers captures the
+        # output of layer l, so a geodesic update still pending at that
+        # boundary is applied here instead of inside the next Mamba in_proj.
+        aux_hidden_states = self._maybe_add_hidden_state(
+            [], self.start_layer, hidden_states, None
+        )
         pending = None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
             if layer.geo_fuse:
                 hidden_states, pending = layer(
                     positions=positions, hidden_states=hidden_states, pending=pending
@@ -1344,12 +1353,20 @@ class OlalaModel(nn.Module):
                     hidden_states = pending[1](hidden_states, pending[0])
                     pending = None
                 hidden_states = layer(positions=positions, hidden_states=hidden_states)
+            if idx + 1 in self.aux_hidden_state_layers:
+                if pending is not None:
+                    hidden_states = pending[1](hidden_states, pending[0])
+                    pending = None
+                aux_hidden_states.append(hidden_states)
         if pending is not None:
             hidden_states = pending[1](hidden_states, pending[0])
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
-        return self.final_norm(hidden_states)
+        hidden_states = self.final_norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 def moe_layer_indices(config) -> list[int]:
@@ -1370,6 +1387,7 @@ class OlalaForCausalLM(
     MixtureOfExperts,
     SupportsPP,
     SupportsLoRA,
+    SupportsEagle3,
 ):
     """Olala causal LM with paged KV and paged recurrent state."""
 
@@ -1499,6 +1517,12 @@ class OlalaForCausalLM(
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # Outputs of layers 1, 9, 17, 25 and 33 of 36: the DFlash / DSpine
+        # spread (second layer to third-from-last) for a 36-layer target.
+        n = len(self.model.layers)
+        return tuple(i + 1 for i in (1, n // 4, n // 2 - 1, 3 * n // 4 - 2, n - 3))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
