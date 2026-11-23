@@ -96,6 +96,7 @@ def transitions_fn(
     candidate_ids: torch.Tensor,
     predecessor_ids: torch.Tensor,
     head_w: torch.Tensor,
+    head_scale: torch.Tensor | None,
     codebook: torch.Tensor,
     w_read: torch.Tensor,
     w_recv: torch.Tensor,
@@ -119,7 +120,17 @@ def transitions_fn(
         * projected
         / (projected.norm(dim=-1, keepdim=True) + eps)
     ).to(dtype)
-    successor_weights = head_w[candidate_ids.long()].float()
+    ids = candidate_ids.long()
+    successor_weights = head_w[ids].float()
+    if head_scale is not None:
+        # INT8 W8A16 head (OLALA_DSPINE_SHARED_HEAD): dequantized rows, per
+        # channel or per group (qwen3_dspine.head_rows).
+        s = head_scale[ids].float()
+        if head_scale.dim() == 1:
+            successor_weights = successor_weights * s.unsqueeze(-1)
+        else:
+            group = head_w.shape[1] // head_scale.shape[1]
+            successor_weights = successor_weights * s.repeat_interleave(group, dim=-1)
     exact = codebook[predecessor_ids].float() * math.sqrt(transfer_dim)
     gate = torch.sigmoid(
         F.linear(receiver_features[:, :, None, :], w_recv).float()
@@ -199,6 +210,7 @@ def score_transitions(
         candidate_ids,
         predecessor_ids,
         lm_head.weight,
+        None if lm_head.weight.is_floating_point() else lm_head.weight_scale,
         transfer_codebook,
         injection.readouts[final_layer_idx].weight,
         injection.receiver_gate.weight,
