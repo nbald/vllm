@@ -44,10 +44,13 @@ own paths replace emulated tensor-core code with fp32 FMA code:
 - the TPA-factor decode attention has an FMA kernel (`tpa_factor_decode_volta.cu`), with one-tile splits and a
   4-head split merge;
 - the latent-MoE small path covers up to 32 tokens; above, the medium path's projections take the same GEMV
-  dispatch and its grouped GEMMs one 16x64x32 single-stage tile.
+  dispatch and its grouped GEMMs one 16x64x32 single-stage tile;
+- the Mamba-3 prefill's chunk-state and output-pass kernels and the DiffTPA prefill attention have FMA editions
+  (`mamba3_chunk_state_volta.cu`, `mamba3_scan_prefill_volta.cu`, `tpa_prefill_attn_volta.cu`) that return the SM80
+  kernels' and FlashAttention-2's values, bit for bit through volta-forever (`OLALA_VOLTA_PREFILL=0` keeps those).
 
 On a V100-SXM2-32GB through volta-forever this takes the bf16 model from 55 to 174 tok/s of decode at one
-request, from 12.6 to 72 tok/s per request at eight, and its prefill (480-token prompts) from ~1590 to ~1960
+request, from 12.6 to 72 tok/s per request at eight, and its prefill (480-token prompts) from ~1590 to ~2700
 tok/s; `OLALA_VOLTA=0` gives the SM80 dispatch back, token for token.
 
 ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
