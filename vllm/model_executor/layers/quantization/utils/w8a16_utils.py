@@ -118,8 +118,8 @@ def _volta_decode_ok(x: torch.Tensor, segs: list[Segment], cfg) -> bool:
 
 @functools.cache
 def volta_tc():
-    """The fp16 tensor-core edition of the SM70 family (OLALA_VOLTA_TC=1: olala/volta_tc.py),
-    or None (off: every path below is unchanged)."""
+    """The fp16 tensor-core edition of the SM70 family (olala/volta_tc.py, on by default there),
+    or None (other GPUs, or OLALA_VOLTA_TC=0: every path below is unchanged)."""
     from vllm.model_executor.layers.mamba.olala import volta_tc as tc
 
     return tc if tc.tc_enabled() else None

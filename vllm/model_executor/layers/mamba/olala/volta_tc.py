@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Volta (SM70 family): dense linears on the V100's fp16 tensor cores, exactly scaled (opt-in).
+"""Volta (SM70 family): dense linears on the V100's fp16 tensor cores, exactly scaled.
 
 On a V100 (natively, or through volta-forever, which tells the process sm_80) the bf16
 tensor-core instructions are emulated with scalar code and cuBLAS has no bf16 tensor-core
@@ -9,7 +9,9 @@ GEMM, and the bf16 model's projections that GEMM, at 3-10 TFLOPS. Volta does hav
 cores (HMMA), and cuBLAS 12.9 (which volta-forever forwards CUDA 13's cuBLAS to) has native
 Volta fp16 GEMMs: 23-66 TFLOPS on these shapes.
 
-``OLALA_VOLTA_TC=1`` (default off; SM70 family only) moves the registered linears to them from
+On the SM70 family this edition is on by default (``OLALA_VOLTA_TC`` unset or ``1``: the
+DEFAULT_KINDS, W8A16 linears and the bf16 model's dense projections; ``0`` turns it off, a comma
+list picks kinds; other GPUs never take it). It moves the registered linears to them from
 ``min_rows`` activation rows on (decode batches and prefill), with exact operands:
 
 - weights: an fp16 copy per weight, made once. INT8 codes are exact in fp16 (W8A16, the
@@ -30,8 +32,11 @@ Volta fp16 GEMMs: 23-66 TFLOPS on these shapes.
   depends on that row only: graph-safe, independent of the batch composition.
 
 A rounding-level change against the emulated kernels (fp32 tensor-core sums in cuBLAS's order
-instead of one fp32 chain), hence opt-in. ``OLALA_VOLTA_TC_STATS=1`` counts the rows per number
-of terms and the fallback rows per linear (device counters; read with ``stats()``).
+instead of one fp32 chain): outputs stay at the CPU-bf16 level of the checkpoints, and
+``OLALA_VOLTA_TC=0`` gives the previous outputs bit for bit. The routed experts ("moe") are
+opt-in only: on chat_math they moved one confident prompt position per quantized checkpoint.
+``OLALA_VOLTA_TC_STATS=1`` counts the rows per number of terms and the fallback rows per linear
+(device counters; read with ``stats()``).
 """
 
 import functools
@@ -58,15 +63,19 @@ _NSTAT = MAX_TERMS + 2
 
 
 KINDS = ("int8", "bf16", "moe")
-DEFAULT_KINDS = ("int8", "bf16")  # OLALA_VOLTA_TC=1
+# OLALA_VOLTA_TC unset or "1". vllm/envs.py keys this default into the compile cache when the
+# variable is unset (compile_factors): keep the two in step.
+DEFAULT_KINDS = ("int8", "bf16")
 
 
 @functools.cache
 def _kinds() -> frozenset[str]:
-    """OLALA_VOLTA_TC on the SM70 family (V100, native or through volta-forever): "1" = the
-    DEFAULT_KINDS, or a comma list of KINDS ("int8": W8A16 linears, "bf16": the bf16 model's dense
-    projections, "moe": the weight-only routed experts above the small path)."""
-    raw = os.environ.get("OLALA_VOLTA_TC", "0").strip()
+    """OLALA_VOLTA_TC on the SM70 family (V100, native or through volta-forever): unset or "1" =
+    the DEFAULT_KINDS, "0" (or empty) = off, or a comma list of KINDS ("int8": W8A16 linears,
+    "bf16": the bf16 model's dense projections, "moe": the weight-only routed experts above the
+    small path). Never on other GPUs."""
+    raw = os.environ.get("OLALA_VOLTA_TC")
+    raw = "1" if raw is None else raw.strip()
     if raw in ("", "0") or not torch.cuda.is_available() or gpu_family() is not GpuFamily.SM70:
         return frozenset()
     kinds = frozenset(DEFAULT_KINDS) if raw == "1" else frozenset(raw.split(","))

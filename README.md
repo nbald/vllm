@@ -18,6 +18,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
 | `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). The extensions are built for the running GPU (SM80 or later, see GPU support below); if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
 | `OLALA_VOLTA` | auto | Volta (V100) detection, see GPU support below: auto = a native sm_70 GPU, or a process running through volta-forever (`VOLTA_FOREVER` set, or its `libcuda.so.1` proxy loaded); `1` / `0` forces the SM70 family on / off (`0` = the dispatch of the capability the process is told, e.g. SM80 through volta-forever). |
+| `OLALA_VOLTA_TC` | `int8,bf16` on SM70 | SM70 family: the fp16 tensor-core edition (`olala/volta_tc.py`). The W8A16 linears (`int8`) and the bf16 model's dense projections (`bf16`) run on cuBLAS's fp16 HMMA GEMMs from 9 activation rows (33 for linears whose rows need 2-3 exact fp16 terms) and in prefill, with exactly scaled operands; fp16 weight copies cost about 2 GiB. Unset or `1` = those two kinds; `0` = off (the FMA and emulated paths, their outputs bit for bit); a comma list picks kinds, `moe` adds the routed experts above 32 tokens (not in the default: on chat_math it moved one confident prompt position per quantized checkpoint). Ignored on other GPUs. |
 | `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
 | `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
 
@@ -61,6 +62,16 @@ own paths replace emulated tensor-core code with fp32 FMA code:
 On a V100-SXM2-32GB through volta-forever this takes the bf16 model from 55 to 174 tok/s of decode at one
 request, from 12.6 to 72 tok/s per request at eight, and its prefill (480-token prompts) from ~1590 to ~2700
 tok/s; `OLALA_VOLTA=0` gives the SM80 dispatch back, token for token.
+
+From 9 rows, the projections then leave those paths for Volta's fp16 tensor cores (`OLALA_VOLTA_TC`, on by
+default): an fp16 copy of each weight (INT8 codes exactly; bf16 rows scaled by a power of two, with a sparse
+term for the few elements that do not fit), each activation row split into one to three exactly scaled fp16
+terms, cuBLAS 12.9's native HMMA GEMM with fp32 sums, and a per-row FMA fallback for the rare rows the terms
+do not cover. Outputs stay at the CPU-bf16 level of the checkpoints. Through volta-forever on a
+V100-SXM2-32GB, decode per request at 32 / 128 requests and the TTFT of a 480-token prompt: bf16 20.7 -> 31.3
+/ 6.9 -> 10.7 tok/s, 0.177 -> 0.110 s; Q8 24.2 -> 32.5 / 7.8 -> 12.0, 0.192 -> 0.106 s; Q4A2 22.2 -> 29.0 /
+7.5 -> 11.1, 0.196 -> 0.115 s; 1-8 rows unchanged; 1.8-2.8 GiB less KV cache (the fp16 weight copies take
+about 2 GiB). `OLALA_VOLTA_TC=0` gives the previous outputs back, bit for bit.
 
 ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
 

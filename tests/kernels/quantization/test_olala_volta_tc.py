@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The Volta fp16 tensor-core edition (olala/volta_tc.py, OLALA_VOLTA_TC): W8A16 and bf16 linears
-against fp64, the exactness of the activation terms, the per-row fallback (rows the terms do not
-cover, non-finite rows), CUDA-graph replay against eager, the W8A16 dispatch, and the routed-expert
-kernel (INT8 per row and INT4 affine experts) against fp64. SM70 family only (a V100, natively or
-through volta-forever)."""
+"""The Volta fp16 tensor-core edition (olala/volta_tc.py, OLALA_VOLTA_TC, on by default on this
+family): the switch on this GPU, W8A16 and bf16 linears against fp64, the exactness of the
+activation terms, the per-row fallback (rows the terms do not cover, non-finite rows), CUDA-graph
+replay against eager, the W8A16 dispatch, and the routed-expert kernel (INT8 per row and INT4
+affine experts) against fp64. SM70 family only (a V100, natively or through volta-forever)."""
 
 import pytest
 import torch
@@ -28,6 +28,27 @@ def tc(monkeypatch):
     yield volta_tc
     volta_tc._kinds.cache_clear()
     wu.volta_tc.cache_clear()
+
+
+@pytest.mark.parametrize("raw,on", [(None, True), ("1", True), ("0", False)])
+def test_switch_on_this_gpu(monkeypatch, raw, on):
+    """Unset = on (int8 and bf16, not moe), "0" = off: the dispatch reads it."""
+    from vllm.model_executor.layers.mamba.olala import volta_tc
+    import vllm.model_executor.layers.quantization.utils.w8a16_utils as wu
+
+    if raw is None:
+        monkeypatch.delenv("OLALA_VOLTA_TC", raising=False)
+    else:
+        monkeypatch.setenv("OLALA_VOLTA_TC", raw)
+    volta_tc._kinds.cache_clear()
+    wu.volta_tc.cache_clear()
+    try:
+        assert (wu.volta_tc() is not None) == on
+        assert volta_tc.tc_enabled("int8") == on and volta_tc.tc_enabled("bf16") == on
+        assert not volta_tc.tc_enabled("moe")
+    finally:
+        volta_tc._kinds.cache_clear()
+        wu.volta_tc.cache_clear()
 
 
 def _int8(n, k, gen):

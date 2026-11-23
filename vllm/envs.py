@@ -2516,6 +2516,12 @@ def compile_factors() -> dict[str, object]:
     for var in sorted(os.environ):
         if var.startswith("OLALA_") and var != "OLALA_TPA_BUILD_DIR":
             factors[var] = normalize_value(os.environ[var])
+    # OLALA_VOLTA_TC was off when unset; it now defaults to the DEFAULT_KINDS of
+    # olala/volta_tc.py on the SM70 family. Key that default explicitly, so that a
+    # graph cached with the variable unset before the change is never reused with
+    # the new default (a constant: other GPUs recompile once, nothing else changes).
+    if "OLALA_VOLTA_TC" not in os.environ:
+        factors["OLALA_VOLTA_TC"] = "default:int8,bf16"
     if "VOLTA_FOREVER" in os.environ:
         factors["VOLTA_FOREVER"] = True
 

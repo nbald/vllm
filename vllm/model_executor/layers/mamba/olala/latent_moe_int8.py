@@ -1846,7 +1846,7 @@ def wq_routed_experts(
     D2 = w2.n
     dev = x.device
     MK = M * top_k
-    # OLALA_VOLTA_TC=moe: the grouped GEMMs on Volta's fp16 tensor cores (volta_tc.py)
+    # OLALA_VOLTA_TC with "moe" (opt-in): the grouped GEMMs on Volta's fp16 tensor cores
     volta_tc_moe = configs is None and _volta_moe_tc(w13, w2)
     if configs is None and gpu_family(x.device) is GpuFamily.SM70:
         configs = (_PREFILL_VOLTA, _PREFILL_VOLTA)

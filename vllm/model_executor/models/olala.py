@@ -1623,7 +1623,7 @@ class OlalaForCausalLM(
             # dtype as cuBLAS (fp32 accumulation, logits rounded to bf16).
             logits = decode_gemv(hidden_states, head.weight)
         elif plain_head and gpu_family() is GpuFamily.SM70:
-            # OLALA_VOLTA_TC=1: the fp16 tensor cores, exactly scaled (volta_tc.py)
+            # OLALA_VOLTA_TC (on by default): the fp16 tensor cores, exactly scaled (volta_tc.py)
             from vllm.model_executor.layers.mamba.olala.volta_tc import bf16_linear
 
             logits = bf16_linear(hidden_states, head.weight)

@@ -112,7 +112,7 @@ class ModelOptW8A16LinearMethod(LinearMethodBase):
         from vllm.model_executor.layers.quantization.utils.w8a16_utils import volta_tc
 
         if (tc := volta_tc()) is not None:
-            # SM70 family, OLALA_VOLTA_TC=1: the fp16 copy of the tensor-core edition
+            # SM70 family, OLALA_VOLTA_TC (on by default): the fp16 copy of the tensor-core edition
             tc.register_int8_layer(layer)
 
     def apply(
