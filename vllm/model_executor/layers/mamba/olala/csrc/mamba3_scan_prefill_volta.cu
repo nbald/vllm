@@ -9,10 +9,12 @@
 // (fma.rn.f32, one term after the other, in the order of k), so under volta-forever this kernel returns the sm80
 // kernel's bits; on other GPUs (whose tensor cores add differently) it is rounding-level close to it.
 //
-// One CTA (8 warps, ~92 KB of shared memory) per (128-token chunk, head), 8-token sub-blocks (32 MIMO rows,
+// One CTA (8 warps, ~93 KB of shared memory) per (128-token chunk, head), 8-token sub-blocks (32 MIMO rows,
 // row = token * R + rank). Per sub-block:
-//   prep    thread (token tid >> 5, rank (tid >> 3) & 3, column chunk tid & 7), as the sm80 kernel: qhat, khat * ts * e,
-//           PsiV, gate, from registers loaded one sub-block ahead;
+//   prep    thread (token tid >> 5, rank (tid >> 3) & 3, j = tid & 7): qhat and khat * ts * e of columns 32 g + 4 j ..
+//           + 3 (g = 0..3: every thread rotates 4 of the (n, n + 64) pairs), PsiV and gate of columns 8 j .. + 7, from
+//           registers loaded one sub-block ahead; the sm80 kernel's bf16 instructions, which volta-forever runs as
+//           sequences of 10-35 instructions, are computed directly (see bf16r);
 //   phase 1 warp w, lane l: o rows of token w (its 4 ranks) x p cols 2 l, 2 l + 1 over n = 0..127, and G rows of
 //           that token x j col l;
 //   phase 2 o += G @ PsiV (j = 0..31), D skip, gate, sum over the ranks in the thread; the state (fp32 registers,
@@ -39,18 +41,13 @@ struct Smem {
   float gz[ROWS * P];      // phi_r * silu(z * zeta_r) [row][p]
   float g[ROWS * LDG];     // masked G [row i][row j], bf16-rounded
   float tok[C][4];         // da_cs, da_cs_rev, ts, gamma per token
-  __nv_bfloat16 qb[R * N], kb[R * N], psi[R * P];
+  float qb[R * N], kb[R * N], psi[R * P];  // rounded to bf16
   float phi[R * P], zeta[R * P];
 };
 
-union U8 {
-  uint4 u;
-  __nv_bfloat162 h2[4];
-};
-
 struct Raw {
-  uint4 q[2], k[2];  // rank (tid >> 3) & 3 of token tid >> 5, columns 8 j and 64 + 8 j
-  float4 th[2];      // thl, columns 8 j .. 8 j + 7 (j < 4)
+  uint2 q[4], k[4];  // rank (tid >> 3) & 3 of token tid >> 5, columns 32 g + 4 j .. 32 g + 4 j + 3
+  float4 th;         // thl, columns 4 j .. 4 j + 3
   uint4 v, z;        // columns 8 j .. 8 j + 7
   float dcs, dcsr, ts, gam;
 };
@@ -77,23 +74,37 @@ __device__ __forceinline__ uint4 ld8(const __nv_bfloat16* __restrict__ p, bool v
   return make_uint4(o[0], o[1], o[2], o[3]);
 }
 
-__device__ __forceinline__ float rbf(float x) { return __bfloat162float(__float2bfloat16(x)); }
+// The sm80 kernel's bf16 roundings, computed in fp32. bf16r(x): x rounded to bf16 (to nearest, ties to even; NaN to
+// 0x7fff), kept as fp32: cvt.rn.bf16.f32 as volta-forever runs it (integer rounding of the bit pattern) and the
+// hardware does. A bf16 sum or product (__hadd2, __hmul2: fma.rn.bf16x2, which volta-forever runs with directed
+// fp32 fmas and a rounding to odd) is the fp32 sum or product rounded once to bf16: the product of two bf16 is exact
+// in fp32, and fp32 has the 2 x 8 + 2 bits that make the double rounding of a sum innocuous. Those fp32 operations
+// keep subnormals (explicit forms), as the bf16 units and volta-forever's sequences do.
+__device__ __forceinline__ float bf16r(float x) {
+  const unsigned b = __float_as_uint(x);
+  const unsigned r = (b + 0x7fffu + ((b >> 16) & 1u)) & 0xffff0000u;
+  return __uint_as_float((b & 0x7fffffffu) > 0x7f800000u ? 0x7fff0000u : r);
+}
+__device__ __forceinline__ float add_rn(float a, float b) {
+  float d;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+  return d;
+}
+__device__ __forceinline__ float mul_rn(float a, float b) {
+  float d;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+  return d;
+}
+__device__ __forceinline__ float bf_lo(unsigned w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf_hi(unsigned w) { return __uint_as_float(w & 0xffff0000u); }
 __device__ __forceinline__ float tanh_approx(float x) {
   float y;
   asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
-// the 8 bf16 of u as fp32, into 8 consecutive floats of shared memory
-__device__ __forceinline__ void st8f(float* dst, const U8& u) {
-  float2 f[4];
-#pragma unroll
-  for (int e = 0; e < 4; ++e) f[e] = __bfloat1622float2(u.h2[e]);
-  reinterpret_cast<float4*>(dst)[0] = make_float4(f[0].x, f[0].y, f[1].x, f[1].y);
-  reinterpret_cast<float4*>(dst)[1] = make_float4(f[2].x, f[2].y, f[3].x, f[3].y);
-}
 
-// thread: token tid >> 5, rank (tid >> 3) & 3, column chunk j = tid & 7 (qhat / khat: 8 j and 64 + 8 j;
-// PsiV / gate: 8 j)
+// thread: token tid >> 5, rank (tid >> 3) & 3, j = tid & 7 (qhat / khat: columns 32 g + 4 j .. + 3; PsiV / gate: 8 j ..
+// 8 j + 7)
 __device__ __forceinline__ void load_raw(Raw& rw, int tid, int t0, int nv, int h, int T, int H, long ldv, long ldz,
                                          long lhv, long lhz, bool vec,
                                          const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
@@ -105,17 +116,14 @@ __device__ __forceinline__ void load_raw(Raw& rw, int tid, int t0, int nv, int h
   const bool ok = tok < nv;
   const long t = t0 + tok;
   const uint4 z0 = make_uint4(0u, 0u, 0u, 0u);
-  const long off = (t * R + r) * N + 8 * j;
-  rw.q[0] = ok ? __ldg(reinterpret_cast<const uint4*>(Q + off)) : z0;
-  rw.q[1] = ok ? __ldg(reinterpret_cast<const uint4*>(Q + off + 64)) : z0;
-  rw.k[0] = ok ? __ldg(reinterpret_cast<const uint4*>(K + off)) : z0;
-  rw.k[1] = ok ? __ldg(reinterpret_cast<const uint4*>(K + off + 64)) : z0;
-  if (j < 4) {
-    const float4* tp = reinterpret_cast<const float4*>(thl + (t * H + h) * NQ + 8 * j);
-    const float4 zf = make_float4(0.f, 0.f, 0.f, 0.f);
-    rw.th[0] = ok ? __ldg(tp) : zf;
-    rw.th[1] = ok ? __ldg(tp + 1) : zf;
+  const long off = (t * R + r) * N + 4 * j;
+  const uint2 z2 = make_uint2(0u, 0u);
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    rw.q[g] = ok ? __ldg(reinterpret_cast<const uint2*>(Q + off + 32 * g)) : z2;
+    rw.k[g] = ok ? __ldg(reinterpret_cast<const uint2*>(K + off + 32 * g)) : z2;
   }
+  rw.th = ok ? __ldg(reinterpret_cast<const float4*>(thl + (t * H + h) * NQ + 4 * j)) : make_float4(0.f, 0.f, 0.f, 0.f);
   rw.v = ok ? ld8(V + t * ldv + h * lhv + 8 * j, vec) : z0;
   rw.z = ok ? ld8(Z + t * ldz + h * lhz + 8 * j, vec) : z0;
   const long ht = (long)h * T + t;
@@ -125,83 +133,88 @@ __device__ __forceinline__ void load_raw(Raw& rw, int tid, int t0, int nv, int h
   rw.gam = ok ? __ldg(gam_g + ht) : 0.f;
 }
 
-// the sm80 kernel's operand preparation, value for value; only the destinations differ (fp32, row-major)
+// the sm80 kernel's operand preparation, value for value; fp32 row-major destinations
 __device__ __forceinline__ void store_operands(Smem& S, const Raw& rw, int tid, const float* a0, bool last_tok,
                                                __nv_bfloat16* __restrict__ fk, long fk_rank_stride) {
   const int tok = tid >> 5, r = (tid >> 3) & 3, j = tid & 7, row = tok * R + r;
   {
-    U8 q0, q1, k0, k1, bq0, bq1, bk0, bk1;
-    q0.u = rw.q[0];
-    q1.u = rw.q[1];
-    k0.u = rw.k[0];
-    k1.u = rw.k[1];
-    bq0.u = *reinterpret_cast<const uint4*>(&S.qb[r * N + 8 * j]);
-    bq1.u = *reinterpret_cast<const uint4*>(&S.qb[r * N + 64 + 8 * j]);
-    bk0.u = *reinterpret_cast<const uint4*>(&S.kb[r * N + 8 * j]);
-    bk1.u = *reinterpret_cast<const uint4*>(&S.kb[r * N + 64 + 8 * j]);
+    // bias in bf16: qv / kv[g][e] = column 32 g + 4 j + e
+    float qv[4][4], kv[4][4];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-      q0.h2[e] = __hadd2(q0.h2[e], bq0.h2[e]);
-      q1.h2[e] = __hadd2(q1.h2[e], bq1.h2[e]);
-      k0.h2[e] = __hadd2(k0.h2[e], bk0.h2[e]);
-      k1.h2[e] = __hadd2(k1.h2[e], bk1.h2[e]);
-    }
-    if (j < 4) {
-      const float th[8] = {rw.th[0].x, rw.th[0].y, rw.th[0].z, rw.th[0].w,
-                           rw.th[1].x, rw.th[1].y, rw.th[1].z, rw.th[1].w};
+    for (int g = 0; g < 4; ++g) {
+      const float4 bq = *reinterpret_cast<const float4*>(&S.qb[r * N + 32 * g + 4 * j]);
+      const float4 bk = *reinterpret_cast<const float4*>(&S.kb[r * N + 32 * g + 4 * j]);
+      const float bqa[4] = {bq.x, bq.y, bq.z, bq.w}, bka[4] = {bk.x, bk.y, bk.z, bk.w};
+      const unsigned wq[2] = {rw.q[g].x, rw.q[g].y}, wk[2] = {rw.k[g].x, rw.k[g].y};
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        float ca, sa, cb, sb;
-        float a = th[2 * e] + a0[2 * e], b = th[2 * e + 1] + a0[2 * e + 1];
-        a = a - 6.283185307179586f * floorf(a * 0.15915494309189535f);
-        b = b - 6.283185307179586f * floorf(b * 0.15915494309189535f);
-        __sincosf(a, &sa, &ca);
-        __sincosf(b, &sb, &cb);
-        const float2 x0 = __bfloat1622float2(q0.h2[e]), x1 = __bfloat1622float2(q1.h2[e]);
-        const float2 y0 = __bfloat1622float2(k0.h2[e]), y1 = __bfloat1622float2(k1.h2[e]);
-        q0.h2[e] = __floats2bfloat162_rn(ca * x0.x - sa * x1.x, cb * x0.y - sb * x1.y);
-        q1.h2[e] = __floats2bfloat162_rn(sa * x0.x + ca * x1.x, sb * x0.y + cb * x1.y);
-        k0.h2[e] = __floats2bfloat162_rn(ca * y0.x - sa * y1.x, cb * y0.y - sb * y1.y);
-        k1.h2[e] = __floats2bfloat162_rn(sa * y0.x + ca * y1.x, sb * y0.y + cb * y1.y);
+        const float xq = (e & 1) ? bf_hi(wq[e >> 1]) : bf_lo(wq[e >> 1]);
+        const float xk = (e & 1) ? bf_hi(wk[e >> 1]) : bf_lo(wk[e >> 1]);
+        qv[g][e] = bf16r(add_rn(xq, bqa[e]));
+        kv[g][e] = bf16r(add_rn(xk, bka[e]));
       }
     }
-    if (last_tok) {
-      *reinterpret_cast<uint4*>(fk + r * fk_rank_stride + 8 * j) = k0.u;
-      *reinterpret_cast<uint4*>(fk + r * fk_rank_stride + 64 + 8 * j) = k1.u;
-    }
-    // khat * (ts * e_j) in one bf16 product (ts itself is held in bf16)
-    const __nv_bfloat162 tse2 = __float2bfloat162_rn(rbf(rw.ts) * __expf(fmaxf(rw.dcsr, -LOG_EMIN)));
+    // rotation of the pairs (4 j + e, 64 + 4 j + e) in fp32, with the products the sm80 kernel's machine code fuses
+    // (explicit forms, so that the compiler cannot pick others)
+    const float th[4] = {rw.th.x, rw.th.y, rw.th.z, rw.th.w};
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      k0.h2[e] = __hmul2(k0.h2[e], tse2);
-      k1.h2[e] = __hmul2(k1.h2[e], tse2);
+      float ca, sa;
+      float a = th[e] + a0[e];
+      a = __fmaf_rn(floorf(a * 0.15915494309189535f), -6.283185307179586f, a);
+      __sincosf(a, &sa, &ca);
+      const float x0 = qv[0][e], x1 = qv[2][e], y0 = kv[0][e], y1 = kv[2][e];
+      qv[0][e] = bf16r(__fmaf_rn(ca, x0, -__fmul_rn(sa, x1)));
+      qv[2][e] = bf16r(__fmaf_rn(sa, x0, __fmul_rn(ca, x1)));
+      kv[0][e] = bf16r(__fmaf_rn(ca, y0, -__fmul_rn(sa, y1)));
+      kv[2][e] = bf16r(__fmaf_rn(sa, y0, __fmul_rn(ca, y1)));
     }
-    st8f(&S.q[row * LDQ + 8 * j], q0);
-    st8f(&S.q[row * LDQ + 64 + 8 * j], q1);
-    st8f(&S.k[row * LDQ + 8 * j], k0);
-    st8f(&S.k[row * LDQ + 64 + 8 * j], k1);
+    if (last_tok) {
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        uint2 u;
+        u.x = (__float_as_uint(kv[g][0]) >> 16) | (__float_as_uint(kv[g][1]) & 0xffff0000u);
+        u.y = (__float_as_uint(kv[g][2]) >> 16) | (__float_as_uint(kv[g][3]) & 0xffff0000u);
+        *reinterpret_cast<uint2*>(fk + r * fk_rank_stride + 32 * g + 4 * j) = u;
+      }
+    }
+    // khat * (ts * e_j) as one bf16 product (ts itself is held in bf16)
+    const float tse = bf16r(bf16r(rw.ts) * __expf(fmaxf(rw.dcsr, -LOG_EMIN)));
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      *reinterpret_cast<float4*>(&S.q[row * LDQ + 32 * g + 4 * j]) = make_float4(qv[g][0], qv[g][1], qv[g][2], qv[g][3]);
+      *reinterpret_cast<float4*>(&S.k[row * LDQ + 32 * g + 4 * j]) =
+          make_float4(bf16r(mul_rn(kv[g][0], tse)), bf16r(mul_rn(kv[g][1], tse)), bf16r(mul_rn(kv[g][2], tse)),
+                      bf16r(mul_rn(kv[g][3], tse)));
+    }
   }
   {
     const int col = 8 * j;
-    U8 va, za, ps, g8;
-    va.u = rw.v;
-    za.u = rw.z;
-    ps.u = *reinterpret_cast<const uint4*>(&S.psi[r * P + col]);
+    const float4* pp = reinterpret_cast<const float4*>(&S.psi[r * P + col]);
     const float4* zp = reinterpret_cast<const float4*>(&S.zeta[r * P + col]);
     const float4* fp = reinterpret_cast<const float4*>(&S.phi[r * P + col]);
-    const float4 za4 = zp[0], zb4 = zp[1], fa4 = fp[0], fb4 = fp[1];
+    const float4 pa4 = pp[0], pb4 = pp[1], za4 = zp[0], zb4 = zp[1], fa4 = fp[0], fb4 = fp[1];
+    const float ps[8] = {pa4.x, pa4.y, pa4.z, pa4.w, pb4.x, pb4.y, pb4.z, pb4.w};
     const float zt[8] = {za4.x, za4.y, za4.z, za4.w, zb4.x, zb4.y, zb4.z, zb4.w};
     const float ft[8] = {fa4.x, fa4.y, fa4.z, fa4.w, fb4.x, fb4.y, fb4.z, fb4.w};
+    const unsigned wv[4] = {rw.v.x, rw.v.y, rw.v.z, rw.v.w}, wz[4] = {rw.z.x, rw.z.y, rw.z.z, rw.z.w};
+    float pvv[8], gzv[8];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      va.h2[e] = __hmul2(va.h2[e], ps.h2[e]);
-      const float2 z = __bfloat1622float2(za.h2[e]);
-      const float g0 = 0.5f * z.x * zt[2 * e], g1 = 0.5f * z.y * zt[2 * e + 1];
-      const float s0 = rbf(g0 * tanh_approx(g0) + g0), s1 = rbf(g1 * tanh_approx(g1) + g1);  // silu in bf16
-      g8.h2[e] = __floats2bfloat162_rn(ft[2 * e] * s0, ft[2 * e + 1] * s1);
+      pvv[2 * e] = bf16r(mul_rn(bf_lo(wv[e]), ps[2 * e]));
+      pvv[2 * e + 1] = bf16r(mul_rn(bf_hi(wv[e]), ps[2 * e + 1]));
+      const float g0 = 0.5f * bf_lo(wz[e]) * zt[2 * e], g1 = 0.5f * bf_hi(wz[e]) * zt[2 * e + 1];
+      const float s0 = bf16r(__fmaf_rn(g0, tanh_approx(g0), g0));  // silu in bf16
+      const float s1 = bf16r(__fmaf_rn(g1, tanh_approx(g1), g1));
+      gzv[2 * e] = bf16r(ft[2 * e] * s0);
+      gzv[2 * e + 1] = bf16r(ft[2 * e + 1] * s1);
     }
-    st8f(&S.pv[row * P + col], va);
-    st8f(&S.gz[row * P + col], g8);
+    float4* pd = reinterpret_cast<float4*>(&S.pv[row * P + col]);
+    float4* gd = reinterpret_cast<float4*>(&S.gz[row * P + col]);
+    pd[0] = make_float4(pvv[0], pvv[1], pvv[2], pvv[3]);
+    pd[1] = make_float4(pvv[4], pvv[5], pvv[6], pvv[7]);
+    gd[0] = make_float4(gzv[0], gzv[1], gzv[2], gzv[3]);
+    gd[1] = make_float4(gzv[4], gzv[5], gzv[6], gzv[7]);
   }
   if ((tid & 31) == 0) {
     S.tok[tok][0] = rw.dcs;
@@ -232,21 +245,18 @@ __global__ void __launch_bounds__(THREADS, 1) scan_volta_kernel(
   const float dsk = Dskip[h];
   const bool vec = ((ldv | ldz | lhv | lhz) & 7) == 0;
   for (int i = tid; i < R * N; i += THREADS) {
-    S.qb[i] = __float2bfloat16(qbias[(long)h * R * N + i]);
-    S.kb[i] = __float2bfloat16(kbias[(long)h * R * N + i]);
+    S.qb[i] = bf16r(qbias[(long)h * R * N + i]);
+    S.kb[i] = bf16r(kbias[(long)h * R * N + i]);
   }
   for (int i = tid; i < R * P; i += THREADS) {
     const long o = (long)h * R * P + i;
-    S.psi[i] = __float2bfloat16(psi[o]);
-    S.phi[i] = rbf(phi[o]);
+    S.psi[i] = bf16r(psi[o]);
+    S.phi[i] = bf16r(phi[o]);
     S.zeta[i] = zeta[o];
   }
-  float a0[8];
-  {
-    const int j = tid & 7;
+  float a0[4];  // entering phase of columns 4 j .. 4 j + 3
 #pragma unroll
-    for (int e = 0; e < 8; ++e) a0[e] = j < 4 ? ain[(long)item * NQ + 8 * j + e] : 0.f;
-  }
+  for (int e = 0; e < 4; ++e) a0[e] = ain[(long)item * NQ + 4 * (tid & 7) + e];
   const int lane = tid & 31, warp = tid >> 5;
   // phase 1 / 2a / epilogue: token t1 = warp (its qhat and G rows are warp-uniform loads), o cols po, po + 1 = 2 lane,
   // 2 lane + 1 (contiguous state loads); G col jg = lane
@@ -264,7 +274,7 @@ __global__ void __launch_bounds__(THREADS, 1) scan_volta_kernel(
 #pragma unroll
     for (int a = 0; a < 8; ++a)
       *reinterpret_cast<float4*>(&S.sb[(n0 + a) * P + p0]) =
-          make_float4(rbf(st[a][0]), rbf(st[a][1]), rbf(st[a][2]), rbf(st[a][3]));
+          make_float4(bf16r(st[a][0]), bf16r(st[a][1]), bf16r(st[a][2]), bf16r(st[a][3]));
   }
   Raw rw;
   load_raw(rw, tid, cs, min(C, cl), h, T, H, ldv, ldz, lhv, lhz, vec, Q, K, V, Z, thl, dcs8, dcsr8, ts_g, gam_g);
@@ -314,11 +324,11 @@ __global__ void __launch_bounds__(THREADS, 1) scan_volta_kernel(
       }
       const int ti = t1, tj = tg;
       const float dj = S.tok[tj][0], lej = fmaxf(S.tok[tj][1], -LOG_EMIN);
-      const float tsi = ti < nv ? rbf(S.tok[ti][2]) : 0.f;  // the trap scale is held in bf16
+      const float tsi = ti < nv ? bf16r(S.tok[ti][2]) : 0.f;  // the trap scale is held in bf16
       const float dg = (ti < nv && tsi > 0.f) ? S.tok[ti][3] / tsi : 0.f;
       const float cf = ti > tj ? __expf(fminf(S.tok[ti][0] - dj, 0.f) - lej) : (ti == tj ? dg * __expf(-lej) : 0.f);
 #pragma unroll
-      for (int r = 0; r < 4; ++r) S.g[(4 * t1 + r) * LDG + jg] = rbf(ga[r] * cf);
+      for (int r = 0; r < 4; ++r) S.g[(4 * t1 + r) * LDG + jg] = bf16r(ga[r] * cf);
     }
     __syncthreads();  // G complete; every warp done reading S.sb
 
@@ -383,7 +393,7 @@ __global__ void __launch_bounds__(THREADS, 1) scan_volta_kernel(
 #pragma unroll
       for (int a = 0; a < 8; ++a)
         *reinterpret_cast<float4*>(&S.sb[(n0 + a) * P + p0]) =
-            make_float4(rbf(st[a][0]), rbf(st[a][1]), rbf(st[a][2]), rbf(st[a][3]));
+            make_float4(bf16r(st[a][0]), bf16r(st[a][1]), bf16r(st[a][2]), bf16r(st[a][3]));
     }
   }
 }
