@@ -116,6 +116,40 @@ def _volta_decode_ok(x: torch.Tensor, segs: list[Segment], cfg) -> bool:
     )
 
 
+@functools.cache
+def volta_tc():
+    """The fp16 tensor-core edition of the SM70 family (OLALA_VOLTA_TC=1: olala/volta_tc.py),
+    or None (off: every path below is unchanged)."""
+    from vllm.model_executor.layers.mamba.olala import volta_tc as tc
+
+    return tc if tc.tc_enabled() else None
+
+
+def _tc_decode(x: torch.Tensor, segs: list[Segment], out: torch.Tensor, cfg) -> bool:
+    """int8_decode_linear through volta_tc: every INT8 segment registered, no column maps; INT8
+    segments on the tensor cores, a bf16 segment through its stock launch (from 33 rows only:
+    below, the shared two-segment launch is cheaper). False: nothing ran."""
+    tc = volta_tc()
+    M = x.shape[0]
+    if (
+        tc is None or cfg is not None or x.dtype != torch.bfloat16 or x.stride(-1) != 1
+        or any(s.cols is not None for s in segs)
+    ):
+        return False
+    s8 = [s for s in segs if s.weight.dtype == torch.int8]
+    if not s8 or (len(s8) < len(segs) and M <= 32):
+        return False
+    if any(s.scale is None or s.scale.dim() != 1 or not tc.rows_ok(M, s.weight) for s in s8):
+        return False
+    for s in segs:
+        o = out[:, s.col0 : s.col0 + s.n]
+        if s.weight.dtype == torch.int8:
+            tc.tc_linear(x, s.weight, s.scale, out=o)
+        else:
+            int8_decode_linear(x, [Segment(s.weight, s.scale)], out=o)
+    return True
+
+
 def _scale_mode(s: Segment) -> int:
     if s.scale is None:
         return _NONE
@@ -792,6 +826,8 @@ def int8_decode_linear(
             assert all(s.cols is None for s in segs), "width required with column maps"
             width = max(s.col0 + s.n for s in segs)
         out = torch.empty(M, width, dtype=x.dtype, device=x.device)
+    if _tc_decode(x, segs, out, cfg):
+        return out
     if _volta_decode_ok(x, segs, cfg):
         return _volta_decode(x, segs, out)
     s1 = segs[0]
@@ -872,6 +908,11 @@ def int8_linear(x: torch.Tensor, w: Int8Weight, cfg=None, out=None) -> torch.Ten
     segment: the lean kernels)."""
     M, K = x.shape
     N = w.n
+    tc = volta_tc()
+    if cfg is None and tc is not None and M >= tc.MIN_ROWS:
+        y = tc.tc_linear(x, w.weight, w.scale, out=out)
+        if y is not None:
+            return y
     y = torch.empty(M, N, dtype=x.dtype, device=x.device) if out is None else out
     if _volta_decode_ok(x, [Segment(w.weight, w.scale)], cfg):
         return _volta_decode(x, [Segment(w.weight, w.scale)], y)
@@ -1050,6 +1091,11 @@ def int8_prefill_mm(x: torch.Tensor, w: Int8Weight) -> torch.Tensor:
         raise ValueError("W8A16 INT8 linears require BF16 activations")
     if x.stride(-1) != 1:
         x = x.contiguous()
+    tc = volta_tc()
+    if tc is not None and M >= tc.MIN_ROWS:
+        y = tc.tc_linear(x, w.weight, w.scale)
+        if y is not None:
+            return y
     if _prefill_uses_cublas(M, N, K):
         buf = _deq_scratch(x.device, N * K)
         if buf is not None:

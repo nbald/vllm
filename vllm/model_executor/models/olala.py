@@ -205,6 +205,9 @@ class OlalaSharedMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
+        # Volta tensor-core edition (OLALA_VOLTA_TC, volta_tc.py): the ReLU² input rows need
+        # two exact fp16 terms
+        self.down_proj.olala_tc_terms = 2
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1175,6 +1178,10 @@ class OlalaMonoBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mixer_proj",
         )
+        if layer_type == "M":
+            # OLALA_VOLTA_TC (volta_tc.py): Mamba-3 output rows span up to ~100 binades, three
+            # exact fp16 terms
+            self.mixer_proj.olala_tc_terms = 3
 
         eps = config.norm_epsilon
         zc = getattr(config, "zero_centered_gamma", False)

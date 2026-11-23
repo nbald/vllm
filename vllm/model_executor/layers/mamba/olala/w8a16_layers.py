@@ -70,6 +70,10 @@ def cat_int8_rows_shared(layers: list, pad_rows: int = 0) -> Int8Weight | None:
         sshape = (n_rows + pad_rows,) + tuple(ref.scale.shape[1:])
         sbuf = torch.ones(sshape, dtype=ref.scale.dtype, device=ref.scale.device)
         torch.cat([w.scale for w in ws], 0, out=sbuf[:n_rows])
+        from vllm.model_executor.layers.quantization.utils.w8a16_utils import volta_tc
+
+        if (tc := volta_tc()) is not None:
+            tc.concat_registered([w.weight for w in ws], buf)
         off = 0
         for layer, w in zip(layers, ws):
             layer.weight.data = buf[off : off + w.n]
