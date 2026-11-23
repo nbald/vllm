@@ -1767,6 +1767,18 @@ _PREFILL_DOWN = dict(
 # INT4 affine experts, up and down: 102 / 417 us per layer for 1024 / 8192 tokens
 # (INT8 99 / 397; RTX 5090).
 _PREFILL_I4 = dict(_PREFILL_UP, BLOCK_SIZE_K=128, num_stages=2)
+# Volta (bf16 mma.sync emulated): 16-row tiles, as a 480-token prefill gives ~11 rows per
+# expert, which 64-row tiles pad 6x; no software pipelining (cp.async is emulated too).
+# Same values as the stock tiles, bit for bit. V100 through volta-forever, up + down +
+# routing per layer, 480 tokens: INT8 1797 -> 748 us, INT4 affine 9169 -> 870 us.
+_PREFILL_VOLTA = dict(
+    BLOCK_SIZE_M=16,
+    BLOCK_SIZE_N=128,
+    BLOCK_SIZE_K=32,
+    GROUP_SIZE_M=8,
+    num_warps=4,
+    num_stages=1,
+)
 
 
 def wq_routed_experts(
@@ -1795,6 +1807,8 @@ def wq_routed_experts(
     D2 = w2.n
     dev = x.device
     MK = M * top_k
+    if configs is None and gpu_family(x.device) is GpuFamily.SM70:
+        configs = (_PREFILL_VOLTA, _PREFILL_VOLTA)
     up_cfg, down_cfg = configs or (
         (_PREFILL_I4, _PREFILL_I4)
         if w13.fmt == FMT_INT4
@@ -1803,6 +1817,8 @@ def wq_routed_experts(
     up_cfg, down_cfg = dict(up_cfg), dict(down_cfg)
     up_cfg["BLOCK_SIZE_K"] = _fit_bk(up_cfg["BLOCK_SIZE_K"], w13)
     down_cfg["BLOCK_SIZE_K"] = _fit_bk(down_cfg["BLOCK_SIZE_K"], w2)
+    # the kernel covers N // BLOCK_SIZE_N column blocks
+    assert N1 % up_cfg["BLOCK_SIZE_N"] == 0 and D2 % down_cfg["BLOCK_SIZE_N"] == 0
     ids = torch.empty(M, top_k, dtype=torch.int32, device=dev)
     tw = torch.empty(MK, dtype=torch.float32, device=dev)
     RB = 8
