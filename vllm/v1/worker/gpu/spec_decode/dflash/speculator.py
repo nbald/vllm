@@ -576,6 +576,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp = (
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
+        # Read by the opt-in step trace (OLALA_STEP_TRACE).
+        self.last_cg_mode = batch_desc.cg_mode
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert batch_desc.num_reqs is not None
