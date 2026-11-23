@@ -448,8 +448,13 @@ def olala_moe_medium(
     D2 = w2.shape[1]
     S = w_in.shape[0] - D1
     # sm_120: the skinny kernel up to 32 rows, where cuBLAS picks sm80 wmma kernels (5.5 vs 17 us
-    # in, 5.2 vs 11.2 us out on an RTX 5090)
-    linear = decode_gemv if gpu_family() is GpuFamily.SM120 else torch.nn.functional.linear
+    # in, 5.2 vs 11.2 us out on an RTX 5090). Volta: cuBLAS has no Volta bf16 GEMM kernel (~250-300
+    # us per projection at decode sizes); decode_gemv takes FMA / skinny kernels up to 64 rows.
+    linear = (
+        decode_gemv
+        if gpu_family() in (GpuFamily.SM70, GpuFamily.SM120)
+        else torch.nn.functional.linear
+    )
     if x_in is None:
         x_in = linear(hidden, w_in)  # [M, D1 + S]
     part = moe_routed_medium(x_in[:, :D1], router_logits, e_score_bias, w13, w2, top_k)

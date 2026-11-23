@@ -41,6 +41,12 @@ from vllm.utils.torch_utils import (
 SMALL_BATCH_MAX_TOKENS = 8
 # With the medium path available (bf16 experts) it wins from 6 tokens on B300.
 SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM = 5
+# Volta (V100, natively or through volta-forever): the medium path's grouped
+# GEMMs are tl.dot, whose bf16 mma.sync is emulated with scalar code there, and
+# pad each expert's rows to 16; the small path's gather-GEMV kernels are plain
+# FMA. Per layer, small vs medium (FMA projections): 8 tokens 110 vs 364 us,
+# 16 tokens 168 vs 459 us, 32 tokens 452 vs 751 us.
+SMALL_BATCH_MAX_TOKENS_VOLTA = 32
 
 # The CUDA small path (int8 experts) beats the generic path up to 32 tokens on an A4500
 # (realistic routing, decode16: -0.6 ms/step): no align/sort/sum launches.
