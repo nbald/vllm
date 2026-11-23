@@ -41,13 +41,20 @@ template <bool F32> struct __align__(128) Stage : StateTile<F32> {
   __nv_bfloat16 angp[NA];
   float angst[NA];
 };
+// Volta builds: the fp32-state step runs the FMA update, which needs neither the zero rows that pad the mma's k nor
+// the biases in shared memory (read through L1 instead); the tile then fits two CTAs per SM (45 KB instead of 52 KB).
+#ifdef STEP_VOLTA
+template <bool F32> constexpr bool kSlim = F32;
+#else
+template <bool F32> constexpr bool kSlim = false;
+#endif
 template <bool F32> struct __align__(128) Smem {
   Stage<F32> st[kStages<F32>];
-  float bias_k[R * S], bias_q[R * S];                  // per-head (fixed per CTA)
+  float bias_k[kSlim<F32> ? 4 : R * S], bias_q[kSlim<F32> ? 4 : R * S];   // per-head (fixed per CTA)
   float xproj[R * D], zproj[R * D], outproj[R * D];
   float sCos[NA], sSin[NA];
-  __nv_bfloat16 sBk[16][LDB];       // mma B operand of the update: rows 0..3 B'[r], 4..7 Bstate[r], 8..15 zero
-  __nv_bfloat16 sCb[8][LDB];        // rotated C' bf16, rows 4..7 zero: mma B operand for o = h C'^T
+  __nv_bfloat16 sBk[kSlim<F32> ? 8 : 16][LDB];   // mma B operand of the update: rows 0..3 B'[r], 4..7 Bstate[r], 8..15 zero
+  __nv_bfloat16 sCb[kSlim<F32> ? 4 : 8][LDB];    // rotated C' bf16, rows 4..7 zero: mma B operand for o = h C'^T
   float sTheta[NA];
 };
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
@@ -122,11 +129,17 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int h = blockIdx.x % H, nb_stride = gridDim.x / H;   // grid is a multiple of H
   const int nitems = a.B * H;
-  for (int i = t; i < 8 * LDB; i += THREADS) { S_.sBk[8 + i / LDB][i % LDB] = __float2bfloat16(0.f); if (i < 4 * LDB) S_.sCb[4 + i / LDB][i % LDB] = __float2bfloat16(0.f); }
+  if constexpr (!kSlim<F32>) {
+    for (int i = t; i < 8 * LDB; i += THREADS) { S_.sBk[8 + i / LDB][i % LDB] = __float2bfloat16(0.f); if (i < 4 * LDB) S_.sCb[4 + i / LDB][i % LDB] = __float2bfloat16(0.f); }
+  }
   // per-head constants once per CTA
-  { const int r = t >> 5, c = t & 31;
+  if constexpr (!kSlim<F32>) {
+    const int r = t >> 5, c = t & 31;
     cp16(S_.bias_k + r * S + c * 4, a.bias_k + ((size_t)r * H + h) * S + c * 4);
     cp16(S_.bias_q + r * S + c * 4, a.bias_q + ((size_t)r * H + h) * S + c * 4); }
+  // bias of (rank r, column j) of this head: shared memory, or global memory through L1 in the slim tile
+  auto bias_k = [&](int r, int j) -> float { if constexpr (kSlim<F32>) return __ldg(a.bias_k + ((size_t)r * H + h) * S + j); else return S_.bias_k[r * S + j]; };
+  auto bias_q = [&](int r, int j) -> float { if constexpr (kSlim<F32>) return __ldg(a.bias_q + ((size_t)r * H + h) * S + j); else return S_.bias_q[r * S + j]; };
   if (t < 64) { const int r = t >> 4, c = t & 15; cp16(S_.xproj + r * D + c * 4, a.xproj + ((size_t)r * H + h) * D + c * 4); cp16(S_.outproj + r * D + c * 4, a.outproj + ((size_t)r * H + h) * D + c * 4); }
   else { const int q = t - 64, r = q >> 4, c = q & 15; cp16(S_.zproj + r * D + c * 4, a.zproj + ((size_t)r * H + h) * D + c * 4); }
   // the per-head constants above are weights; everything below may be the previous kernel's output
@@ -180,8 +193,8 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
 #ifndef V_NOPRE
     for (int i = t; i < R * (S / 2); i += THREADS) {
       const int r = i / (S / 2), j = i % (S / 2);
-      float blo = bf2f(st.bm[r * S + j]) + S_.bias_k[r * S + j], bhi = bf2f(st.bm[r * S + j + 64]) + S_.bias_k[r * S + j + 64];
-      float clo = bf2f(st.cm[r * S + j]) + S_.bias_q[r * S + j], chi = bf2f(st.cm[r * S + j + 64]) + S_.bias_q[r * S + j + 64];
+      float blo = bf2f(st.bm[r * S + j]) + bias_k(r, j), bhi = bf2f(st.bm[r * S + j + 64]) + bias_k(r, j + 64);
+      float clo = bf2f(st.cm[r * S + j]) + bias_q(r, j), chi = bf2f(st.cm[r * S + j + 64]) + bias_q(r, j + 64);
       if (j < NA) {
         const float c = S_.sCos[j], s_ = S_.sSin[j];
         const float b0 = blo * c - bhi * s_, b1 = blo * s_ + bhi * c, c0 = clo * c - chi * s_, c1 = clo * s_ + chi * c;
