@@ -82,7 +82,9 @@ def _load():
         # fp32-state step are emulated with scalar code there, so build the scalar
         # FMA update (STEP_VOLTA, csrc/mamba3_step.cu). V100 through volta-forever,
         # fp32 state, graphed: 63 -> 12 us per layer at batch 1, 682 -> 87 us at 8,
-        # 1296 -> 162 us at 16.
+        # 1296 -> 162 us at 16; its edition with the state in registers
+        # (mamba3_step_volta_kernel, same bits): 1-stage 14.0 -> 12.1 us at 1,
+        # 208 -> 155 us at 32, 412 -> 301 us at 64.
         name += "_volta"
         flags.append("-DSTEP_VOLTA")
     return load_extension(name, "mamba3_step.cu", flags)
