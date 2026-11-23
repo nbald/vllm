@@ -22,7 +22,7 @@ def tc(monkeypatch):
     from vllm.model_executor.layers.mamba.olala import volta_tc
     import vllm.model_executor.layers.quantization.utils.w8a16_utils as wu
 
-    monkeypatch.setenv("OLALA_VOLTA_TC", "int8,bf16")
+    monkeypatch.setenv("OLALA_VOLTA_TC", "int8,bf16,moe")
     volta_tc._kinds.cache_clear()
     wu.volta_tc.cache_clear()
     yield volta_tc
@@ -177,3 +177,49 @@ def test_w8a16_dispatch(tc):
                 assert y_tc is None
     finally:
         tc.unregister(q)
+
+
+@pytest.mark.parametrize("fmt", [1, 3])
+@pytest.mark.parametrize("m", [40, 300])
+def test_routed_experts_vs_fp64(tc, fmt, m):
+    from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import WqWeight, wq_routed_experts
+
+    E, N1, D1, D2, K = 256, 768, 384, 384, 6
+    gen = torch.Generator(device="cuda").manual_seed(fmt * 100 + m)
+    ws, deq = [], []
+    for n, k in ((N1, D1), (D2, N1)):
+        if fmt == 1:
+            w = torch.randn(E, n, k, device="cuda", generator=gen) * 0.02
+            sc = w.abs().amax(-1) / 127
+            q = torch.round(w / sc[..., None]).clamp(-127, 127).to(torch.int8)
+            ws.append(WqWeight(q.contiguous(), sc.float().contiguous()))
+            deq.append(q.double() * sc.double()[..., None])
+        else:
+            q = torch.randint(0, 16, (E, n, k), device="cuda", generator=gen, dtype=torch.uint8)
+            g32 = (E, n, k // 32)
+            sc = (torch.rand(g32, device="cuda", generator=gen) * 0.004 + 0.001).to(torch.bfloat16)
+            b = (-(torch.rand(g32, device="cuda", generator=gen) * 0.03)).to(torch.bfloat16)
+            packed = (q[..., 0::2] | (q[..., 1::2] << 4)).contiguous()
+            ws.append(WqWeight.int4_affine(packed, sc, b))
+            s64 = sc.double().repeat_interleave(32, -1)
+            deq.append(s64 * q.double() + b.double().repeat_interleave(32, -1))
+    assert tc.moe_ok(*ws)
+    x = (torch.randn(m, D1, device="cuda", generator=gen) * 0.7).to(torch.bfloat16)
+    logits = torch.randn(m, E, device="cuda", generator=gen)
+    bias = torch.zeros(E, device="cuda")
+    y = wq_routed_experts(x, logits, bias, ws[0], ws[1], K, 2.5)
+    # fp64 reference on the routing the kernel used
+    from vllm.model_executor.layers.mamba.olala.latent_moe_medium import _route_topk_kernel
+
+    ids = torch.empty(m, K, dtype=torch.int32, device="cuda")
+    tw = torch.empty(m * K, dtype=torch.float32, device="cuda")
+    _route_topk_kernel[((m + 7) // 8,)](
+        logits, bias, ids, tw, m, logits.stride(0), E=E, K=K, KP=8, RB=8, num_warps=4
+    )
+    flat = ids.reshape(-1).long()
+    rows = torch.arange(m * K, device="cuda") // K
+    up = torch.stack([x[rows[i]].double() @ deq[0][flat[i]].t() for i in range(m * K)])
+    h = torch.relu(up.to(torch.bfloat16).double()).square().to(torch.bfloat16).double()
+    down = torch.stack([h[i] @ deq[1][flat[i]].t() for i in range(m * K)])
+    ref = 2.5 * (down * tw.double()[:, None]).view(m, K, D2).sum(1)
+    assert _err(y, ref) < 1e-2

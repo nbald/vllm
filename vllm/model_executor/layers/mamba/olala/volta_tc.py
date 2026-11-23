@@ -57,7 +57,7 @@ MAX_BAD_ELEMS = 256
 _NSTAT = MAX_TERMS + 2
 
 
-KINDS = ("int8", "bf16")
+KINDS = ("int8", "bf16", "moe")
 DEFAULT_KINDS = ("int8", "bf16")  # OLALA_VOLTA_TC=1
 
 
@@ -65,7 +65,7 @@ DEFAULT_KINDS = ("int8", "bf16")  # OLALA_VOLTA_TC=1
 def _kinds() -> frozenset[str]:
     """OLALA_VOLTA_TC on the SM70 family (V100, native or through volta-forever): "1" = the
     DEFAULT_KINDS, or a comma list of KINDS ("int8": W8A16 linears, "bf16": the bf16 model's dense
-    projections)."""
+    projections, "moe": the weight-only routed experts above the small path)."""
     raw = os.environ.get("OLALA_VOLTA_TC", "0").strip()
     if raw in ("", "0") or not torch.cuda.is_available() or gpu_family() is not GpuFamily.SM70:
         return frozenset()
@@ -544,4 +544,139 @@ def stats() -> dict[str, list[int]]:
     for name, v in zip(_SITES, vals):
         cur = out.setdefault(name, [0] * _NSTAT)
         out[name] = [a + b for a, b in zip(cur, v)]
+    return out
+
+
+# -- routed experts (kind "moe") --------------------------------------------------------------
+
+
+@functools.cache
+def _moe_ext():
+    """csrc/moe_tc_volta.cu (hand-written mma.m8n8k4: volta-forever passes the fp16 product through
+    to Volta's HMMA), or None if its JIT build fails."""
+    from vllm.model_executor.layers.mamba.olala.arch import gencode, sm_arch
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+    try:
+        return load_extension(
+            f"olala_moe_tc_volta_sm{sm_arch()}", "moe_tc_volta.cu", ["-O3", "-std=c++20", gencode()]
+        )
+    except Exception as e:  # noqa: BLE001 - any build failure keeps the stock kernels
+        logger.warning("Olala Volta TC: expert kernel not built (%s); stock kernels instead.", e)
+        return None
+
+
+@functools.cache
+def _moe_terms() -> tuple[int, int]:
+    """Exact fp16 terms of the up input (the latent rows) and the down input (ReLU² rows).
+    OLALA_VOLTA_TC_MOE_TERMS="up,down" overrides."""
+    raw = os.environ.get("OLALA_VOLTA_TC_MOE_TERMS")
+    if raw:
+        a, b = (int(v) for v in raw.split(","))
+        return max(1, min(2, a)), max(1, min(2, b))
+    return 1, 2
+
+
+# Rows per sorted block: 16 (two m8n8k4 row tiles share each weight fragment, which halves the
+# per-product cost of the weight conversion) from 33 tokens, i.e. wherever this path runs; 8 below.
+# V100 through volta-forever, whole routed-expert call at 128 tokens, 8 -> 16 rows: INT4 495 ->
+# 370 us, INT8 452 -> 368 us. OLALA_VOLTA_TC_MOE_BM16="tokens" overrides (measurements).
+MOE_BM16_MIN_TOKENS = int(os.environ.get("OLALA_VOLTA_TC_MOE_BM16", "33"))
+_MOE_SITES: dict[str, int] = {}
+
+
+def moe_ok(w13, w2) -> bool:
+    """The routed experts can take the tensor-core kernel: INT8 per row (FMT 1) or INT4 affine g32
+    (FMT 3) on both projections, K % 128 == 0, K <= 1024 and N % 128 == 0."""
+    if not tc_enabled("moe"):
+        return False
+    for w in (w13, w2):
+        if (
+            w.fmt not in (1, 3) or w.k % 128 or w.k > 1024 or w.n % 128
+            or (w.fmt == 3 and w.group != 32)
+        ):
+            return False
+    return _moe_ext() is not None
+
+
+def _moe_split(x: torch.Tensor, terms: int, name: str):
+    M, K = x.shape
+    h = torch.empty(terms * M, K, dtype=torch.float16, device=x.device)
+    sh = torch.empty(terms, M, dtype=torch.int32, device=x.device)
+    ok = torch.empty(M, dtype=torch.int32, device=x.device)
+    site = -1
+    if _stats_on():
+        if name not in _MOE_SITES:
+            if _capturing():
+                site = -1
+            else:
+                _MOE_SITES[name] = _new_site(name, x.device)
+        site = _MOE_SITES.get(name, -1)
+    stats = _STATS is not None and site >= 0
+    bk = triton.next_power_of_2(K)
+    _tc_split_kernel[(M,)](
+        x, h, sh, ok, _STATS[site] if stats else ok, M, K, x.stride(0),
+        T=terms, BK=bk, STATS=stats, E_MIN=E_LO, E_MAX=E_HI,
+        num_warps=4 if bk <= 2048 else 8,
+    )
+    return h, sh, ok
+
+
+@triton.jit(do_not_specialize=["M", "stride_xm"])
+def _xsum_kernel(x_ptr, xs_ptr, M, K, stride_xm, BK: tl.constexpr):
+    """xs[m, g] = sum of x[m, 32g .. 32g + 31] in fp32 (the INT4 experts' bias term)."""
+    m = tl.program_id(0)
+    offs = tl.arange(0, BK)
+    v = tl.load(x_ptr + m.to(tl.int64) * stride_xm + offs, mask=offs < K, other=0.0).to(tl.float32)
+    g = tl.sum(tl.reshape(v, [BK // 32, 32]), axis=1)
+    og = tl.arange(0, BK // 32)
+    tl.store(xs_ptr + m.to(tl.int64) * (K // 32) + og, g, mask=og < K // 32)
+
+
+def _xsum(x: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    xs = torch.empty(M, K // 32, dtype=torch.float32, device=x.device)
+    _xsum_kernel[(M,)](x, xs, M, K, x.stride(0), BK=triton.next_power_of_2(K), num_warps=4)
+    return xs
+
+
+def moe_experts(
+    x: torch.Tensor,  # [M, D1] bf16 latent rows
+    ids: torch.Tensor,  # [M, top_k] int32 experts
+    tw: torch.Tensor,  # [M * top_k] fp32 routing weights
+    w13,
+    w2,
+    top_k: int,
+    routed_scale: float,
+) -> torch.Tensor:
+    """The routed experts of latent_moe_int8.wq_routed_experts after routing, on the tensor cores:
+    grouped up GEMM + ReLU², grouped down GEMM weighted by the routing weights (fp32), top-k sum
+    times the routed scale. Returns the routed latent [M, D2] bf16."""
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+    from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import _topk_sum_kernel
+
+    ext = _moe_ext()
+    M, D1 = x.shape
+    E, N1, D2 = w13.weight.shape[0], w13.n, w2.n
+    MK = M * top_k
+    mt = 2 if M >= MOE_BM16_MIN_TOKENS else 1
+    sorted_ids, expert_ids, ntp = moe_align_block_size(ids, 8 * mt, E)
+    t_up, t_down = _moe_terms()
+    if x.stride(-1) != 1 or x.stride(0) != D1:
+        x = x.contiguous()
+    hx, shx, okx = _moe_split(x, t_up, "moe up input")
+    xs = _xsum(x) if w13.fmt == 3 else okx
+    h = torch.empty(MK, N1, dtype=torch.bfloat16, device=x.device)
+    ext.moe_tc(hx, shx, okx, x, xs, w13.weight, w13.scale, h, tw, sorted_ids, expert_ids, ntp,
+               MK, N1, D1, top_k, w13.fmt, t_up, True, mt)
+    hh, shh, okh = _moe_split(h, t_down, "moe down input")
+    xs = _xsum(h) if w2.fmt == 3 else okh
+    part = torch.empty(MK, D2, dtype=torch.float32, device=x.device)
+    ext.moe_tc(hh, shh, okh, h, xs, w2.weight, w2.scale, part, tw, sorted_ids, expert_ids, ntp,
+               MK, D2, N1, top_k, w2.fmt, t_down, False, mt)
+    out = torch.empty(M, D2, dtype=torch.bfloat16, device=x.device)
+    BR = 8
+    _topk_sum_kernel[(triton.cdiv(M, BR), D2 // 128)](
+        part, out, routed_scale, M, D=D2, K=top_k, BR=BR, BD=128, num_warps=4
+    )
     return out

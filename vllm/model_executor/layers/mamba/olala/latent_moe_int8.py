@@ -1813,6 +1813,13 @@ _PREFILL_VOLTA = dict(
 )
 
 
+def _volta_moe_tc(w13: WqWeight, w2: WqWeight) -> bool:
+    """OLALA_VOLTA_TC with the "moe" kind on the SM70 family, and experts its kernel takes."""
+    from vllm.model_executor.layers.mamba.olala.volta_tc import moe_ok, tc_enabled
+
+    return tc_enabled("moe") and moe_ok(w13, w2)
+
+
 def wq_routed_experts(
     x: torch.Tensor,  # [M, D1] bf16 latent
     router_logits: torch.Tensor,  # [M, E] fp32
@@ -1839,6 +1846,8 @@ def wq_routed_experts(
     D2 = w2.n
     dev = x.device
     MK = M * top_k
+    # OLALA_VOLTA_TC=moe: the grouped GEMMs on Volta's fp16 tensor cores (volta_tc.py)
+    volta_tc_moe = configs is None and _volta_moe_tc(w13, w2)
     if configs is None and gpu_family(x.device) is GpuFamily.SM70:
         configs = (_PREFILL_VOLTA, _PREFILL_VOLTA)
     up_cfg, down_cfg = configs or (
@@ -1867,6 +1876,10 @@ def wq_routed_experts(
         RB=RB,
         num_warps=4,
     )
+    if volta_tc_moe:
+        from vllm.model_executor.layers.mamba.olala.volta_tc import moe_experts
+
+        return moe_experts(x, ids, tw, w13, w2, top_k, routed_scale)
     bm = up_cfg["BLOCK_SIZE_M"]
     assert down_cfg["BLOCK_SIZE_M"] == bm
     sorted_ids, expert_ids, ntp = moe_align_block_size(ids, bm, E)
