@@ -13,6 +13,8 @@ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByTy
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mamba3_attn import Mamba3AttentionMetadataBuilder
+from vllm.v1.attention.backends.olala_diff_tpa_attn import OlalaDiffTPAMetadataBuilder
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
     ShortConvAttentionMetadataBuilder,
@@ -58,6 +60,10 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
                 GDNAttentionMetadataBuilder,
                 ShortConvAttentionMetadataBuilder,
                 PleShortConvAttentionMetadataBuilder,
+                # Olala's column-slot spec protocol reads the previous step's
+                # acceptance to pick each request's current state column.
+                Mamba3AttentionMetadataBuilder,
+                OlalaDiffTPAMetadataBuilder,
             ),
         ):
             return {}

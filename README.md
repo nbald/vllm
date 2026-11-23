@@ -15,6 +15,9 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_MOE_INT8` | `1` | W8A16 checkpoints: latent-MoE decode through the weight-only small and medium kernels (`latent_moe_int8.py`), per-channel routed-expert prefill through Olala's grouped GEMMs. `0` = per-channel INT8 experts through vLLM's `int8_w8a16` fused MoE at every batch size; group-32 and INT4 affine (`W4A16_AFFINE`) experts keep Olala's grouped GEMMs. |
 | `OLALA_INT8_MOE_PREFILL` | `olala` | W8A16 checkpoints, prefill of per-channel INT8 routed experts: `olala` = Olala's grouped GEMMs, `vllm` = vLLM's `int8_w8a16` fused MoE (2 % slower on an RTX 5090). |
 | `VLLM_W8A16_INT8_DECODE` | `1` | W8A16 checkpoints: Triton decode kernels (GEMV, skinny GEMM) for the INT8 linears; `0` = prefill kernels at every batch size. Declared in `vllm/envs.py`, like `VLLM_W8A16_INT8_DEQ_SCRATCH_MB` (default `48`, the dequantization buffer of the prefill path). |
+| `OLALA_MAMBA3_VERIFY` | `cuda` | Speculative verify of the Mamba-3 layers: `cuda` = one fused launch for every draft position (`csrc/mamba3_verify.cu`, fp32 state, 7A1B shapes at TP=1), bit-identical to chaining the CUDA decode step; any other value = the decode step launched once per position. |
+| `OLALA_TPA_SPEC_FUSED` | `1` | Speculative verify of the DiffTPA layers: fused K/V reconstruction, token shift, q/k norms and scaling (`tpa_decode_qkv_spec`); `0` = eager per-op path. |
+| `OLALA_DSPINE_FUSED`, `OLALA_DSPINE_GEMV`, `OLALA_DSPINE_CUDA_NORM` | `0` | Opt-in fast path of a DSpine drafter (compiled injection and transition scoring, `2` also compiles the draft layers; skinny GEMV; CUDA RMSNorm). See [DSpine](docs/features/speculative_decoding/dspine.md). |
 | `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
 | `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). The extensions are built for the running GPU (SM80 or later, see GPU support below); if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
 | `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
@@ -51,6 +54,34 @@ Checkpoints converted before the Olala rename (`DragonForCausalLM`) still load.
 The Mamba-3 MIMO inference kernels are vendored in `vllm/model_executor/layers/mamba/ops/mamba3/`
 (forward only, next to the Mamba-2 ops): **`mamba_ssm` is not needed**. They use `tilelang`,
 `nvidia-cutlass-dsl` and `quack-kernels`, already in vLLM's CUDA requirements.
+
+### Speculative decoding
+
+Olala verifies drafts with a column-slot protocol: each request keeps `1 + K` Mamba-3 state and DiffTPA
+token-shift columns, and the next step resumes from the column of the last accepted token, so a rejection needs
+no state copy. The validated configuration uses Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`; candidate-head
+drafters such as DSpine select it automatically). Olala exposes auxiliary hidden states (`SupportsEagle3`) to
+EAGLE-3, DFlash and [DSpine](docs/features/speculative_decoding/dspine.md) drafters; by default the outputs of
+layers 1, 9, 17, 25 and 33.
+
+Requirements: `OLALA_TPA_FACTOR=0` (dense paged KV), `OLALA_REPLAY_SSM` unset or `0`, fp32 Mamba-3 state (the
+default). With a DSpine drafter, e.g. on an RTX 5090 with a Q8 target:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 OLALA_TPA_FACTOR=0 OLALA_REPLAY_SSM=0 \
+OLALA_DSPINE_FUSED=2 OLALA_DSPINE_GEMV=1 OLALA_DSPINE_CUDA_NORM=1 \
+vllm serve <target> --trust-remote-code --mamba-ssm-cache-dtype float32 --max-num-seqs 2 \
+    --speculative-config '{"method": "dflash", "model": "<drafter>", "num_speculative_tokens": 3,
+                           "attention_backend": "TRITON_ATTN"}'
+```
+
+Speculation pays at low concurrency only. The spec layout holds about four times fewer tokens than direct
+serving with ReplaySSM and the factorized TPA cache (fp32 state times `1 + K` columns, dense TPA KV, drafter KV),
+and steps that mix prefills with verifies run outside the FULL CUDA graphs. Measured with a v1 DSpine drafter,
+`K = 3`, against direct serving with ReplaySSM and the factorized cache (Q8 target, RTX 5090): x1.20 greedy and
+x1.11 sampled output tokens/s at one request; slower from 8 concurrent requests under continuous arrivals. Use
+dynamic speculative decoding (`num_speculative_tokens_per_batch_size`, `0` above the break-even batch size) or
+route batched traffic to a direct server.
 
 ### Docker image
 

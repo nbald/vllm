@@ -14,12 +14,16 @@ from tests.v1.attention.test_gdn_metadata_builder import (
     _create_gdn_builder,
 )
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.config import DeviceConfig, SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.mamba3_attn import Mamba3AttentionMetadataBuilder
+from vllm.v1.attention.backends.olala_diff_tpa_attn import OlalaDiffTPAMetadataBuilder
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
@@ -437,3 +441,36 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+@pytest.mark.parametrize(
+    "builder_cls",
+    [Mamba3AttentionMetadataBuilder, OlalaDiffTPAMetadataBuilder],
+)
+def test_olala_verification_starts_from_last_accepted_state(builder_cls):
+    """With different acceptances, the next verify must resume each row's own state."""
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+    builder = builder_cls(
+        MambaSpec(block_size=16, shapes=((1,),), dtypes=(torch.float32,)),
+        ["layer.0"],
+        config,
+        DEVICE,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[64, 64], query_lens=[4, 4]),
+        block_size=16,
+        device=DEVICE,
+        arange_block_indices=True,
+    )
+    runtime = mamba_hybrid.MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        num_accepted_tokens=torch.tensor([3, 2], dtype=torch.int32),
+    )
+    metadata = builder.build(
+        0, common, **runtime.get_extra_attn_kwargs(builder, num_reqs=2)
+    )
+    # Row 0 owns slots [0..3], row 1 owns [4..7].
+    assert metadata.spec.initial_slots().tolist() == [2, 5]

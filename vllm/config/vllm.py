@@ -780,6 +780,7 @@ class VllmConfig:
                 "DFlash2DraftModel",
                 "DFlash2BeamDraftModel",
                 "LiLiCorrDraftModel",
+                "DSpineDraftModel",
             }.intersection(draft_config.architectures or [])
         )
 
@@ -1387,7 +1388,7 @@ class VllmConfig:
                 )
             if self._is_dflash_candidate_draft():
                 raise ValueError(
-                    "Watermarking does not support DFlash2 and LiLiCorr "
+                    "Watermarking does not support DFlash2, LiLiCorr and DSpine "
                     "candidate-head drafters yet."
                 )
             if (

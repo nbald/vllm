@@ -7,7 +7,7 @@ from collections.abc import Callable, Hashable, Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from itertools import groupby, product
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 import torch
 import torch.nn as nn
@@ -148,6 +148,11 @@ def has_compiled_submodule(model: nn.Module) -> bool:
 
 
 class CudaGraphManager:
+    # Under dynamic speculative decoding, also capture the decode graphs of the
+    # shorter query lengths the schedule can produce. A manager whose forward
+    # always runs the full query length disables it.
+    expand_dynamic_sd_query_lens: ClassVar[bool] = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -278,6 +283,7 @@ class CudaGraphManager:
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
             and self.decode_query_len > self.vllm_config.num_speculative_tokens
+            and self.expand_dynamic_sd_query_lens
         ):
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step

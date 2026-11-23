@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
+    tpa_decode_qkv_spec,
     tpa_diff_combine,
 )
 from vllm.model_executor.layers.mamba.olala.tpa_factor import (
@@ -163,6 +164,11 @@ def _token_shift_decode_kernel(
         v.to(vpool_ptr.dtype.element_ty),
     )
 
+
+
+# Speculative verify batches run the fused decode preamble too
+# (tpa_decode_qkv_spec); OLALA_TPA_SPEC_FUSED=0 keeps the eager per-op path.
+_FUSED_SPEC = os.environ.get("OLALA_TPA_SPEC_FUSED", "1") != "0"
 
 
 class OlalaTokenShiftState(nn.Module, MambaBase):
@@ -477,21 +483,35 @@ class OlalaDiffTPAAttention(PluggableLayer):
             attn_metadata = get_forward_context().attn_metadata
             if attn_metadata is not None and self.shift_state.prefix in attn_metadata:
                 md = attn_metadata[self.shift_state.prefix]
-                if md.num_prefills != 0 or md.spec is not None:
+                if md.num_prefills != 0 or (md.spec is not None and not _FUSED_SPEC):
                     md = None
         if md is not None:
             # Pure decode batch: one kernel per (token, kv head) for the K/V
-            # reconstruction, token shift, q/k norms and softmax scaling.
+            # reconstruction, token shift, q/k norms and softmax scaling; for a
+            # verify batch one program per (request, kv head) chains the
+            # positions (column-slot protocol).
             k_pool, v_pool = self.shift_state.kv_cache
-            q_flat, k_flat, v_flat = tpa_decode_qkv(
-                q_all, A_k_all, A_v_all, B_k_all, B_v_all,
-                shift_alphas[0], shift_alphas[1], positions,
-                md.state_indices_tensor, k_pool, v_pool,
+            common = (
+                k_pool, v_pool,
                 self.q_norm.norm.weight, self.k_norm.norm.weight,
                 self.q_norm.norm.eps, self.softmax_scaler,
                 float(getattr(self.config, "sliding_window_size", 0) or 0),
                 self.num_kv_heads_local, self.snr + 1, self.rank, self.head_dim,
             )
+            if md.spec is not None:
+                spec = md.spec
+                q_flat, k_flat, v_flat = tpa_decode_qkv_spec(
+                    q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                    shift_alphas[0], shift_alphas[1], positions,
+                    spec.query_start_loc_d, spec.state_cols,
+                    spec.num_accepted_tokens, *common,
+                )
+            else:
+                q_flat, k_flat, v_flat = tpa_decode_qkv(
+                    q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                    shift_alphas[0], shift_alphas[1], positions,
+                    md.state_indices_tensor, *common,
+                )
             attn_out = self.attn(q_flat, k_flat, v_flat)
             tpa_diff_combine(attn_out, lam_all, out, self.num_noise_heads_local,
                              self.snr, self.head_dim)

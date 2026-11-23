@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
     cudagraph_utils as spec_cudagraph_utils,
 )
@@ -352,6 +353,9 @@ def _make_spec_decode_manager(
     max_num_seqs: int = 8,
     use_kda_recoverssm: bool = False,
     varlen_decode: bool = False,
+    manager_cls: type[
+        gpu_cudagraph_utils.CudaGraphManager
+    ] = gpu_cudagraph_utils.CudaGraphManager,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -363,7 +367,7 @@ def _make_spec_decode_manager(
         "get_global_graph_pool",
         lambda: object(),
     )
-    manager = gpu_cudagraph_utils.CudaGraphManager(
+    manager = manager_cls(
         vllm_config=_create_decode_vllm_config(
             capture_sizes or [1, 2, 4, 8, 16, 24],
             num_speculative_tokens=num_speculative_tokens,
@@ -539,6 +543,36 @@ def test_dynamic_spec_decode_shared_token_count_stays_reachable(monkeypatch):
             )
             == desc
         ), desc
+
+
+@pytest.mark.parametrize(
+    "manager_cls,expected_query_lens",
+    [
+        (gpu_cudagraph_utils.CudaGraphManager, {1, 4}),
+        # DFlash drafts its full block whatever K the schedule picks.
+        (DFlashCudaGraphManager, {4}),
+    ],
+)
+def test_dynamic_spec_decode_query_lens_follow_manager(
+    monkeypatch, manager_cls, expected_query_lens
+):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=4,
+        capture_sizes=[4, 8, 16, 24],
+        num_speculative_tokens=3,
+        # K 3 up to two requests, then 0: decode query lengths 4 and 1.
+        dynamic_spec_schedule=[(1, 2, 3), (3, 8, 0)],
+        manager_cls=manager_cls,
+    )
+
+    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert {desc.uniform_token_count for desc in full_descs} == expected_query_lens
+    desc = manager.dispatch(
+        num_reqs=2, num_tokens=8, uniform_token_count=4, num_active_loras=0
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.num_tokens == 8
 
 
 @pytest.mark.parametrize("specialize", [False, True])

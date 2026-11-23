@@ -57,8 +57,11 @@ from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     mamba3_replay_step,
     mamba3_step_cuda,
     mamba3_step_cuda_raw,
+    mamba3_verify_cuda,
     refresh_f32_cache,
     replay_step_supported,
+    verify_kernel_enabled,
+    verify_supported,
 )
 from vllm.model_executor.layers.mamba.olala.replay import replay_reset
 from vllm.model_executor.custom_op import PluggableLayer
@@ -1261,6 +1264,44 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         angle = bc[..., 2 * R * S :]
         bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
 
+        if verify_kernel_enabled() and verify_supported(
+            ssm_pool, k_pool, v_pool, angle_pool, H, D, S, R, self.num_rope_angles
+        ):
+            # One launch for every position of every request
+            # (csrc/mamba3_verify.cu), bit-identical to chaining the CUDA
+            # decode step over the positions.
+            direct = (
+                not self._postgate_norm
+                and out.dtype == x.dtype
+                and out.is_contiguous()
+            )
+            y = out.view(ndt, H, D) if direct else torch.empty_like(x)
+            mamba3_verify_cuda(
+                ssm_pool, k_pool, v_pool, angle_pool, _A, bn_cn[:, 0],
+                bn_cn[:, 1], self.D, x, DT, trap, xpj, zpj, outpj, z, bias_q,
+                bias_k, angle, spec.query_start_loc_d, spec.state_cols,
+                spec.num_accepted_tokens, y,
+            )  # fmt: skip
+            if not direct:
+                y = y.reshape(ndt, H * D)
+                if self._postgate_norm:
+                    y = self.output_norm(y)
+                out.copy_(y.to(out.dtype))
+            return
+        self._decode_spec_chain(
+            u, out, spec, pools, x, z, _A, DT, trap, bn_cn, angle
+        )
+
+    def _decode_spec_chain(
+        self, u, out, spec, pools, x, z, _A, DT, trap, bn_cn, angle
+    ) -> None:
+        """Reference verify path (OLALA_MAMBA3_VERIFY != cuda, or shapes the
+        fused kernel does not cover): the step kernel launched once per
+        position."""
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        H, D = self.nheads_local, self.headdim
+        ndt = u.shape[0]
+        bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
         qsl = spec.query_start_loc_d
         starts = qsl[:-1].long()
         qlens = torch.diff(qsl)

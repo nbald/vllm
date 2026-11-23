@@ -1526,6 +1526,14 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         max_model_len=8192,
         max_num_seqs=32,
     ),
+    "DSpineDraftModel": _HfExamplesInfo(
+        "Qwen/Qwen3.8-27B",
+        speculative_model="tencent/Qwen3.8-27B-DSpine-b16",
+        is_available_online=False,
+        use_original_num_layers=True,
+        max_model_len=8192,
+        max_num_seqs=32,
+    ),
     "DFlash2BeamDraftModel": _HfExamplesInfo(
         "reflection/Beam-1.0-501B-A23B-NVFP4",
         speculative_model="reflection/Beam-1.0-501B-A23B-DFlash2",

@@ -76,6 +76,13 @@ class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
 
+    # Under dynamic speculative decoding the drafter still drafts its full
+    # block every step (the runner truncates the drafts to the scheduled K, and
+    # K = 0 skips the query forward), so only the full query length is ever
+    # replayed. Shorter captures would only cost time and memory, and drafters
+    # whose block length is fixed at load time (DSpine) cannot run them.
+    expand_dynamic_sd_query_lens = False
+
     def capture(
         self,
         forward_fn: Callable,

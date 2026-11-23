@@ -89,6 +89,132 @@ def _tpa_decode_qkv_kernel(
 
 
 @triton.jit
+def _tpa_qkv_row(
+    n, h, k, v, kprev, vprev, use_prev,
+    q_ptr, sq_n, sq_h, alk_ptr, alv_ptr, sal_n, pos_ptr,
+    qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr, ko_ptr, vo_ptr,
+    HKV: tl.constexpr, GQ: tl.constexpr, D: tl.constexpr,
+):
+    """Shift blend, k norm and the GQ query heads of one (token, kv head), as
+    _tpa_decode_qkv_kernel."""
+    offs = tl.arange(0, D)
+    a_k = tl.sigmoid(tl.load(alk_ptr + n * sal_n + h).to(tl.float32))
+    a_v = tl.sigmoid(tl.load(alv_ptr + n * sal_n + h).to(tl.float32))
+    pos = tl.load(pos_ptr + n)
+    a_k = tl.where((pos == 0) | (use_prev == 0), 0.0, a_k)
+    a_v = tl.where((pos == 0) | (use_prev == 0), 0.0, a_v)
+    ks = (a_k * kprev + (1.0 - a_k) * k).to(tl.bfloat16).to(tl.float32)
+    vs = (a_v * vprev + (1.0 - a_v) * v).to(tl.bfloat16)
+    tl.store(vo_ptr + n * (HKV * D) + h * D + offs, vs)
+    kw = (1.0 + tl.load(kw_ptr + offs).to(tl.float32)).to(tl.bfloat16)
+    kw = kw.to(tl.float32)
+    inv = 1.0 / tl.sqrt(tl.sum(ks * ks, axis=0) / D + eps)
+    kn = (ks * inv).to(tl.bfloat16).to(tl.float32)
+    tl.store(ko_ptr + n * (HKV * D) + h * D + offs, (kn * kw).to(tl.bfloat16))
+    qw = (1.0 + tl.load(qw_ptr + offs).to(tl.float32)).to(tl.bfloat16)
+    qw = qw.to(tl.float32)
+    p1 = tl.maximum(pos.to(tl.float32) + 1.0, 1.0)
+    if wsize > 0:
+        p1 = tl.minimum(p1, wsize)
+    log_pos = tl.log(p1).to(tl.bfloat16).to(tl.float32)
+    for j in range(GQ):
+        hq = h * GQ + j
+        q = tl.load(q_ptr + n * sq_n + hq * sq_h + offs).to(tl.float32)
+        inv_q = 1.0 / tl.sqrt(tl.sum(q * q, axis=0) / D + eps)
+        qn = (q * inv_q).to(tl.bfloat16).to(tl.float32)
+        qn = (qn * qw).to(tl.bfloat16).to(tl.float32)
+        sc = tl.load(scaler_ptr + hq).to(tl.bfloat16).to(tl.float32)
+        scale = (sc * log_pos).to(tl.bfloat16).to(tl.float32)
+        tl.store(
+            qo_ptr + n * (HKV * GQ * D) + hq * D + offs,
+            (qn * scale).to(tl.bfloat16),
+        )
+
+
+@triton.jit
+def _tpa_raw_kv(
+    n, h, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n,
+    R: tl.constexpr, D: tl.constexpr,
+):
+    offs = tl.arange(0, D)
+    k = tl.zeros([D], dtype=tl.float32)
+    v = tl.zeros([D], dtype=tl.float32)
+    for r in range(R):
+        ak_r = tl.load(ak_ptr + n * sa_n + h * R + r).to(tl.float32)
+        av_r = tl.load(av_ptr + n * sa_n + h * R + r).to(tl.float32)
+        k += ak_r * tl.load(bk_ptr + n * sb_n + r * D + offs).to(tl.float32)
+        v += av_r * tl.load(bv_ptr + n * sb_n + r * D + offs).to(tl.float32)
+    k = (k.to(tl.bfloat16).to(tl.float32) / R).to(tl.bfloat16).to(tl.float32)
+    v = (v.to(tl.bfloat16).to(tl.float32) / R).to(tl.bfloat16).to(tl.float32)
+    return k, v
+
+
+@triton.jit
+def _tpa_decode_qkv_spec_kernel(
+    q_ptr, sq_n, sq_h,
+    ak_ptr, av_ptr, sa_n,
+    bk_ptr, bv_ptr, sb_n,
+    alk_ptr, alv_ptr, sal_n,
+    pos_ptr,
+    qsl_ptr, cols_ptr, scol, ncols, acc_ptr, lanes, N,
+    kpool_ptr, vpool_ptr, sp_n, sp_h, P,
+    qw_ptr, kw_ptr, eps,
+    scaler_ptr, wsize,
+    qo_ptr, ko_ptr, vo_ptr,
+    HKV: tl.constexpr,
+    GQ: tl.constexpr,
+    R: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Spec-decode verify rows (column-slot protocol, see olala_spec_utils):
+    one program per (request, kv head) walks the request's positions in order.
+    Position 0 shifts against the pool column of the accepted state, position
+    t > 0 against the raw K/V of position t - 1; position t's raw K/V goes to
+    column t. Program ``lanes`` passes the CUDA-graph padding rows past the
+    last request through unshifted, without touching the pool."""
+    r = tl.program_id(0)
+    h = tl.program_id(1)
+    offs = tl.arange(0, D)
+    if r < lanes:
+        start = tl.load(qsl_ptr + r)
+        qlen = tl.minimum(tl.load(qsl_ptr + r + 1) - start, ncols)
+        c0 = tl.maximum(tl.load(acc_ptr + r) - 1, 0)
+        init = tl.load(cols_ptr + r * scol + c0)
+        irow = tl.minimum(tl.maximum(init, 0), P - 1).to(tl.int64)
+        kprev = tl.load(kpool_ptr + irow * sp_n + h * sp_h + offs).to(tl.float32)
+        vprev = tl.load(vpool_ptr + irow * sp_n + h * sp_h + offs).to(tl.float32)
+        for t in range(qlen):
+            n = start + t
+            k, v = _tpa_raw_kv(
+                n, h, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n, R, D
+            )
+            _tpa_qkv_row(
+                n, h, k, v, kprev, vprev, 1,
+                q_ptr, sq_n, sq_h, alk_ptr, alv_ptr, sal_n, pos_ptr,
+                qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr, ko_ptr, vo_ptr,
+                HKV, GQ, D,
+            )
+            dst = tl.load(cols_ptr + r * scol + t)
+            drow = tl.minimum(tl.maximum(dst, 0), P - 1).to(tl.int64)
+            dpos = drow * sp_n + h * sp_h + offs
+            tl.store(kpool_ptr + dpos, k.to(kpool_ptr.dtype.element_ty))
+            tl.store(vpool_ptr + dpos, v.to(vpool_ptr.dtype.element_ty))
+            kprev = k
+            vprev = v
+    else:
+        for n in range(tl.load(qsl_ptr + lanes), N):
+            k, v = _tpa_raw_kv(
+                n, h, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n, R, D
+            )
+            _tpa_qkv_row(
+                n, h, k, v, k, v, 0,
+                q_ptr, sq_n, sq_h, alk_ptr, alv_ptr, sal_n, pos_ptr,
+                qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr, ko_ptr, vo_ptr,
+                HKV, GQ, D,
+            )
+
+
+@triton.jit
 def _tpa_diff_combine_kernel(
     attn_ptr,          # (N, Hkv*(SNR+1)*D) contiguous
     lam_ptr, sl_n,     # lambda logits (N, Hkv): row stride
@@ -127,6 +253,33 @@ def tpa_decode_qkv(q_all, A_k, A_v, B_k, B_v, alpha_k, alpha_v, positions, slots
         B_k, B_v, B_k.stride(0),
         alpha_k, alpha_v, alpha_k.stride(0),
         positions, slots,
+        k_pool, v_pool, k_pool.stride(0), k_pool.stride(1), k_pool.shape[0],
+        q_w, k_w, eps, scaler, float(wsize),
+        q_out, k_out, v_out,
+        HKV=hkv, GQ=gq, R=rank, D=d, num_warps=2,
+    )
+    return q_out, k_out, v_out
+
+
+def tpa_decode_qkv_spec(q_all, A_k, A_v, B_k, B_v, alpha_k, alpha_v, positions,
+                        qsl, cols, num_accepted, k_pool, v_pool, q_w, k_w, eps,
+                        scaler, wsize, hkv, gq, rank, d):
+    """tpa_decode_qkv for a verify batch (decode rows only, ragged per request):
+    ``qsl`` (lanes + 1,) decode-token offsets, ``cols`` (lanes, 1 + k) pool
+    columns, ``num_accepted`` (lanes,) previous acceptance."""
+    n = q_all.shape[0]
+    dt = q_all.dtype
+    q_out = torch.empty(n, hkv * gq * d, dtype=dt, device=q_all.device)
+    k_out = torch.empty(n, hkv * d, dtype=dt, device=q_all.device)
+    v_out = torch.empty(n, hkv * d, dtype=dt, device=q_all.device)
+    lanes = cols.shape[0]
+    _tpa_decode_qkv_spec_kernel[(lanes + 1, hkv)](
+        q_all, q_all.stride(0), d,
+        A_k, A_v, A_k.stride(0),
+        B_k, B_v, B_k.stride(0),
+        alpha_k, alpha_v, alpha_k.stride(0),
+        positions,
+        qsl, cols, cols.stride(0), cols.shape[1], num_accepted, lanes, n,
         k_pool, v_pool, k_pool.stride(0), k_pool.stride(1), k_pool.shape[0],
         q_w, k_w, eps, scaler, float(wsize),
         q_out, k_out, v_out,
