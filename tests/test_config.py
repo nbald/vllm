@@ -1024,7 +1024,12 @@ def test_v2_model_runner_supports_custom_logits_processors():
 
 @pytest.mark.parametrize(
     "architecture",
-    ["DFlash2DraftModel", "DFlash2BeamDraftModel", "LiLiCorrDraftModel"],
+    [
+        "DFlash2DraftModel",
+        "DFlash2BeamDraftModel",
+        "LiLiCorrDraftModel",
+        "DSpineDraftModel",
+    ],
 )
 def test_dflash_candidate_draft_forces_v2_model_runner(architecture):
     """A DFlash2 draft must reach the V2 speculator, the only one that runs its
@@ -3866,7 +3871,9 @@ def test_dual_key_gumbel_supports_probabilistic_speculative_decoding(
     config._check_supports_watermarking()
 
 
-@pytest.mark.parametrize("architecture", ["DFlash2DraftModel", "LiLiCorrDraftModel"])
+@pytest.mark.parametrize(
+    "architecture", ["DFlash2DraftModel", "LiLiCorrDraftModel", "DSpineDraftModel"]
+)
 def test_dual_key_gumbel_rejects_dflash_candidate_drafts(architecture):
     config = _watermarked_vllm_config()
     config.watermark_config = WatermarkConfig(algorithm="dual_key_gumbel", key=42)

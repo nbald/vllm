@@ -39,6 +39,12 @@ def init_speculator(
             )
 
             return LiLiCorrSpeculator(vllm_config, device)
+        if "DSpineDraftModel" in architectures:
+            from vllm.v1.worker.gpu.spec_decode.dspine.speculator import (
+                DSpineSpeculator,
+            )
+
+            return DSpineSpeculator(vllm_config, device)
         if {"DFlash2DraftModel", "DFlash2BeamDraftModel"}.intersection(architectures):
             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
                 DFlash2Speculator,
