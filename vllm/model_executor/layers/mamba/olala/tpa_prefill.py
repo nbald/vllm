@@ -16,6 +16,7 @@ from functools import lru_cache
 import torch
 
 from vllm.model_executor.layers.mamba.olala import fa4_softcap
+from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gencode, gpu_family, sm_arch
 from vllm.triton_utils import tl, triton
 
 
@@ -232,6 +233,30 @@ def prefill_q_prescale(softmax_scale: float, softcap: float) -> float | None:
     return softmax_scale / softcap
 
 
+@lru_cache(maxsize=1)
+def _volta_attn_ext():
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+    return load_extension(f"olala_tpa_prefill_attn_volta_sm{sm_arch()}", "tpa_prefill_attn_volta.cu",
+                          ["-O3", "-std=c++20", "--use_fast_math", gencode()])
+
+
+def _volta_attn_ok(q, k, prescaled) -> bool:
+    """SM70 family (V100 through volta-forever, which emulates FA2's bf16 mma.sync / ldmatrix / cp.async with
+    scalar code): the FMA edition csrc/tpa_prefill_attn_volta.cu, which returns FA2's values (head dim 128, 4 query
+    heads per KV head). OLALA_VOLTA_PREFILL=0 keeps FA2."""
+    return (not prescaled and os.environ.get("OLALA_VOLTA_PREFILL", "1") == "1"
+            and gpu_family() is GpuFamily.SM70 and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16
+            and q.shape[-1] == 128 and q.shape[1] == 4 * k.shape[1])
+
+
+def _vec_ok(t: torch.Tensor) -> torch.Tensor:
+    # 16-byte rows for the kernel's vector loads and stores
+    if t.stride(-1) != 1 or t.stride(0) % 8 or t.stride(1) % 8 or t.data_ptr() % 16:
+        return t.contiguous()
+    return t
+
+
 def tpa_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                          softmax_scale, softcap, prescaled=False):
     """Causal varlen attention of the dense prefill K/V.
@@ -239,7 +264,14 @@ def tpa_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_
     With FA4 and a softcap, ``OLALA_FA4_SOFTCAP`` picks: ``native`` (default on sm_10x, see
     fa4_softcap.py), ``mod`` (the fast score_mod above) or ``fa4`` (FA4's own softcap).
     ``prescaled``: q already times ``prefill_q_prescale(...)`` (native path only).
+    On the SM70 family: the FMA kernel csrc/tpa_prefill_attn_volta.cu (FA2's values).
     """
+    if _volta_attn_ok(q, k, prescaled):
+        q, k, v = _vec_ok(q), _vec_ok(k), _vec_ok(v)
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        _volta_attn_ext().attn_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k, out, int(max_seqlen_q),
+                                   float(softmax_scale), float(softcap))
+        return out
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func, get_flash_attn_version
 
     fa_version = get_flash_attn_version()
