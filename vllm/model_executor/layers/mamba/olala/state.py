@@ -55,6 +55,50 @@ class ReplayConfig:
 
 DEFAULT_REPLAY_BUFFER_LEN = 8
 
+# OLALA_VOLTA_STATE16=1 picks this format (see volta_state16)
+DEFAULT_VOLTA_STATE16 = "fp16"
+# formats and their code for the step kernel (mamba3_step_cuda's state16); bf16sr / fp16sr round
+# stochastically: measurement editions
+STATE16_CODES = {"bf16": 1, "fp16": 2, "bf16sr": 3, "fp16sr": 4}
+
+
+def state16_scaled(fmt: str | None) -> bool:
+    """The format stores fp16 rows with per-row scales (a fifth state tensor)."""
+    return fmt in ("fp16", "fp16sr")
+
+
+@lru_cache(maxsize=1)
+def volta_state16() -> str | None:
+    """16-bit SSM state of the SM70 family (V100), opt-in: ``OLALA_VOLTA_STATE16``.
+
+    ``bf16``: the state is stored in bf16 (round to nearest even), ``fp16``: in fp16 with one power-of-two scale
+    per state row (head, p) in an extra fp32 pool tensor, ``1``: the default format (``DEFAULT_VOLTA_STATE16``);
+    unset or ``0``: off; ``bf16sr`` / ``fp16sr``: the same with stochastic rounding in the decode step
+    (measurement editions). The decode step and the prefill state pass compute in fp32 and round only what they store
+    (``mamba3_step_volta16_kernel`` in csrc/mamba3_step.cu, ``_ssd_state_pass_pool``): half the state traffic of the
+    fp32 state, which is the Mamba step's floor at high concurrency. Read only on the SM70 family
+    (``arch.sm70_family_no_context``, i.e. ``gpu_family() is GpuFamily.SM70`` without a CUDA context: the state
+    dtypes are decided in configuration code); elsewhere the switch is ignored. Not combinable with ReplaySSM, an
+    explicit ``--mamba-ssm-cache-dtype`` or speculative decoding.
+    """
+    v = os.environ.get("OLALA_VOLTA_STATE16", "0").strip().lower()
+    if v in ("", "0", "off", "no", "false"):
+        return None
+    if v in ("1", "on", "yes", "true"):
+        v = DEFAULT_VOLTA_STATE16
+    if v not in STATE16_CODES:
+        raise ValueError(f"OLALA_VOLTA_STATE16 must be one of {sorted(STATE16_CODES)}, 1 or 0, got {v!r}")
+    from vllm.model_executor.layers.mamba.olala.arch import sm70_family_no_context
+
+    if not sm70_family_no_context():
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning("OLALA_VOLTA_STATE16 is read on the SM70 family (V100) only: ignored.")
+        return None
+    if replay_config() is not None:
+        raise ValueError("OLALA_VOLTA_STATE16 and OLALA_REPLAY_SSM cannot be combined.")
+    return v
+
 
 @lru_cache(maxsize=1)
 def replay_config() -> ReplayConfig | None:
@@ -88,16 +132,30 @@ def mamba3_state_dtype(
     repetition loops (bf16 storage is ~16% faster at high concurrency; opt in
     with ``--mamba-ssm-cache-dtype bfloat16``). With ReplaySSM, ``auto`` is a
     bf16 anchor, which that compounding does not apply to.
+
+    On the SM70 family, ``OLALA_VOLTA_STATE16`` (``volta_state16``) stores the
+    state in bf16, or in fp16 followed by a fifth tensor of per-row fp32
+    scales; the Volta kernels compute it in fp32 and round only what they store.
     """
     state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
     rc = replay_config()
-    if mamba_ssm_cache_dtype == "auto":
+    s16 = volta_state16()
+    if s16 is not None and mamba_ssm_cache_dtype != "auto":
+        raise ValueError(
+            "OLALA_VOLTA_STATE16 sets the SSM state dtype itself: leave "
+            f"--mamba-ssm-cache-dtype at auto (got {mamba_ssm_cache_dtype})."
+        )
+    if s16 is not None:
+        ssm_dtype = torch.float16 if state16_scaled(s16) else torch.bfloat16
+    elif mamba_ssm_cache_dtype == "auto":
         # ReplaySSM rounds its anchor once per window, not every step: bf16
         # holds fp32 quality there (see ReplayConfig)
         ssm_dtype = torch.bfloat16 if rc is not None else torch.float32
     else:
         ssm_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
     dtypes = (torch.float32, ssm_dtype, state_dtype, state_dtype)
+    if state16_scaled(s16):
+        dtypes += (torch.float32,)  # per-row inverse scales of the fp16 state
     if rc is not None:
         dtypes += (torch.bfloat16, torch.bfloat16, torch.float32, torch.int32)
         if rc.read_fp8:
@@ -121,6 +179,9 @@ def mamba3_state_shape(
     ``(A*dt, gamma, beta, -) (nh, L, 4)`` and ``(count, flush target)
     (nh, 2)``; then the fp8 read copy ``(nh, head_dim, d_state)`` and its
     per-row scales ``(nh, head_dim)`` if enabled.
+
+    With ``OLALA_VOLTA_STATE16=fp16`` a fifth tensor ``(nh, head_dim)`` holds
+    the inverse power-of-two scale of each fp16 state row.
     """
     nh = divide(num_heads, tp_world_size)
     shapes: tuple[tuple[int, ...], ...] = (
@@ -129,6 +190,8 @@ def mamba3_state_shape(
         (mimo_dim, nh, d_state),
         (nh, head_dim),
     )
+    if state16_scaled(volta_state16()):
+        shapes += ((nh, head_dim),)
     rc = replay_config()
     if rc is not None:
         L = rc.buffer_len

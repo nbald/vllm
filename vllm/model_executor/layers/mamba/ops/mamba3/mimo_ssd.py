@@ -308,10 +308,17 @@ def _ssd_state_pass_pool(
     T, H,
     HAS_INIT: tl.constexpr, R: tl.constexpr, N: tl.constexpr, P: tl.constexpr, NQ: tl.constexpr,
     PB: tl.constexpr, NSTAGES: tl.constexpr = 4,
+    sc_pool=None, s_sc=0, SCALED: tl.constexpr = False,
 ):
     """_ssd_state_pass reading the entering state straight from the request's pool slot (zero when
     has_initial_state is false) and writing the final SSM state back into it; the final angle goes
-    to fin_ang (written to the pool later: other programs of this sequence still read it)."""
+    to fin_ang (written to the pool later: other programs of this sequence still read it).
+
+    SCALED (OLALA_VOLTA_STATE16=fp16, SM70 family): the pool holds fp16 rows (h, p) whose inverse
+    power-of-two scales are in sc_pool (slots, H, P) fp32, as the 16-bit Volta decode step stores them:
+    read as fp16 * scale; written as fp16(S * 2^(14 - e)), e the exponent of the row's max |S| (a zero
+    row: e = -110), scale 2^(e - 14). A bf16 pool needs no flag (widened on load, rounded to nearest
+    even on store)."""
     h = tl.program_id(0)
     s = tl.program_id(1)
     p0 = tl.program_id(2) * PB
@@ -327,6 +334,12 @@ def _ssd_state_pass_pool(
         st1 = tl.load(sb + p[None, :] * N + NQ + nq[:, None], mask=hi, other=0.0).to(tl.float32)
         st2 = tl.load(sb + p[None, :] * N + 2 * NQ + nq[:, None], mask=hi, other=0.0).to(tl.float32)
         st3 = tl.load(sb + p[None, :] * N + 3 * NQ + nq[:, None], mask=hi, other=0.0).to(tl.float32)
+        if SCALED:
+            rs = tl.load(sc_pool + slot * s_sc + h * P + p, mask=hi, other=0.0)[None, :]
+            st0 = st0 * rs
+            st1 = st1 * rs
+            st2 = st2 * rs
+            st3 = st3 * rs
         t0 = tl.load(seq_t0_ptr + s)
         bscale = tl.load(DT_ptr + h * T + t0) * tl.sigmoid(-tl.load(TRAP_ptr + h * T + t0).to(tl.float32))
         bscale = tl.where(hi, bscale, 0.0)
@@ -369,6 +382,17 @@ def _ssd_state_pass_pool(
         st3 = dec * st3 + l3
         th = _mod2pi(th + tl.load(asum_ptr + (c * H + h) * NQ + nq))
     dt_ = ssm_pool.dtype.element_ty
+    if SCALED:
+        # per row p: the max over its N state entries sets the scale (exponent from the fp32 bits)
+        m = tl.maximum(tl.maximum(tl.max(tl.abs(st0), axis=0), tl.max(tl.abs(st1), axis=0)),
+                       tl.maximum(tl.max(tl.abs(st2), axis=0), tl.max(tl.abs(st3), axis=0)))
+        ex = tl.maximum(((m.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127, -110)
+        up = ((141 - ex) << 23).to(tl.float32, bitcast=True)[None, :]  # 2^(14 - ex)
+        tl.store(sc_pool + slot * s_sc + h * P + p, ((ex + 113) << 23).to(tl.float32, bitcast=True))  # 2^(ex - 14)
+        st0 = st0 * up
+        st1 = st1 * up
+        st2 = st2 * up
+        st3 = st3 * up
     tl.store(sb + p[None, :] * N + nq[:, None], st0.to(dt_))
     tl.store(sb + p[None, :] * N + NQ + nq[:, None], st1.to(dt_))
     tl.store(sb + p[None, :] * N + 2 * NQ + nq[:, None], st2.to(dt_))
@@ -456,9 +480,13 @@ def mamba3_mimo_hybrid_pools(
     chunk_tokens: int | None = None,
     tl_chunk: int = 16,
     tune: dict | None = None,
+    ssm_scale: torch.Tensor | None = None,
 ):
     """:func:`mamba3_mimo_hybrid` reading the entering states from and writing the final states to
-    the request pool slots in place (``has_init`` None: every sequence starts from zero)."""
+    the request pool slots in place (``has_init`` None: every sequence starts from zero).
+
+    ``ssm_scale`` (OLALA_VOLTA_STATE16=fp16): the per-row inverse scales (slots, H, P) fp32 of an fp16
+    ssm pool (``_ssd_state_pass_pool`` SCALED)."""
     from .mimo_fwd_varlen import mamba_mimo_forward_varlen
     from .segsum import compute_dacs_segsum_triton_varlen
     angle_pool, ssm_pool, k_pool, v_pool = pools
@@ -533,6 +561,7 @@ def mamba3_mimo_hybrid_pools(
         angle_pool.stride(0), ssm_pool.stride(0), k_pool.stride(0), v_pool.stride(0),
         psi, DT, Trap, SinT, Ain, fin_ang, T, H,
         HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=tune.get("pass_nw", 1 if long_seq else 2),
+        **({} if ssm_scale is None else dict(sc_pool=ssm_scale, s_sc=ssm_scale.stride(0), SCALED=True)),
     )
     if scan_tc:
         k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)
