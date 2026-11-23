@@ -60,8 +60,11 @@ from vllm.model_executor.layers.mamba.olala.tpa_factor import (
     factor_cache_enabled,
     factor_decode_attention,
     factor_decode_write,
+    factor_decode_write_spec,
     factor_rows,
+    factor_spec_enabled,
     num_splits_for_batch,
+    num_splits_for_verify,
     reconstruct_dense_batched,
     reconstruct_dense_kv,
     write_rows,
@@ -765,9 +768,14 @@ class OlalaDiffTPAAttention(PluggableLayer):
             nd, ndt = md.num_decodes, md.num_decode_tokens
             np_, npt = md.num_prefills, md.num_prefill_tokens
             if ms.spec is not None:
-                raise NotImplementedError(
-                    "speculative decoding with OLALA_TPA_FACTOR=1")
-            if nd > 0 and os.environ.get("OLALA_TPA_FACTOR_DECODE_DENSE") == "1":
+                if not factor_spec_enabled():
+                    raise NotImplementedError(
+                        "speculative decoding with OLALA_TPA_FACTOR=1 needs OLALA_TPA_FACTOR_SPEC=1")
+                self._factor_verify(
+                    md, ms, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                    alpha_k_all, alpha_v_all, slot_mapping, kplane, vplane, attn_out,
+                )
+            elif nd > 0 and os.environ.get("OLALA_TPA_FACTOR_DECODE_DENSE") == "1":
                 # Debug: route decode rows through the write + reconstruct + FA path.
                 reqs = (nd, list(range(nd + 1)), md.seq_lens[:nd].tolist(), [True] * nd,
                         ms.state_indices_tensor[:nd].tolist(), 0)
@@ -812,6 +820,41 @@ class OlalaDiffTPAAttention(PluggableLayer):
                 attn_out[ndt + npt :] = 0  # cudagraph padding rows
         tpa_diff_combine(attn_out, lam_all, out, self.num_noise_heads_local,
                          self.snr, self.head_dim)
+
+    def _factor_verify(
+        self, md, ms, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+        alpha_k_all, alpha_v_all, slot_mapping, kplane, vplane, attn_out,
+    ) -> None:
+        """Verify rows of a spec step (OLALA_TPA_FACTOR_SPEC), pure or mixed: the
+        factor row and token shift of every position (factor_decode_write_spec,
+        column-slot protocol or light columns), then attention through the
+        factor decode kernel on one virtual single-token row per position
+        (seq_len = committed context + position + 1). Rejected positions leave
+        rows past the accepted ones: the next step overwrites them, and the
+        kernel reads only rows < seq_len."""
+        ndt = md.num_decode_tokens
+        spec = ms.spec
+        assert md.num_decodes == ms.num_decodes, (
+            f"{self.prefix}: factor and token-shift builders split the batch differently "
+            f"({md.num_decodes} vs {ms.num_decodes} verify requests)"
+        )
+        k_cols, v_cols, ak_cols, av_cols = self._ts_kv(spec=True)
+        q_d = factor_decode_write_spec(
+            q_all[:ndt], A_k_all[:ndt], A_v_all[:ndt], B_k_all[:ndt], B_v_all[:ndt],
+            alpha_k_all[:ndt], alpha_v_all[:ndt], positions[:ndt],
+            spec.query_start_loc_d, spec.state_cols, spec.num_accepted_tokens,
+            slot_mapping[:ndt], k_cols, v_cols, ak_cols, av_cols,
+            self.q_norm.norm.weight, self.k_norm.norm.weight,
+            self.q_norm.norm.eps, self.softmax_scaler,
+            float(getattr(self.config, "sliding_window_size", 0) or 0),
+            kplane, vplane, self.snr + 1,
+        )
+        bt_v, sl_v = md.virtual_decode_rows()
+        nsplit = num_splits_for_verify(md.num_decodes)
+        factor_decode_attention(
+            q_d, kplane, vplane, bt_v, sl_v, md.split_size(nsplit), nsplit,
+            self.scale, self.softcap, self.factor_cache.block_size, out=attn_out[:ndt],
+        )
 
     def _factor_prefill(
         self, md, ms, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,

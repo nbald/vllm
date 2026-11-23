@@ -6,7 +6,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OLALA_TPA_FACTOR` | `1` | TPA-factorized paged KV cache for the DiffTPA layers (stores the rank-4 factors, 2.5x smaller than dense K/V) with the wgmma decode-attention kernel. `0` = dense paged KV + standard attention backend. Not compatible with speculative decoding (use `0` with spec decode). |
+| `OLALA_TPA_FACTOR` | `1` | TPA-factorized paged KV cache for the DiffTPA layers (stores the rank-4 factors, 2.5x smaller than dense K/V) with the wgmma decode-attention kernel. `0` = dense paged KV + standard attention backend. Under speculative decoding it needs `OLALA_TPA_FACTOR_SPEC=1`; otherwise a speculative config sets it to `0`. |
 | `OLALA_MAMBA3_STEP` | `cuda` | Mamba-3 decode step: `cuda` = persistent CUDA kernel (bf16 and fp32 state); any other value = CuteDSL step (`ops/mamba3/step_cute.py`). |
 | `OLALA_GROUPED_PREFILL` | `1` | Group-parallel exact Mamba-3 varlen prefill for long prompts; `0` = single-pass kernel. |
 | `OLALA_GEMV` | `1` | Single-token Triton GEMV for decode projections; `0` = regular GEMM. |
@@ -16,6 +16,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_INT8_MOE_PREFILL` | `olala` | W8A16 checkpoints, prefill of per-channel INT8 routed experts: `olala` = Olala's grouped GEMMs, `vllm` = vLLM's `int8_w8a16` fused MoE (2 % slower on an RTX 5090). |
 | `VLLM_W8A16_INT8_DECODE` | `1` | W8A16 checkpoints: Triton decode kernels (GEMV, skinny GEMM) for the INT8 linears; `0` = prefill kernels at every batch size. Declared in `vllm/envs.py`, like `VLLM_W8A16_INT8_DEQ_SCRATCH_MB` (default `48`, the dequantization buffer of the prefill path). |
 | `OLALA_MAMBA3_VERIFY` | `cuda` | Speculative verify of the Mamba-3 layers: `cuda` = one fused launch for every draft position (`csrc/mamba3_verify.cu`, fp32 state, 7A1B shapes at TP=1), bit-identical to chaining the CUDA decode step; any other value = the decode step launched once per position. |
+| `OLALA_TPA_FACTOR_SPEC` | `0` | `1` keeps the TPA-factorized cache under speculative decoding: verify rows write their factor rows for every draft position and attend through the factor decode kernel, one single-token row per position (KV traffic x (1 + K) on long contexts). The factor blocks are 16 tokens on SM80 / SM120 (13 elsewhere). `0` = a speculative config turns the factor cache off (`OLALA_TPA_FACTOR=0`, with a log line) and refuses an explicit `OLALA_TPA_FACTOR=1`. |
 | `OLALA_TPA_SPEC_FUSED` | `1` | Speculative verify of the DiffTPA layers: fused K/V reconstruction, token shift, q/k norms and scaling (`tpa_decode_qkv_spec`); `0` = eager per-op path. |
 | `OLALA_DSPINE_FUSED`, `OLALA_DSPINE_GEMV`, `OLALA_DSPINE_CUDA_NORM` | `0` | Opt-in fast path of a DSpine drafter (compiled injection and transition scoring, `2` also compiles the draft layers; skinny GEMV; CUDA RMSNorm). See [DSpine](docs/features/speculative_decoding/dspine.md). |
 | `OLALA_DSPINE_SHARED_HEAD` | `0` | A DSpine drafter uses the target's LM head (INT8 on W8A16 checkpoints) instead of its own copy, which is not loaded. |
@@ -72,8 +73,9 @@ drafters such as DSpine select it automatically). Olala exposes auxiliary hidden
 EAGLE-3, DFlash and [DSpine](docs/features/speculative_decoding/dspine.md) drafters; by default the outputs of
 layers 1, 9, 17, 25 and 33.
 
-Requirements: `OLALA_TPA_FACTOR=0` (dense paged KV), `OLALA_REPLAY_SSM` unset or `0`, fp32 Mamba-3 state (the
-default). With a DSpine drafter, e.g. on an RTX 5090 with a Q8 target:
+Requirements: `OLALA_TPA_FACTOR=0` (dense paged KV) or `OLALA_TPA_FACTOR_SPEC=1` (factorized TPA cache,
+opt-in), `OLALA_REPLAY_SSM` unset or `0`, fp32 Mamba-3 state (the default). With a DSpine drafter, e.g. on an
+RTX 5090 with a Q8 target:
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 OLALA_TPA_FACTOR=0 OLALA_REPLAY_SSM=0 \
