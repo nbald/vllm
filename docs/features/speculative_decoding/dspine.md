@@ -95,6 +95,12 @@ validation runs. On an RTX 5090 with a 5-layer drafter and `K = 3`, all three
 flags with `"attention_backend": "TRITON_ATTN"` take a captured draft step from
 1.61 ms to 0.77 ms at one request.
 
+`OLALA_DSPINE_SHARED_HEAD=1` makes a drafter that ships its own head (`has_own_lm_head`) use the target's
+instead: the drafter's `lm_head.weight` is not loaded (0.47 GB for a 151,936 x 1,536 BF16 head), the draft
+logits go through the target's head (INT8 on W8A16 checkpoints) and the exact transition rescoring reads
+dequantized rows. Use it when the drafter's head is a copy of the target's: on the Q8 target the served
+acceptance changed by -0.01 % offline.
+
 ## Limitations
 
 - Model Runner V2 only (selected automatically).
