@@ -17,19 +17,25 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `VLLM_W8A16_INT8_DECODE` | `1` | W8A16 checkpoints: Triton decode kernels (GEMV, skinny GEMM) for the INT8 linears; `0` = prefill kernels at every batch size. Declared in `vllm/envs.py`, like `VLLM_W8A16_INT8_DEQ_SCRATCH_MB` (default `48`, the dequantization buffer of the prefill path). |
 | `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
 | `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). The extensions are built for the running GPU (SM80 or later, see GPU support below); if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
+| `OLALA_VOLTA` | auto | Volta (V100) detection, see GPU support below: auto = a native sm_70 GPU, or a process running through volta-forever (`VOLTA_FOREVER` set, or its `libcuda.so.1` proxy loaded); `1` / `0` forces the SM70 family on / off (`0` = the dispatch of the capability the process is told, e.g. SM80 through volta-forever). |
 | `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
 | `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
 
 ### GPU support
 
-The Olala kernels dispatch on GPU families (`vllm/model_executor/layers/mamba/olala/arch.py`): SM80 (Ampere,
-Ada), SM90 (Hopper), SM100 (B200, B300) and SM120 (consumer Blackwell: RTX 50xx, RTX PRO Blackwell). SM120 has
-its own paths, tuned on an RTX 5090:
+The Olala kernels dispatch on GPU families (`vllm/model_executor/layers/mamba/olala/arch.py`): SM70 (Volta:
+V100), SM80 (Ampere, Ada), SM90 (Hopper), SM100 (B200, B300) and SM120 (consumer Blackwell: RTX 50xx, RTX PRO
+Blackwell). SM120 has its own paths, tuned on an RTX 5090:
 
 - the Mamba-3 prefill runs the CUDA mma.sync chunk-state and output-pass kernels, as on SM80;
 - the decode projections use a dedicated GEMV dispatch: the full-K or K-loop GEMV at one row, the skinny kernel
   up to 32 rows (64 on wide outputs), cuBLAS beyond;
 - the medium-batch latent-MoE projections take the same dispatch.
+
+SM70 serves bf16 checkpoints through volta-forever, which runs CUDA 12/13 programs on a V100 and tells them
+compute capability 8.0 (`VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1`: vLLM keeps bf16, the Olala kernels build for
+sm_80 and the layer lowers them to sm_70, emulating the bf16 tensor-core instructions). The family is recognized
+before that capability (`OLALA_VOLTA`), and Volta runs the SM80 kernels wherever it has no path of its own.
 
 ReplaySSM (`OLALA_REPLAY_SSM`) needs the fp8 conversion instructions of sm_89 or later.
 
