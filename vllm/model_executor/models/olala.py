@@ -113,6 +113,7 @@ from vllm.model_executor.layers.mamba.olala import (
     OlalaDiffTPAAttention,
     OlalaMamba3Mixer,
     OlalaNorm,
+    volta_cuda,
 )
 from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
@@ -979,6 +980,9 @@ def _olala_geodesic_norm(
     clamp: float,
 ) -> torch.Tensor:
     out = torch.empty_like(x)
+    if volta_cuda.geodesic_ok(x, g, out, scale, bias):
+        # Volta: the CUDA edition of _geodesic_norm_kernel, bit for bit (volta_cuda.py)
+        return volta_cuda.geodesic(x, g, out, scale, bias, inv_depth, clamp)
     D = x.shape[-1]
     _geodesic_norm_kernel[(x.numel() // D,)](
         x,
@@ -1062,6 +1066,10 @@ class OlalaGeodesicNorm(nn.Module):
                 x, g, self.scale, self.bias, 1.0 / (self.layer_idx + 1), self.clamp
             )
         # into the caller's buffer: called from inside the opaque MoE op (eager)
+        if volta_cuda.geodesic_ok(x, g, out, self.scale, self.bias):
+            return volta_cuda.geodesic(
+                x, g, out, self.scale, self.bias, 1.0 / (self.layer_idx + 1), self.clamp
+            )
         D = x.shape[-1]
         _geodesic_norm_kernel[(x.numel() // D,)](
             x,
