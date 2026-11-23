@@ -745,6 +745,17 @@ def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, nactive_ptr, o_pt
              mask=hmask[:, None])
 
 
+@lru_cache(maxsize=1)
+def _volta_split_ctas() -> int:
+    """OLALA_TPA_SPLIT_CTAS=<n> (Volta, opt-in): KV splits for about n decode CTAs from 32 requests on, e.g. 512:
+    4 splits at 128 requests, 16 at 32. V100 through volta-forever, ~480-735-token contexts, kernel + combine, us:
+    128 requests 1075.7 (1 split, the default) -> 886.2 (4); 64: 580.6 (1) -> 478.2 (8); 32: 311.2 (2) -> 260.4 (16).
+    The partials merge differently: the outputs change at rounding level (bf16 output rounding vs fp64 alike)."""
+    if gpu_family() is not GpuFamily.SM70:
+        return 0
+    return int(os.environ.get("OLALA_TPA_SPLIT_CTAS", "0") or 0)
+
+
 def num_splits_for_batch(batch: int) -> int:
     """KV splits per request, a power of two so the combine kernel has at most 8
     specializations (all compiled during cudagraph capture). Hopper: ~_target_ctas()
@@ -754,6 +765,12 @@ def num_splits_for_batch(batch: int) -> int:
     if _hopper():
         want = max(1, min(128, -(-_target_ctas() // batch)))
         return 1 << (want - 1).bit_length()
+    volta = _volta_split_ctas()
+    if volta and batch >= 32:
+        # opt-in (OLALA_TPA_SPLIT_CTAS): about that many CTAs (power-of-two splits); the default (one wave of the
+        # resident CTAs) leaves the Volta kernel, at 1 CTA per SM, with 1-2 CTAs per request from 32 requests on
+        want = max(1, min(128, volta // batch))
+        return 1 << (want.bit_length() - 1)
     table = _split_table()
     if table:
         return next((n for b, n in reversed(table) if b <= batch), table[0][1])
