@@ -84,6 +84,7 @@ struct Args {
   int raw; const __nv_bfloat16* zxdt; long long zxdt_stride; const float* dt_bias; float a_floor;
   const float* wb; const float* wc; float eps;
   int pdl;   // launched with programmatic stream serialization: wait for the producer grid before reading its output
+  float* ssm_scale; long long sc_sst;   // 16-bit fp16 state (state16 = 2): per-row inverse scales (P, H, D), slot stride
 };
 
 template <bool F32> __device__ __forceinline__ void issue_item(const Args& a, Stage<F32>& st, int item, int t) {
@@ -843,6 +844,299 @@ __global__ void __launch_bounds__(THREADS, 3) mamba3_step_volta_kernel(const Arg
     }
   }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 16-bit state, Volta edition (OLALA_VOLTA_STATE16; host argument state16). The SSM state is stored in 16 bits and
+// computed in fp32: a thread's 64 state elements of the item (rows p0 and p0 + 8, columns j * 32 + 8 qd + [0, 8),
+// j = 0..3: 16-byte loads, 8 rows x 64 contiguous bytes per warp instruction) go to registers, are widened to fp32,
+// take the fp32 update h_new = alpha h + sum_k A[p][k] Bk[k][s] and the C dot o = h_new C'^T of mamba3_step_volta_kernel
+// on the unrounded values (same operations, same order per element), and only the stored state is rounded:
+//   state16 = 1  bf16, round to nearest even with integer operations (+ 0x7fff + the lowest kept bit, NaN kept as
+//                0x7fff): plain integer code, nothing for volta-forever to emulate (the bf16x2 conversion
+//                instruction of sm_80 is ~10 emulated instructions per pair there);
+//   state16 = 2  fp16 with one power-of-two scale per state row (h, p): with e the exponent of the row's max |h_new|,
+//                the row is stored as fp16(h_new * 2^(14 - e)) (round to nearest even, cvt.rn.f16.f32: a native
+//                Volta instruction), i.e. its max in [2^14, 2^15), and its inverse scale 2^(e - 14) (fp32) goes to the
+//                ssm_scale pool (P, H, D). 11 significant bits per element (bf16: 8) for any row magnitude;
+//   state16 = 3 / 4  the same formats with stochastic rounding (below); 4 is OLALA_VOLTA_STATE16's default: unbiased
+//                rounding keeps slow decays and small updates that round-to-nearest stalls on (STATE16.md).
+// The preamble (angles, bias + rotary on B/C), the token / pool rows, the output and the k / v / angle pool writes are
+// mamba3_step_volta_kernel's.
+__device__ __forceinline__ float2 bf16x2_to_f2(uint32_t w) { return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)); }
+__device__ __forceinline__ uint32_t bf16_rn_hi(float f) {   // f rounded to bf16 (nearest even) in the upper 16 bits
+  const uint32_t u = __float_as_uint(f);
+  const uint32_t r = u + 0x7fffu + ((u >> 16) & 1u);
+  return (u & 0x7fffffffu) > 0x7f800000u ? 0x7fff0000u : r;   // NaN: 0x7fff, as cvt.rn.bf16.f32
+}
+__device__ __forceinline__ uint32_t f2_to_bf16x2_rn(float lo, float hi) { return __byte_perm(bf16_rn_hi(lo), bf16_rn_hi(hi), 0x7632); }
+__device__ __forceinline__ float2 f16x2_to_f2(uint32_t w) {
+  float lo, hi;
+  asm("{\n .reg .b16 l, h;\n mov.b32 {l, h}, %2;\n cvt.f32.f16 %0, l;\n cvt.f32.f16 %1, h;\n}" : "=f"(lo), "=f"(hi) : "r"(w));
+  return make_float2(lo, hi);
+}
+__device__ __forceinline__ uint32_t f2_to_f16x2_rn(float lo, float hi) {
+  uint32_t w;
+  asm("{\n .reg .b16 l, h;\n cvt.rn.f16.f32 l, %1;\n cvt.rn.f16.f32 h, %2;\n mov.b32 %0, {l, h};\n}" : "=r"(w) : "f"(lo), "f"(hi));
+  return w;
+}
+// Stochastic rounding (state16 = 3: bf16, 4: fp16 + row scale): 16 / 13 random bits
+// added below the kept mantissa, then truncation. The bits come from a hash of the item's inputs (dt, the new phase,
+// the thread), not of the slot: deterministic and independent of the batch composition.
+__device__ __forceinline__ uint32_t hash32_v16(uint32_t x) {   // lowbias32
+  x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x;
+}
+__device__ __forceinline__ uint32_t bf16_sr_hi(float f, uint32_t r16) {
+  const uint32_t u = __float_as_uint(f);
+  if ((u & 0x7f800000u) == 0x7f800000u) return (u & 0x7fffffffu) > 0x7f800000u ? 0x7fff0000u : u;   // NaN / inf
+  return (u + r16) & 0xffff0000u;
+}
+__device__ __forceinline__ uint32_t f2_to_bf16x2_sr(float lo, float hi, uint32_t r) {
+  return __byte_perm(bf16_sr_hi(lo, r & 0xffffu), bf16_sr_hi(hi, r >> 16), 0x7632);
+}
+__device__ __forceinline__ float sr_f16_bits(float f, uint32_t r13) {   // 11 significant bits (fp16), stochastically
+  const uint32_t u = __float_as_uint(f);
+  if ((u & 0x7f800000u) == 0x7f800000u) return f;
+  return __uint_as_float((u + r13) & 0xffffe000u);
+}
+__device__ __forceinline__ uint32_t f2_to_f16x2_rz(float lo, float hi) {   // exact for 11-bit values in fp16's range
+  uint32_t w;
+  asm("{\n .reg .b16 l, h;\n cvt.rz.f16.f32 l, %1;\n cvt.rz.f16.f32 h, %2;\n mov.b32 %0, {l, h};\n}" : "=r"(w) : "f"(lo), "f"(hi));
+  return w;
+}
+__device__ __forceinline__ uint32_t weyl_v16(uint32_t seed, int i) {
+  uint32_t r = (seed + (uint32_t)i * 0x9e3779b9u) * 0x85ebca6bu;
+  return r ^ (r >> 13);
+}
+
+// The kernel: the grid is a multiple of H and CTA c owns head c % H for the tokens c / H, c / H + G, ... (G = grid / H),
+// so the head's constants (xproj, zproj, outproj, both biases) are read once into shared memory, and the preamble's
+// bias reads come from there; per token, the state words, the token / pool rows and the scalars are loaded at once
+// (all in flight), staged, used, and the next token's are loaded after the stores (three CTAs per SM overlap one
+// another). Measured alternatives (agents/perf128/STATE16.md): agent Q's round-robin items with the constants loaded per
+// item, 1.2-1.4x slower at 32-128 sequences; the next token's loads in flight during this one, within 5 % (10 % faster
+// at 8 sequences only).
+struct __align__(16) VStageH {
+  __nv_bfloat16 bst[R * S], bm[R * S], cm[R * S];
+  __nv_bfloat16 x[D], z[D], xst[D];
+  __nv_bfloat16 angp[NA];
+  float angst[NA];
+};
+struct __align__(16) VSmemH {
+  VStageH st;
+  float xproj[R * D], zproj[R * D], outproj[R * D];   // the CTA's head
+  float bias_k[R * S], bias_q[R * S];
+  float sCos[NA], sSin[NA], sTheta[NA];
+  __nv_bfloat16 sBk[8][LDB];
+  __nv_bfloat16 sCb[4][LDB];
+};
+struct VLoadH {
+  uint32_t hw[2][16];
+  float rs[2];
+  uint4 sm[3];
+  float dt, A, trap;
+};
+template <int FMT>
+__device__ __forceinline__ void vh_issue(const Args& a, const int b, const int h, const int slot, const int t,
+                                         const int p0, const int qd, VLoadH& L) {
+  const int srow = (slot >= 0 && slot < a.P) ? slot : 0;
+  const unsigned short* src = reinterpret_cast<const unsigned short*>(a.ssm) + (size_t)srow * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+  for (int e = 0; e < 2; ++e)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      *reinterpret_cast<uint4*>(&L.hw[e][4 * j]) = *reinterpret_cast<const uint4*>(src + (p0 + e * 8) * S + j * 32 + qd * 8);
+  if constexpr (FMT == 2 || FMT == 4) {
+    const float* sc = a.ssm_scale + (size_t)srow * a.sc_sst + (size_t)h * D;
+    L.rs[0] = sc[p0]; L.rs[1] = sc[p0 + 8];
+  }
+  if (t < 64) {
+    const int r = t >> 4, c = t & 15;
+    L.sm[0] = *reinterpret_cast<const uint4*>(a.kp + (size_t)srow * a.kp_sst + ((size_t)r * H + h) * S + c * 8);
+    L.sm[1] = *reinterpret_cast<const uint4*>(a.Bm + (size_t)b * a.bc_bstride + t * 8);
+    L.sm[2] = *reinterpret_cast<const uint4*>(a.Cm + (size_t)b * a.bc_bstride + t * 8);
+  } else {
+    const int q = t - 64;
+    if (q < 8) L.sm[0] = *reinterpret_cast<const uint4*>(a.x + ((size_t)b * H + h) * D + q * 8);
+    else if (q < 16) L.sm[0] = *reinterpret_cast<const uint4*>(a.z + ((size_t)b * H + h) * D + (q - 8) * 8);
+    else if (q < 24) L.sm[0] = *reinterpret_cast<const uint4*>(a.vp + (size_t)srow * a.vp_sst + (size_t)h * D + (q - 16) * 8);
+    else if (q < 28) L.sm[0] = *reinterpret_cast<const uint4*>(a.angp + (size_t)b * a.angp_stride + (q - 24) * 8);
+    else if (q < 36) L.sm[0] = *reinterpret_cast<const uint4*>(a.angle + (size_t)srow * a.ang_sst + (size_t)h * NA + (q - 28) * 4);
+  }
+  L.dt = a.dt[b * H + h]; L.A = a.A[b * H + h]; L.trap = a.trap[b * H + h];
+}
+__device__ __forceinline__ void vh_stage(VStageH& st, const VLoadH& L, const int t) {
+  if (t < 64) {
+    const int r = t >> 4, c = t & 15;
+    *reinterpret_cast<uint4*>(st.bst + r * S + c * 8) = L.sm[0];
+    *reinterpret_cast<uint4*>(st.bm + t * 8) = L.sm[1];
+    *reinterpret_cast<uint4*>(st.cm + t * 8) = L.sm[2];
+  } else {
+    const int q = t - 64;
+    if (q < 8) *reinterpret_cast<uint4*>(st.x + q * 8) = L.sm[0];
+    else if (q < 16) *reinterpret_cast<uint4*>(st.z + (q - 8) * 8) = L.sm[0];
+    else if (q < 24) *reinterpret_cast<uint4*>(st.xst + (q - 16) * 8) = L.sm[0];
+    else if (q < 28) *reinterpret_cast<uint4*>(st.angp + (q - 24) * 8) = L.sm[0];
+    else if (q < 36) *reinterpret_cast<uint4*>(st.angst + (q - 28) * 4) = L.sm[0];
+  }
+}
+
+#ifndef STEP16_MINB
+#define STEP16_MINB 3
+#endif
+template <int FMT>
+__global__ void __launch_bounds__(THREADS, STEP16_MINB) mamba3_step_volta16_kernel(const Args a) {
+  constexpr bool kF16 = FMT == 2 || FMT == 4, kSR = FMT >= 3;
+  __shared__ VSmemH S_;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const int qd = lane & 3, p0 = warp * 16 + (lane >> 2);
+  const int h = blockIdx.x % H, G = gridDim.x / H;   // grid: a multiple of H
+  int b = blockIdx.x / H;
+  if (b >= a.B) return;
+  VStageH& st = S_.st;
+  // the head's constants, once per CTA
+  for (int i = t; i < R * D; i += THREADS) {
+    const size_t g = (size_t)(i / D) * H * D + (size_t)h * D + i % D;
+    S_.xproj[i] = a.xproj[g]; S_.zproj[i] = a.zproj[g]; S_.outproj[i] = a.outproj[g];
+  }
+  for (int i = t; i < R * S; i += THREADS) {
+    const size_t g = (size_t)(i / S) * H * S + (size_t)h * S + i % S;
+    S_.bias_k[i] = a.bias_k[g]; S_.bias_q[i] = a.bias_q[g];
+  }
+  const float Dh = a.Dp[h];
+  VLoadH cur;
+  int slotc = a.slots[b];
+  int slotn = b + G < a.B ? a.slots[b + G] : 0;
+  vh_issue<FMT>(a, b, h, slotc, t, p0, qd, cur);
+  vh_stage(st, cur, t);
+  __syncthreads();
+  for (; b < a.B; b += G) {
+    const int bn = b + G;
+    const int slot = slotc; const bool valid = slot >= 0 && slot < a.P;
+    const float dt = cur.dt, A = cur.A, trap = cur.trap;
+    const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
+    if (t < NA) { float th = st.angst[t] + tanhf(bf2f(st.angp[t])) * dt * 3.14159265358979323846f; th -= 6.283185307179586f * floorf(th / 6.283185307179586f); S_.sTheta[t] = th; sincosf(th, &S_.sSin[t], &S_.sCos[t]); }
+    __syncthreads();
+    for (int i = t; i < R * (S / 2); i += THREADS) {
+      const int r = i / (S / 2), j = i % (S / 2);
+      float blo = bf2f(st.bm[r * S + j]) + S_.bias_k[r * S + j], bhi = bf2f(st.bm[r * S + j + 64]) + S_.bias_k[r * S + j + 64];
+      float clo = bf2f(st.cm[r * S + j]) + S_.bias_q[r * S + j], chi = bf2f(st.cm[r * S + j + 64]) + S_.bias_q[r * S + j + 64];
+      if (j < NA) {
+        const float c = S_.sCos[j], s_ = S_.sSin[j];
+        const float b0 = blo * c - bhi * s_, b1 = blo * s_ + bhi * c, c0 = clo * c - chi * s_, c1 = clo * s_ + chi * c;
+        blo = b0; bhi = b1; clo = c0; chi = c1;
+      }
+      S_.sBk[r][j] = __float2bfloat16(blo); S_.sBk[r][j + 64] = __float2bfloat16(bhi);
+      S_.sBk[4 + r][j] = st.bst[r * S + j]; S_.sBk[4 + r][j + 64] = st.bst[r * S + j + 64];
+      S_.sCb[r][j] = __float2bfloat16(clo); S_.sCb[r][j + 64] = __float2bfloat16(chi);
+    }
+    __syncthreads();
+    float av[2][8];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int p = p0 + e * 8;
+      const float xp = bf2f(st.x[p]), xs = bf2f(st.xst[p]);
+#pragma unroll
+      for (int r = 0; r < R; ++r) { const float xpj = S_.xproj[r * D + p]; av[e][r] = gamma * xp * xpj; av[e][4 + r] = beta * xs * xpj; }
+    }
+    float o[2][R];
+#pragma unroll
+    for (int e = 0; e < 2; ++e)
+#pragma unroll
+      for (int r = 0; r < R; ++r) o[e][r] = 0.f;
+    float2 hn[2][16];
+    float mx[2] = {0.f, 0.f};
+    const uint32_t seed = kSR ? hash32_v16(__float_as_uint(dt) ^ (__float_as_uint(S_.sTheta[0]) * 0x9e3779b9u) ^
+                                           ((uint32_t)(h * THREADS + t) * 0xc2b2ae35u)) : 0u;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int c2 = 0; c2 < 4; ++c2) {
+        const int n = j * 32 + qd * 8 + 2 * c2;
+        float2 bk[8], cr[R];
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) bk[kk] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sBk[kk][n]));
+#pragma unroll
+        for (int r = 0; r < R; ++r) cr[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sCb[r][n]));
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const uint32_t w = cur.hw[e][4 * j + c2];
+          float2 hv;
+          if constexpr (!kF16) hv = bf16x2_to_f2(w);
+          else { hv = f16x2_to_f2(w); hv.x *= cur.rs[e]; hv.y *= cur.rs[e]; }
+          hv.x *= alpha; hv.y *= alpha;
+#pragma unroll
+          for (int kk = 0; kk < 8; ++kk) { hv.x = fmaf(av[e][kk], bk[kk].x, hv.x); hv.y = fmaf(av[e][kk], bk[kk].y, hv.y); }
+#pragma unroll
+          for (int r = 0; r < R; ++r) o[e][r] = fmaf(hv.x, cr[r].x, fmaf(hv.y, cr[r].y, o[e][r]));
+          if constexpr (FMT == 1) cur.hw[e][4 * j + c2] = f2_to_bf16x2_rn(hv.x, hv.y);
+          else if constexpr (FMT == 3) cur.hw[e][4 * j + c2] = f2_to_bf16x2_sr(hv.x, hv.y, weyl_v16(seed, e * 16 + 4 * j + c2));
+          else { hn[e][4 * j + c2] = hv; mx[e] = fmaxf(mx[e], fmaxf(fabsf(hv.x), fabsf(hv.y))); }
+        }
+      }
+    float rsn[2] = {0.f, 0.f};
+    if constexpr (kF16) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        float m = mx[e];
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        const int ex = max((int)((__float_as_uint(m) >> 23) & 0xffu) - 127, -110);
+        const float up = __uint_as_float((uint32_t)(141 - ex) << 23);
+        rsn[e] = __uint_as_float((uint32_t)(ex + 113) << 23);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          if constexpr (FMT == 2) cur.hw[e][i] = f2_to_f16x2_rn(hn[e][i].x * up, hn[e][i].y * up);
+          else {
+            const uint32_t r = weyl_v16(seed, e * 16 + i);
+            cur.hw[e][i] = f2_to_f16x2_rz(sr_f16_bits(hn[e][i].x * up, r & 0x1fffu),
+                                          sr_f16_bits(hn[e][i].y * up, (r >> 16) & 0x1fffu));
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int e = 0; e < 2; ++e)
+#pragma unroll
+      for (int r = 0; r < R; ++r) { o[e][r] += __shfl_xor_sync(0xffffffffu, o[e][r], 1); o[e][r] += __shfl_xor_sync(0xffffffffu, o[e][r], 2); }
+    float ys[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int p = p0 + e * 8;
+      const float xp = bf2f(st.x[p]), zp = bf2f(st.z[p]);
+      float orr = o[e][0];
+#pragma unroll
+      for (int r = 1; r < R; ++r) orr = (qd == r) ? o[e][r] : orr;
+      orr += Dh * xp * S_.xproj[qd * D + p];
+      const float zv = zp * S_.zproj[qd * D + p];
+      orr *= __fdividef(zv, 1.f + __expf(-zv));
+      ys[e] = orr * S_.outproj[qd * D + p];
+      ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
+    }
+    if (qd == 0) { a.y[((size_t)b * H + h) * D + p0] = __float2bfloat16(valid ? ys[0] : 0.f); a.y[((size_t)b * H + h) * D + p0 + 8] = __float2bfloat16(valid ? ys[1] : 0.f); }
+    if (valid) {
+      unsigned short* dst = reinterpret_cast<unsigned short*>(a.ssm) + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          *reinterpret_cast<uint4*>(dst + (p0 + e * 8) * S + j * 32 + qd * 8) = *reinterpret_cast<const uint4*>(&cur.hw[e][4 * j]);
+      if constexpr (kF16) {
+        if (qd == 0) { float* sc = a.ssm_scale + (size_t)slot * a.sc_sst + (size_t)h * D; sc[p0] = rsn[0]; sc[p0 + 8] = rsn[1]; }
+      }
+      if (t < 64) { const int r = t >> 4, c = t & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[r][c * 8]); }
+      if (t < D) a.vp[(size_t)slot * a.vp_sst + (size_t)h * D + t] = st.x[t];
+      if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
+    }
+    __syncthreads();   // the stage, sBk / sCb / sTheta are free for the next token
+    if (bn < a.B) {
+      slotc = slotn;
+      if (bn + G < a.B) slotn = a.slots[bn + G];
+      vh_issue<FMT>(a, bn, h, slotc, t, p0, qd, cur);
+      vh_stage(st, cur, t);
+      __syncthreads();
+    }
+  }
+}
 #endif  // STEP_VOLTA
 }  // namespace
 
@@ -851,7 +1145,8 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
                     torch::Tensor xproj, torch::Tensor zproj, torch::Tensor outproj, torch::Tensor z, torch::Tensor bias_q, torch::Tensor bias_k,
                     torch::Tensor angle_proj, torch::Tensor slots, torch::Tensor y, int64_t ctas_per_sm,
                     std::optional<torch::Tensor> raw_zxdt, std::optional<torch::Tensor> raw_dt_bias, double a_floor,
-                    std::optional<torch::Tensor> raw_wb, std::optional<torch::Tensor> raw_wc, double eps, bool pdl) {
+                    std::optional<torch::Tensor> raw_wb, std::optional<torch::Tensor> raw_wc, double eps, bool pdl,
+                    std::optional<torch::Tensor> ssm_scale, int64_t state16) {
   Args a;
   a.ssm = ssm_pool.data_ptr(); a.kp = reinterpret_cast<__nv_bfloat16*>(k_pool.data_ptr()); a.vp = reinterpret_cast<__nv_bfloat16*>(v_pool.data_ptr());
   a.angle = angle_pool.data_ptr<float>(); a.P = ssm_pool.size(0); a.A = A.data_ptr<float>(); a.Bm = reinterpret_cast<const __nv_bfloat16*>(Bm.data_ptr()); a.Cm = reinterpret_cast<const __nv_bfloat16*>(Cm.data_ptr());
@@ -868,8 +1163,10 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   TORCH_CHECK((a.ssm_sst * ssm_pool.element_size()) % 16 == 0 && (a.kp_sst * 2) % 16 == 0 && (a.vp_sst * 2) % 16 == 0 && (a.ang_sst * 4) % 16 == 0, "pool slot strides must be 16B aligned");
   TORCH_CHECK(Bm.stride(1) == S && Bm.stride(2) == 1 && Cm.stride(0) == Bm.stride(0) && Cm.stride(1) == S && angle_proj.stride(1) == 1);
   TORCH_CHECK((Bm.stride(0) * 2) % 16 == 0 && (angle_proj.stride(0) * 2) % 16 == 0, "B/C batch stride and angle_proj row stride must be 16B aligned");
-  TORCH_CHECK((f32 || ssm_pool.dtype() == torch::kBFloat16) && k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
+  const bool f16 = state16 == 2 || state16 == 4;   // fp16 + per-row scales (4: stochastic rounding)
+  TORCH_CHECK((f32 || ssm_pool.dtype() == torch::kBFloat16 || (f16 && ssm_pool.dtype() == torch::kHalf)) && k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
   a.pdl = pdl ? 1 : 0;
+  a.ssm_scale = nullptr; a.sc_sst = 0;
   a.raw = 0; a.zxdt = nullptr; a.zxdt_stride = 0; a.dt_bias = nullptr; a.a_floor = 0.f; a.wb = a.wc = nullptr; a.eps = 0.f;
   if (raw_zxdt.has_value()) {
     const auto& zx = *raw_zxdt;
@@ -907,6 +1204,32 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   constexpr bool volta = false;
 #endif
   static const bool pipe = [] { const char* e = getenv("OLALA_STEP_PIPE"); return !(e && e[0] == '0'); }();
+  // 16-bit state (OLALA_VOLTA_STATE16, Volta builds): state16 = 1 bf16, 2 fp16 with per-row scales, both rounded to
+  // nearest even; 3 / 4 the same with stochastic rounding; any batch size
+  if (state16 != 0) {
+#ifdef STEP_VOLTA
+    TORCH_CHECK(!a.raw, "state16: the decode preamble runs upstream (OLALA_RAW_STEP is not supported)");
+    TORCH_CHECK(state16 >= 1 && state16 <= 4 && ssm_pool.dtype() == (f16 ? torch::kHalf : torch::kBFloat16),
+                "state16 = 1 / 3 take a bf16 ssm pool, 2 / 4 an fp16 one");
+    if (f16) {
+      TORCH_CHECK(ssm_scale.has_value(), "state16 = 2 needs the ssm_scale pool");
+      const auto& sc = *ssm_scale;
+      TORCH_CHECK(sc.dtype() == torch::kFloat32 && sc.dim() == 3 && sc.size(0) == ssm_pool.size(0) && sc.size(1) == H &&
+                  sc.size(2) == D && sc.stride(1) == D && sc.stride(2) == 1, "ssm_scale must be (P, 48, 64) fp32, inner dims contiguous");
+      a.ssm_scale = sc.data_ptr<float>(); a.sc_sst = sc.stride(0);
+    }
+    int nsm = 80; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+    auto kernel = state16 == 1 ? mamba3_step_volta16_kernel<1> : state16 == 2 ? mamba3_step_volta16_kernel<2>
+                : state16 == 3 ? mamba3_step_volta16_kernel<3> : mamba3_step_volta16_kernel<4>;
+    int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, kernel, THREADS, 0);
+    const int cps = std::max(1, std::min<int>((int)ctas_per_sm, fit));
+    const int grid = H * std::max(1, std::min(a.B, nsm * cps / H));   // head-resident CTAs: a multiple of H
+    kernel<<<grid, THREADS, 0, c10::cuda::getCurrentCUDAStream()>>>(a);
+    return;
+#else
+    TORCH_CHECK(false, "state16 needs the STEP_VOLTA build (SM70 family)");
+#endif
+  }
 #if defined(STEP_VOLTA) && !defined(STEP_VOLTA_1STAGE)   // STEP_VOLTA_1STAGE: tests build the 1-stage kernel
   if (f32 && !a.raw && pipe) {   // items dealt round-robin: the grid need not be a multiple of H
     int nsm = 80; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
@@ -921,4 +1244,4 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   else if (f32) launch(mamba3_step_cuda_kernel<true>, (int)sizeof(Smem<true>));
   else launch(mamba3_step_cuda_kernel<false>, (int)sizeof(Smem<false>));
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_step_cuda, py::arg("ssm"), py::arg("kp"), py::arg("vp"), py::arg("angle"), py::arg("A"), py::arg("Bm"), py::arg("Cm"), py::arg("Dp"), py::arg("x"), py::arg("dt"), py::arg("trap"), py::arg("xproj"), py::arg("zproj"), py::arg("outproj"), py::arg("z"), py::arg("bias_q"), py::arg("bias_k"), py::arg("angle_proj"), py::arg("slots"), py::arg("y"), py::arg("ctas_per_sm"), py::arg("raw_zxdt") = py::none(), py::arg("raw_dt_bias") = py::none(), py::arg("a_floor") = 0.0, py::arg("raw_wb") = py::none(), py::arg("raw_wc") = py::none(), py::arg("eps") = 0.0, py::arg("pdl") = false); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_step_cuda, py::arg("ssm"), py::arg("kp"), py::arg("vp"), py::arg("angle"), py::arg("A"), py::arg("Bm"), py::arg("Cm"), py::arg("Dp"), py::arg("x"), py::arg("dt"), py::arg("trap"), py::arg("xproj"), py::arg("zproj"), py::arg("outproj"), py::arg("z"), py::arg("bias_q"), py::arg("bias_k"), py::arg("angle_proj"), py::arg("slots"), py::arg("y"), py::arg("ctas_per_sm"), py::arg("raw_zxdt") = py::none(), py::arg("raw_dt_bias") = py::none(), py::arg("a_floor") = 0.0, py::arg("raw_wb") = py::none(), py::arg("raw_wc") = py::none(), py::arg("eps") = 0.0, py::arg("pdl") = false, py::arg("ssm_scale") = py::none(), py::arg("state16") = 0); }

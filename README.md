@@ -34,6 +34,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_VOLTA` | auto | Volta (V100) detection, see GPU support below: auto = a native sm_70 GPU, or a process running through volta-forever (`VOLTA_FOREVER` set, or its `libcuda.so.1` proxy loaded); `1` / `0` forces the SM70 family on / off (`0` = the dispatch of the capability the process is told, e.g. SM80 through volta-forever). |
 | `OLALA_VOLTA_TC` | `int8,bf16` on SM70 | SM70 family: the fp16 tensor-core edition (`olala/volta_tc.py`). The W8A16 linears (`int8`) and the bf16 model's dense projections (`bf16`) run on cuBLAS's fp16 HMMA GEMMs from 9 activation rows (33 for linears whose rows need 2-3 exact fp16 terms) and in prefill, with exactly scaled operands; fp16 weight copies cost about 2 GiB. Unset or `1` = those two kinds; `0` = off (the FMA and emulated paths, their outputs bit for bit); a comma list picks kinds, `moe` adds the routed experts above 32 tokens (not in the default: on chat_math it moved one confident prompt position per quantized checkpoint). Ignored on other GPUs; `VF_SAFE=1` turns it off, all kinds, whatever this variable says. |
 | `VF_SAFE` | unset | volta-forever's conservative switch, read by this fork too (once per process): only the exact value `1` turns it on (`0`, empty, `true`... do not). It means no path whose results leave the conservative reference class. On the SM70 family the fp16 tensor-core edition (`OLALA_VOLTA_TC`) is then off: HMMA truncates its fp32 sums, a systematic bias toward zero. The fp32-FMA kernels stay on: the Volta editions that return the stock values bit for bit (the prefill kernels), and those that accumulate in fp32 and only reorder a sum, without a bias (the decode GEMVs, the few-row GEMV `OLALA_GEMV_ROWS_CUDA`), which strictly are not bit-identical to stock either. |
+| `OLALA_VOLTA_STATE16` | unset | SM70 family (V100) only, opt-in: the Mamba-3 SSM state stored in 16 bits and computed in fp32 (the decode step and the prefill's state pass round only what they store). `fp16sr` (or `1`) = fp16 with one power-of-two scale per state row, the decode step rounding stochastically; `fp16`, `bf16sr`, `bf16` = the same with round-to-nearest-even, bf16 storage, or both (round to nearest even drifts over long sequences: the slow decays and small updates it rounds away are lost the same way at every step). Half the state traffic of the fp32 state. Not combinable with `--mamba-ssm-cache-dtype`, ReplaySSM or speculative decoding. |
 | `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
 | `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
 
@@ -62,6 +63,13 @@ own paths replace emulated tensor-core code with fp32 FMA code:
 - the Mamba-3 decode step runs its scalar-FMA update (`-DSTEP_VOLTA`); with an fp32 state, the state goes straight
   to registers, all loads in flight at once, three CTAs per SM (`mamba3_step_volta_kernel`, the 1-stage kernel's
   bits; `OLALA_STEP_PIPE=0` keeps that one);
+- with `OLALA_VOLTA_STATE16` (opt-in) the SSM state is stored in 16 bits, by default fp16 with one power-of-two
+  scale per state row (a fifth state tensor) and stochastic rounding, and computed in fp32: the decode step
+  `mamba3_step_volta16_kernel` (every batch size: the CuteDSL step is not used) and the prefill's state pass widen it
+  on load and round it on store, so a decode step moves half the state bytes (Mamba-3 step 362 us per layer at 128
+  sequences against 647 us for the fp32 state's CuteDSL step; with the Q8 checkpoint, +10.7 % per-request decode
+  rate at 128 concurrent requests, +4.6 % at 32, -0.6 % at 1; teacher-forced logprobs at the fp32-vs-fp32 noise
+  level over 3k tokens);
 - the TPA-factor decode attention has an FMA kernel (`tpa_factor_decode_volta.cu`), with one-tile splits and a
   4-head split merge;
 - the speculative verify of the Mamba-3 layers runs that step's FMA arithmetic at every draft position
@@ -106,7 +114,9 @@ regime (more throughput under concurrency on short prompts); `--max-num-batched-
 `--max-model-len`.
 
 The Mamba-3 SSM state is stored in **fp32** by default (`--mamba-ssm-cache-dtype auto`): bf16 storage drifts over
-long generations (repetition loops). `--mamba-ssm-cache-dtype bfloat16` is ~15% faster at high concurrency.
+long generations (repetition loops). `--mamba-ssm-cache-dtype bfloat16` is ~15% faster at high concurrency; on a
+V100 it is slower up to 64 sequences (its CUDA step there is bf16 tensor-core code that volta-forever emulates), and
+the SM70 family's 16-bit state is `OLALA_VOLTA_STATE16` (see GPU support).
 Checkpoints converted before the Olala rename (`DragonForCausalLM`) still load.
 
 The Mamba-3 MIMO inference kernels are vendored in `vllm/model_executor/layers/mamba/ops/mamba3/`

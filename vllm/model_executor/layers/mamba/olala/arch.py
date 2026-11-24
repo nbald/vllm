@@ -73,6 +73,27 @@ def _volta(device) -> bool:
 
 
 @cache
+def sm70_family_no_context() -> bool:
+    """``gpu_family() is GpuFamily.SM70`` decided without creating a CUDA context, for configuration code that may run
+    in vLLM's front-end process (the state dtypes of ``state.mamba3_state_dtype``): the ``OLALA_VOLTA`` override and
+    the volta-forever test of ``_volta``, then a native GPU's capability from NVML through vLLM's platform."""
+    forced = os.environ.get("OLALA_VOLTA")
+    if forced in ("0", "1"):
+        return forced == "1"
+    if volta_forever():
+        return True
+    try:
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda():
+            return False
+        cap = current_platform.get_device_capability()
+        return cap is not None and (cap.major, cap.minor) == (7, 0)
+    except Exception:  # noqa: BLE001 - no NVML / no GPU: not Volta
+        return False
+
+
+@cache
 def gpu_family(device=None) -> GpuFamily:
     if not torch.cuda.is_available():
         return GpuFamily.UNSUPPORTED

@@ -74,12 +74,15 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
 from vllm.model_executor.layers.mamba.olala.state import (
+    STATE16_CODES,
     folded_token_shift_layout,
     mamba3_state_dtype,
     mamba3_state_shape,
     replay_config,
     spec_light_cols,
+    state16_scaled,
     ts_fold_active,
+    volta_state16,
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -117,6 +120,10 @@ def _fuse_rotary_max_batch() -> int:
     # 256: 168 us vs 172 + 13.5 us per layer.
     if gpu_family() in (GpuFamily.SM100, GpuFamily.SM120) and cuda_step_enabled():
         return 1 << 30
+    # SM70 with a 16-bit state (OLALA_VOLTA_STATE16): the 16-bit Volta step at every batch size (the CuteDSL step
+    # cannot read the fp16 + scale layout; with bf16 its packing conversions are emulated by volta-forever)
+    if gpu_family() is GpuFamily.SM70 and volta_state16() is not None:
+        return 1 << 30
     return _FUSE_ROTARY_MAX_BATCH
 
 # Mamba3 kernels (vendored under ops/mamba3), imported lazily: the prefill
@@ -139,6 +146,11 @@ def _xz_strided_ok(dev) -> bool:
 
 def _is_pow2(n: int) -> bool:
     return n & (n - 1) == 0
+
+
+def _mamba3_hybrid_enabled() -> bool:
+    """The chunk-parallel hybrid prefill (``mamba3_mimo_hybrid_pools``) is selected (``OLALA_M3_PREFILL``)."""
+    return os.environ.get("OLALA_M3_PREFILL", "hybrid") == "hybrid"
 
 
 def _lazy_import_kernels() -> None:
@@ -576,6 +588,34 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                     f"{self.num_rope_angles}/{self.ngroups})."
                 )
 
+        # 16-bit SSM state on the SM70 family (state.volta_state16): the 16-bit Volta
+        # decode step at every batch size and the hybrid prefill's state pass read and
+        # write it; nothing else does (no CuteDSL step, raw step, spec decode or
+        # TileLang prefill with this layout).
+        self._state16 = volta_state16()
+        self._s16_scaled = state16_scaled(self._state16)
+        if self._state16 is not None:
+            if gpu_family() is not GpuFamily.SM70:
+                raise ValueError("OLALA_VOLTA_STATE16 runs on the SM70 family only.")
+            if vllm_config.speculative_config is not None:
+                raise ValueError(
+                    "OLALA_VOLTA_STATE16 does not support speculative decoding (its "
+                    "verify step is the CuteDSL step); unset it."
+                )
+            if not (
+                self._hybrid_ok
+                and _mamba3_hybrid_enabled()
+                and self.nheads_local == 48
+                and self.headdim == 64
+                and self.d_state == 128
+                and self.mimo_dim == 4
+                and self.num_rope_angles == 32
+            ):
+                raise ValueError(
+                    "OLALA_VOLTA_STATE16 needs the Olala 7A1B Mamba3 shapes and the "
+                    "hybrid prefill (OLALA_M3_PREFILL=hybrid)."
+                )
+
         # Register in the static forward-context table so the runner can find
         # this layer's metadata by prefix.
         compilation = get_current_vllm_config().compilation_config
@@ -600,7 +640,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         _, ssm_dtype, k_dtype, v_dtype = dtypes[:4]
         if self.ts_fold:
             dtypes = tuple(dtypes) + self._ts_fold_layout()[1]
-        if ssm_dtype not in (torch.float32, torch.bfloat16):
+        if ssm_dtype not in (torch.float32, torch.bfloat16) and not (
+            ssm_dtype == torch.float16 and self._s16_scaled
+        ):
             raise ValueError(
                 f"Olala mamba3 supports an fp32 or bf16 SSM state, got "
                 f"{ssm_dtype}. Set --mamba-ssm-cache-dtype to float32 or auto."
@@ -746,6 +788,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # (angle, ssm, k, v); ReplaySSM tensors follow. With light columns the
         # verify kernel takes the whole page, everything else column 0.
         pools = self._base_pools()
+        # OLALA_VOLTA_STATE16=fp16sr / fp16: the per-row scales of the fp16 state follow
+        ssm_scale = all_pools[4] if self._s16_scaled else None
         slots = md.state_indices_tensor
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
@@ -761,7 +805,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 )
             else:
                 self._decode(
-                    hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], pools
+                    hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], pools,
+                    ssm_scale=ssm_scale,
                 )
 
         if md.num_prefills > 0:
@@ -772,6 +817,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 prefill_slots,
                 md,
                 pools,
+                ssm_scale=ssm_scale,
             )
             if self._replay is not None:
                 replay_reset(all_pools, prefill_slots.to(torch.int32))
@@ -938,15 +984,17 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         slots: torch.Tensor,  # (P,)
         md: Mamba3AttentionMetadata,
         pools: tuple[torch.Tensor, ...],
+        ssm_scale: torch.Tensor | None = None,
     ) -> None:
         if _mamba3_mimo_hybrid_pools is not None and self._hybrid_ok:
             # pool slots read / written in place by the kernels (no host sync, no gathers)
             self._prefill_hybrid(
                 h, out, slots, md.query_start_loc_p, pools,
                 md.has_initial_state if md.has_initial_any else None,
-                md.query_start_loc_p_cpu,
+                md.query_start_loc_p_cpu, ssm_scale=ssm_scale,
             )
             return
+        assert self._state16 is None, "OLALA_VOLTA_STATE16 runs the hybrid prefill only"
         # Fast path: every prompt starts from zero state, so one packed varlen
         # launch covers the batch. OlalaForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
@@ -990,9 +1038,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         )
         # light columns: the prefill sees column 0, as on the real pages (_base_pools)
         pools = (full[0][:, 0], full[1], full[2][:, 0], full[3][:, 0]) if self.light_cols else full[:4]
+        ssm_scale = full[4] if self._s16_scaled else None
         slots = torch.zeros(1, dtype=torch.long, device=h.device)
         qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
-        self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
+        self._prefill_zero_start(
+            h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]), ssm_scale=ssm_scale
+        )
 
     @staticmethod
     def _gather_init_states(
@@ -1029,10 +1080,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         pools: tuple[torch.Tensor, ...],
         init_states: tuple[torch.Tensor, ...] | None = None,
         qsl_cpu: torch.Tensor | None = None,
+        ssm_scale: torch.Tensor | None = None,
     ) -> None:
         if _mamba3_mimo_hybrid_pools is not None and self._hybrid_ok and init_states is None:
-            self._prefill_hybrid(h, out, slots, qsl, pools, None, qsl_cpu)
+            self._prefill_hybrid(h, out, slots, qsl, pools, None, qsl_cpu, ssm_scale=ssm_scale)
             return
+        assert self._state16 is None, "OLALA_VOLTA_STATE16 runs the hybrid prefill only"
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
         z = z.unsqueeze(0)  # (1, T, H, p)
@@ -1123,7 +1176,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             y = self.output_norm(y)
         out.copy_(y.to(out.dtype))
 
-    def _prefill_hybrid(self, h, out, slots, qsl, pools, has_init, qsl_cpu):
+    def _prefill_hybrid(self, h, out, slots, qsl, pools, has_init, qsl_cpu, ssm_scale=None):
         angle_pool, ssm_pool, k_pool, v_pool = pools
         T = h.shape[0]
         H, D, R, S = self.nheads_local, self.headdim, self.mimo_dim, self.d_state
@@ -1198,9 +1251,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 and v_pool.stride()[1:] == (D, 1) and angle_pool.stride()[1:] == (self.num_rope_angles, 1))
         direct = not self._postgate_norm and out.dtype == x.dtype and out.is_contiguous()
         o_buf = out.view(T, H, D) if direct else torch.empty(T, H, D, device=dev, dtype=x.dtype)
+        if self._s16_scaled:
+            assert ssm_scale is not None and ssm_scale.stride()[1:] == (D, 1)
         _mamba3_mimo_hybrid_pools(
             Q, K, x, z, ang, DT, ADT, trap, q_bias, k_bias, mimo_v, mimo_out, mimo_z, d_f32, cu,
-            pools, slots, has_init, o_buf,
+            pools, slots, has_init, o_buf, ssm_scale=ssm_scale,
         )
         if not direct:
             y = o_buf.reshape(T, -1)
@@ -1227,11 +1282,14 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import _scan_tc_ok
 
         real = self._base_pools()  # the committed state's views: column 0 with light columns, as _prefill sees them
+        if self._s16_scaled:  # OLALA_VOLTA_STATE16=fp16sr / fp16: + the per-row scales of the fp16 state
+            real += (self.kv_cache[4],)
         dev, dtype = real[1].device, self.model_config.dtype
-        pools = tuple(
+        dummies = tuple(
             torch.empty_strided((2, *p.shape[1:]), p.stride(), dtype=p.dtype, device=dev).zero_()
             for p in real
         )
+        pools, ssm_scale = dummies[:4], (dummies[4] if len(dummies) > 4 else None)
         ls = 256 if _scan_tc_ok(dev) else 128  # chunk length of mamba3_mimo_hybrid_pools
         layouts = [[1]]
         for chunks0 in (0, 31) if max_tokens > 32 * ls else (0,):
@@ -1256,7 +1314,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             for off in (0, 1):  # prefill slots after 0 / 1 decodes (int32: aligned or not)
                 slots = torch.zeros(off + len(lens), dtype=torch.int32, device=dev)[off:]
                 for has_init in (None, torch.ones(len(lens), dtype=torch.bool, device=dev)):
-                    self._prefill_hybrid(h, out, slots, qsl, pools, has_init, qsl_cpu)
+                    self._prefill_hybrid(h, out, slots, qsl, pools, has_init, qsl_cpu, ssm_scale=ssm_scale)
                     n += 1
         if self._replay is not None:
             # ReplaySSM marks the just-prefilled slots (replay.py) after a step's prefills, which the
@@ -1499,6 +1557,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         out: torch.Tensor,  # (N, d_inner_local)
         slots: torch.Tensor,  # (N,)
         pools: tuple[torch.Tensor, ...],
+        ssm_scale: torch.Tensor | None = None,  # OLALA_VOLTA_STATE16=fp16sr / fp16: per-row scales
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         H, D = self.nheads_local, self.headdim
@@ -1601,7 +1660,19 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 "CuteDSL decode step: ~1.4x slower Mamba-3 decode step",
                 "none needed for correctness; the kernel only covers the Olala 7A1B shapes",
             )
-        if use_cuda_step:
+        if self._state16 is not None:
+            # 16-bit state (SM70): the 16-bit Volta step at every batch size, fp32 compute
+            if not use_cuda_step:
+                raise RuntimeError(
+                    "OLALA_VOLTA_STATE16 needs the CUDA Mamba-3 step (OLALA_MAMBA3_STEP=cuda and its "
+                    "JIT build); the CuteDSL step cannot read this state layout."
+                )
+            mamba3_step_cuda(
+                ssm_pool, k_pool, v_pool, angle_pool, _A, B[:, :, 0], C[:, :, 0], self.D, x, DT, trap,
+                xpj, zpj, outpj, z, bias_q, bias_k, angle[:, 0], slots32, y,
+                ssm_scale=ssm_scale, state16=STATE16_CODES[self._state16],
+            )
+        elif use_cuda_step:
             # Persistent CUDA step (tensor-core update + C dot, cp.async state pipeline).
             mamba3_step_cuda(
                 ssm_pool, k_pool, v_pool, angle_pool, _A, B[:, :, 0], C[:, :, 0], self.D, x, DT, trap,
@@ -1646,6 +1717,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         angle_pool, ssm_pool, k_pool, v_pool = pools
         return (
             _RAW_STEP
+            and self._state16 is None
             and (self._in_proj_cat_ok or self._int8_in_proj)
             and not self._postgate_norm
             and self.headdim <= _STEP_TILE_D
