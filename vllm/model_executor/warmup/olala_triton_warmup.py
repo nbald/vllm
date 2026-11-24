@@ -154,6 +154,100 @@ def _warm_tpa_prefill(runner, layer, max_tokens: int) -> int:
     return n
 
 
+def _int_class_size(n: int) -> int:
+    """A dim-0 size Triton specializes like ``n`` (1, a multiple of 16, other): dummy pools keep the
+    real pools' class for the kernels that take their slot count as an argument."""
+    return 1 if n == 1 else (16 if n % 16 == 0 else 2)
+
+
+@torch.inference_mode()
+def _warm_tpa_verify(runner, layer, max_tokens: int) -> int:
+    """F1's verify write (factor_decode_write_spec, OLALA_TPA_FACTOR_SPEC) specializes on its request
+    count ``lanes`` and row count ``N`` (1, a multiple of 16, other), and the projections' output
+    strides follow the step's row count (decode GEMV / GEMM regimes). Uniform CUDA-graph batches and
+    the warm-up's steps meet only some of those classes: replaying the V100's dynamic-K schedule on
+    an RTX 5090, a padded verify batch (lanes % 16 != 0, N % 16 == 0) compiled it while serving. One
+    call per (lanes, N) class and projection regime, in this server's spec layout (light columns or
+    column slots), on dummy token-shift pools and factor planes with the real strides (slot class
+    kept), the real spec column table, and slot -1 for the factor rows."""
+    try:
+        from vllm.model_executor.layers.mamba.olala.tpa_factor import (
+            factor_decode_write_spec,
+            factor_spec_enabled,
+        )
+    except ImportError:
+        return 0
+    if (
+        runner.vllm_config.speculative_config is None
+        or not getattr(layer, "factor_mode", False)
+        or not factor_spec_enabled()
+        or not hasattr(layer, "_factor_verify")
+    ):
+        return 0
+    cols_all = _factor_block_table(runner, layer._ts_md_key)
+    if cols_all is None:
+        logger.info("Olala TPA verify warmup skipped: token-shift block table not found.")
+        return 0
+    kv = layer.factor_cache.kv_cache
+    kv = _dummy_like(kv, _int_class_size(kv.shape[0]))
+    if kv.shape[0] != 2 or kv.dim() != 4 or kv.shape[1] == 1:  # block-major (as _forward_factor)
+        nb, bs = kv.shape[0], kv.shape[-2]
+        kv = kv.reshape(nb, 2, bs, kv.shape[-1] // 2).transpose(0, 1)
+    kplane, vplane = kv[0], kv[1]
+    shift = layer.shift_state
+    host = getattr(layer, "_ts_host", None) if shift.folded else None
+    if shift.folded and host is None:
+        return 0
+    real_pools = host.folded_token_shift_pools() if host is not None else shift.kv_cache
+    dummies = tuple(_dummy_like(p, _int_class_size(p.shape[0])) for p in real_pools)
+    dev, dtype = kplane.device, kplane.dtype
+    num_spec = int(runner.vllm_config.speculative_config.num_speculative_tokens or 0)
+    if num_spec <= 0:
+        return 0
+    qlen = 1 + num_spec  # a full verify per request; shorter requests change no argument class
+    max_lanes = min(runner.max_num_reqs, cols_all.shape[0])
+    wsize = float(getattr(layer.config, "sliding_window_size", 0) or 0)
+    i32 = dict(dtype=torch.int32, device=dev)
+    n = 0
+    if host is not None:
+        host.folded_token_shift_pools = lambda: dummies  # instance attribute: shadows the method
+    else:
+        shift.kv_cache = list(dummies)
+    try:
+        k_cols, v_cols, ak_cols, av_cols = layer._ts_kv(spec=True)
+        cases = set()
+        for lanes in sorted({1, 2, 16, max_lanes - 1, max_lanes}):
+            if lanes < 1 or lanes > max_lanes:
+                continue
+            rows = lanes * qlen
+            cases.add((lanes, rows + (-rows) % 16))  # N % 16 == 0 (padding rows past the requests)
+            cases.add((lanes, rows if rows % 16 else rows + 1))  # N % 16 != 0
+            if lanes == 1:
+                cases.add((1, 1))  # a lone one-token verify (no draft)
+        for lanes, N in sorted(cases):
+            for total in sorted({N, 200, 1100}):  # projection regimes of the step's row count
+                if total < N or total > max_tokens:
+                    continue
+                proj = _tpa_projections(layer, torch.zeros(total, layer.c_q.input_size, dtype=dtype, device=dev))
+                per = min(qlen, max(1, N // lanes))
+                qsl = torch.tensor([min(i * per, N) for i in range(lanes + 1)], **i32)
+                factor_decode_write_spec(
+                    *(p[:N] for p in proj), torch.zeros(N, dtype=torch.int64, device=dev),
+                    qsl, torch.zeros_like(cols_all)[:lanes, :qlen], torch.ones(lanes, **i32),
+                    torch.full((N,), -1, dtype=torch.int64, device=dev),
+                    k_cols, v_cols, ak_cols, av_cols, layer.q_norm.norm.weight, layer.k_norm.norm.weight,
+                    layer.q_norm.norm.eps, layer.softmax_scaler, wsize, kplane, vplane, layer.snr + 1,
+                )
+                n += 1
+    finally:
+        if host is not None:
+            del host.folded_token_shift_pools
+        else:
+            shift.kv_cache = real_pools
+    torch.cuda.synchronize()
+    return n
+
+
 @torch.inference_mode()
 def _warm_logits(runner, model) -> int:
     """compute_logits at every row count a step can sample (it runs outside the CUDA graphs on the
@@ -287,6 +381,9 @@ def olala_triton_warmup(runner: "GPUModelRunner") -> None:
         counts["mamba3 prefill"] = mamba.warmup_prefill_kernels(max_tokens)
     if tpa is not None:
         counts["tpa prefill"] = _warm_tpa_prefill(runner, tpa, max_tokens)
+        verify = _warm_tpa_verify(runner, tpa, max_tokens)
+        if verify:
+            counts["tpa verify"] = verify
     counts["logits and logprobs"] = _warm_logits(runner, model)
     if runner.vllm_config.speculative_config is not None:
         counts["dflash inputs"] = _warm_dflash_inputs(runner)
