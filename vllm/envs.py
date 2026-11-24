@@ -2364,6 +2364,17 @@ def is_set(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# OLALA_* variables that do not change any compiled graph: locations (where JIT
+# extensions are built, which toolkit builds them) and diagnostics (the step
+# trace, host-sync reports, debug checks), all read in host code or inside
+# opaque custom ops, never in traced forward code.
+_OLALA_UNKEYED = frozenset({
+    "OLALA_TPA_BUILD_DIR", "OLALA_JIT_CUDA_HOME",
+    "OLALA_STEP_TRACE", "OLALA_STEP_TRACE_SYNCS",
+    "OLALA_PREFILL_NOSYNC_CHECK", "OLALA_SYNC_DEBUG", "OLALA_TPA_DEBUG",
+})
+
+
 def compile_factors() -> dict[str, object]:
     """Return env vars used for torch.compile cache keys.
 
@@ -2511,10 +2522,13 @@ def compile_factors() -> dict[str, object]:
     # from running under volta-forever (whose launcher exports VOLTA_FOREVER):
     # both change the traced graph, so a graph compiled under one setting must
     # not be reused under another (e.g. after switching OLALA_VOLTA).
-    # OLALA_TPA_BUILD_DIR only says where JIT extensions are built; the
-    # volta-forever version does not change the graph, only its presence does.
+    # The locations and diagnostics of _OLALA_UNKEYED are not keyed: a per-run
+    # OLALA_STEP_TRACE path gave every server a fresh compile cache, and with it
+    # an empty Triton cache, so every Triton kernel compiled again at its first
+    # use during serving (0.6-1.9 s stalls). The volta-forever version does not
+    # change the graph, only its presence does.
     for var in sorted(os.environ):
-        if var.startswith("OLALA_") and var != "OLALA_TPA_BUILD_DIR":
+        if var.startswith("OLALA_") and var not in _OLALA_UNKEYED:
             factors[var] = normalize_value(os.environ[var])
     if "VOLTA_FOREVER" in os.environ:
         factors["VOLTA_FOREVER"] = True
