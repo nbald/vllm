@@ -92,6 +92,7 @@ target's output distribution (every draft token is verified):
 |---|---|
 | `OLALA_DSPINE_FUSED=1` | The injection after every layer and the transition scoring each run as one `torch.compile`'d function. Single rank only for the transition scoring. |
 | `OLALA_DSPINE_FUSED=2` | Also compiles every draft decoder layer. |
+| `OLALA_DSPINE_FUSED=3` | Level 2 plus hand-fused Triton kernels (`qwen3_dspine_kernels.py`) for draft steps of at most `OLALA_DSPINE_FUSED_MAX_ROWS` rows (64; larger steps keep level 2): q/k norm + rotary, context K/V store, inputs, injection, transition scoring. Single rank only for the transition scoring. |
 | `OLALA_DSPINE_GEMV=1` | The drafter's BF16 linears and head use the skinny GEMV of the Olala kernels (`olala_linear`), up to 64 rows. |
 | `OLALA_DSPINE_CUDA_NORM=1` | The drafter's RMSNorms use vLLM's CUDA kernels instead of the native implementation. |
 
@@ -100,6 +101,23 @@ different GEMM splits); accepted lengths matched the eager drafter in the
 validation runs. On an RTX 5090 with a 5-layer drafter and `K = 3`, all three
 flags with `"attention_backend": "TRITON_ATTN"` take a captured draft step from
 1.61 ms to 0.77 ms at one request.
+
+Level 3 is the recommended setting. The draft step is about 180 small kernels at level 2. On GPUs with a high
+per-kernel cost their count sets the draft time: on a V100 through volta-forever, 1.6 µs of graph launch per kernel.
+Level 3 replaces the chains with single launches:
+- an RTX 5090 at `K = 5` goes from 183 to 115 kernels per draft step, and from 0.64 to 0.52 ms at one request;
+- a V100 at `K = 3` goes from 1.71 to 1.28 ms per draft step.
+
+The kernels use plain loads, reductions and FMAs (tl.dot only in the transition scoring, with an FMA path on the
+SM70 family), so they run on SM70, the SM80 family and SM120. They are not bit-identical to level 2.
+
+Measured against level 2, served greedy and sampled acceptance holds: within 0.4 % on an RTX 5090, 1-16 requests,
+three seeds. Output tokens/s at one to two requests: ×1.01-1.03 on a V100, an RTX 3080 and an RTX 5090. Elsewhere
+the ratio is within noise.
+
+On the SM70 family the injection keeps its explicit update kernel. Its delta form, combined with the fused q/k path,
+lowered acceptance there: the drafter's GEMVs run on the fp16 tensor-core path from 9 rows.
+`OLALA_DSPINE_FUSED_OFF=qk,ctx,prep,inject,delta,transitions,compile` turns groups off, for attribution.
 
 `OLALA_DSPINE_SHARED_HEAD=1` makes a drafter that ships its own head (`has_own_lm_head`) use the target's
 instead: the drafter's `lm_head.weight` is not loaded (0.47 GB for a 151,936 x 1,536 BF16 head), the draft
