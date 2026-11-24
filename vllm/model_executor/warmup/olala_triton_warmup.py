@@ -15,6 +15,7 @@ graph-capture runs meet only a few of these classes. The kernels:
     (OlalaMamba3Mixer.warmup_prefill_kernels);
   - the TPA-factor prefill: ``_tpa_rows_kernel``, ``_tpa_pools_kernel``, ``_tpa_q_kernel``,
     ``_reconstruct_dense_kernel2``;
+  - with a DFlash / DSpine drafter, DFlash's input preparation per span class;
   - the lm_head kernels of compute_logits, which runs outside the CUDA graphs on the unpadded
     rows (e.g. ``_gemv_rows_many_kernel``), and the logprob kernels of the sampler and of prompt
     logprobs (``_topk_log_softmax_kernel`` per number of requested logprobs, ``_ranks_kernel``).
@@ -182,6 +183,50 @@ def _warm_logits(runner, model) -> int:
     return n
 
 
+@torch.inference_mode()
+def _warm_dflash_inputs(runner) -> int:
+    """DFlash's _prepare_dflash_inputs_kernel (spec_decode/dflash/speculator.py) specializes on BLOCK_SIZE, the
+    next power of two of the step's longest request span (query + draft slots, at most 256): the graph-capture runs
+    meet the decode spans only, so the first prefills of each larger class compiled while serving (0.44-0.46 s each
+    on an RTX 5090). One call per class, for one dummy request, through prepare_dflash_inputs on the speculator's
+    own buffers (the prepared inputs and slot mappings, which every step rewrites); the per-request inputs are
+    dummies of the runner's dtypes."""
+    from types import SimpleNamespace as NS
+
+    import numpy as np
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator, prepare_dflash_inputs
+
+    spec = getattr(runner, "speculator", None)
+    if not isinstance(spec, DFlashSpeculator) or not getattr(spec, "draft_kv_cache_group_ids", None):
+        return 0
+    dev = runner.device
+    nq = spec.num_query_per_req
+    i32 = dict(dtype=torch.int32, device=dev)
+    n = 0
+    for bs in (8, 16, 32, 64, 128, 256):
+        q = bs - nq if bs > nq else 1  # the longest query of the step: next_power_of_2(q + nq) == bs
+        if q + nq > spec.max_num_tokens:
+            break
+        batch = NS(num_reqs=1, num_scheduled_tokens=np.array([q], dtype=np.int32),
+                   positions=torch.zeros(spec.max_num_tokens, dtype=torch.int64, device=dev),
+                   query_start_loc=torch.tensor([0, q], **i32), idx_mapping=torch.zeros(1, dtype=torch.int64, device=dev))
+        for i, gid in enumerate(spec.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                spec.input_buffers, spec.block_tables.slot_mappings[gid], spec.context_positions,
+                spec._context_slot_mappings[i], spec.sample_indices, spec.sample_pos, spec.sample_idx_mapping,
+                spec.temperature, spec.seeds, batch, torch.ones(1, **i32), torch.zeros(1, **i32),
+                runner.req_states.last_sampled_tokens, runner.req_states.next_prefill_tokens,
+                runner.sampler.sampling_states.temperature.gpu, runner.sampler.sampling_states.seeds.gpu,
+                spec.block_tables.input_block_tables[gid], spec.block_tables.block_sizes[gid],
+                spec.block_tables.cp_rank, spec.dcp_size, spec.block_tables.cp_interleave,
+                spec.parallel_drafting_token_id, nq, spec.num_speculative_steps, spec.max_num_reqs,
+                spec.max_num_tokens, spec.max_model_len, spec.sample_from_anchor, 1,
+            )  # fmt: skip
+            n += 1
+    return n
+
+
 def olala_triton_warmup(runner: "GPUModelRunner") -> None:
     """Compile the Olala prefill, logits and logprob Triton specializations before serving, on every
     CUDA GPU (OLALA_TRITON_WARMUP=0 skips it), direct or speculative. Every Mamba-3 (TPA) layer has
@@ -208,6 +253,8 @@ def olala_triton_warmup(runner: "GPUModelRunner") -> None:
     if tpa is not None:
         counts["tpa prefill"] = _warm_tpa_prefill(runner, tpa, max_tokens)
     counts["logits and logprobs"] = _warm_logits(runner, model)
+    if runner.vllm_config.speculative_config is not None:
+        counts["dflash inputs"] = _warm_dflash_inputs(runner)
     torch.cuda.synchronize()
     logger.info(
         "Warmed the Olala prefill, logits and logprob Triton kernels (%s calls) in %.2f s.",
