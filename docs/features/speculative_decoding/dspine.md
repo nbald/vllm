@@ -101,6 +101,20 @@ logits go through the target's head (INT8 on W8A16 checkpoints) and the exact tr
 dequantized rows. Use it when the drafter's head is a copy of the target's: on the Q8 target the served
 acceptance changed by -0.01 % offline.
 
+`OLALA_DSPINE_INT8=1` quantizes the drafter's own decoder linears (qkv, o, gate_up, down) and its context projection
+`fc` at load time: symmetric RTN of the BF16 weights, one fp32 scale per output channel. They run through the
+target's W8A16 linear method, which takes its fp16 tensor-core copy on the V100 family, and the fused context K/V
+projection uses the same INT8 rows. The injection and transition weights, the codebook and the norms stay BF16.
+
+On the Q8 target with the v3r2 drafter, offline acceptance on the 2,000 held-out answers is unchanged: τ@5 3.696
+greedy and 3.625 sampled. Served greedy against the BF16 drafter (`K = 5`, `K = 3` on a V100):
+- **one request:** +1.5 % on an RTX 5090 (draft step 0.71 → 0.63 ms) and +2.6 % on a V100 (2.04 → 1.68 ms);
+- **8 to 128 requests:** within ±1 %, apart from two points.
+  - c = 16 on the 5090: +7.8 %.
+  - c = 32 on an RTX 3080: −1.6 / −1.8 % over two rounds. The time to first token there drops by 22 %.
+
+So the flag stays opt-in.
+
 ## Limitations
 
 - Model Runner V2 only (selected automatically).
