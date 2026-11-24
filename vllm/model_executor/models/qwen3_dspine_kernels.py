@@ -163,9 +163,11 @@ def _inject_gate_kernel(
     pn = tl.program_id(1)
     rows = pm * BM + tl.arange(0, BM)
     rmask = rows < n_rows
-    prev = tl.where(rows == 0, n_rows - 1, rows - 1)   # features.roll(1)
     pos = rows % BLOCK
     use_anchor = pos == 1
+    # the previous row of the same block only (positions >= 2): no read past the block, as in _inj_feat_kernel
+    prev = tl.maximum(rows - 1, 0)
+    pmask = rmask & (pos >= 2)
     arow = rows // BLOCK
     cols = pn * BN + tl.arange(0, BN)
     ks = tl.arange(0, BK)
@@ -173,7 +175,7 @@ def _inject_gate_kernel(
     sqp = tl.zeros((BM,), dtype=tl.float32)
     for k0 in range(0, T, BK):
         f = tl.load(proj_ptr + rows[:, None] * T + k0 + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
-        fp = tl.load(proj_ptr + prev[:, None] * T + k0 + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+        fp = tl.load(proj_ptr + prev[:, None] * T + k0 + ks[None, :], mask=pmask[:, None], other=0.0).to(tl.float32)
         sq += tl.sum(f * f, 1)
         sqp += tl.sum(fp * fp, 1)
     s = scale / (tl.sqrt(sq) + eps)
@@ -184,7 +186,7 @@ def _inject_gate_kernel(
     for k0 in range(0, T, BK):
         f = tl.load(proj_ptr + rows[:, None] * T + k0 + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
         f = (f * s[:, None]).to(tl.bfloat16).to(tl.float32)
-        fp = tl.load(proj_ptr + prev[:, None] * T + k0 + ks[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+        fp = tl.load(proj_ptr + prev[:, None] * T + k0 + ks[None, :], mask=pmask[:, None], other=0.0).to(tl.float32)
         fp = (fp * sp[:, None]).to(tl.bfloat16).to(tl.float32)
         an = tl.load(anchor_ptr + arow[:, None] * T + k0 + ks[None, :], mask=(rmask & use_anchor)[:, None],
                      other=0.0).to(tl.float32)
@@ -446,7 +448,7 @@ def _inj_pre_kernel(h_ptr, r_ptr, pre_ptr, xn_ptr, rms_ptr, eps, H: tl.constexpr
 
 
 @triton.jit
-def _inj_feat_kernel(p_ptr, anchor_ptr, f_ptr, pred_ptr, n_rows, eps, scale, T: tl.constexpr, BT: tl.constexpr,
+def _inj_feat_kernel(p_ptr, anchor_ptr, f_ptr, pred_ptr, eps, scale, T: tl.constexpr, BT: tl.constexpr,
                      BLOCK: tl.constexpr):
     i = tl.program_id(0)
     offs = tl.arange(0, BT)
@@ -454,12 +456,20 @@ def _inj_feat_kernel(p_ptr, anchor_ptr, f_ptr, pred_ptr, n_rows, eps, scale, T: 
     p = tl.load(p_ptr + i * T + offs, mask=m, other=0.0).to(tl.float32)
     f = (scale * p / (tl.sqrt(tl.sum(p * p, 0)) + eps)).to(tl.bfloat16)
     tl.store(f_ptr + i * T + offs, f, mask=m)
-    j = tl.where(i == 0, n_rows - 1, i - 1)   # features.roll(1)
-    q = tl.load(p_ptr + j * T + offs, mask=m, other=0.0).to(tl.float32)
-    fq = (scale * q / (tl.sqrt(tl.sum(q * q, 0)) + eps)).to(tl.bfloat16)
-    if i % BLOCK == 1:
-        fq = tl.load(anchor_ptr + (i // BLOCK) * T + offs, mask=m, other=0.0).to(tl.bfloat16)
-    tl.store(pred_ptr + i * T + offs, fq, mask=m)
+    # The predecessor stays in the row's block: the anchor at position 1, the previous row from position 2.
+    # Position 0 has none (its output is its pre-injection state) and reads nothing: the roll of the eager
+    # form would hand it the previous block's last row, a padded row of a CUDA graph's batch (NaN from an
+    # empty attention) or another request.
+    pos = i % BLOCK
+    if pos == 1:
+        fa = tl.load(anchor_ptr + (i // BLOCK) * T + offs, mask=m, other=0.0).to(tl.bfloat16)
+        tl.store(pred_ptr + i * T + offs, fa, mask=m)
+    elif pos == 0:
+        tl.store(pred_ptr + i * T + offs, tl.zeros([BT], dtype=tl.bfloat16), mask=m)
+    else:
+        q = tl.load(p_ptr + (i - 1) * T + offs, mask=m, other=0.0).to(tl.float32)
+        fq = (scale * q / (tl.sqrt(tl.sum(q * q, 0)) + eps)).to(tl.bfloat16)
+        tl.store(pred_ptr + i * T + offs, fq, mask=m)
 
 
 @triton.jit
@@ -475,7 +485,7 @@ def _inj_gate_kernel(r_ptr, pm_ptr, b_ptr, g_ptr, rms_ptr, G: tl.constexpr, BG: 
     msg = tl.load(pm_ptr + i * 2 * G + G + offs, mask=m, other=0.0).to(tl.float32)
     gm = gate * msg
     if AS_DELTA:   # rms * (gated @ w_write.T) = (rms * gated) @ w_write.T; block position 0 keeps pre
-        gm = gm * tl.load(rms_ptr + i) * tl.where(i % BLOCK == 0, 0.0, 1.0)
+        gm = tl.where(i % BLOCK == 0, 0.0, gm * tl.load(rms_ptr + i))   # a select: NaN * 0 is NaN
     tl.store(g_ptr + i * G + offs, gm.to(tl.bfloat16), mask=m)
 
 
@@ -514,7 +524,7 @@ def inject_rows(hidden, residual, anchor, w_read, w_recv, w_pred_msg, w_write, g
     proj = linear(xn, w_read)
     feats = torch.empty(n, t, dtype=hidden.dtype, device=hidden.device)
     pred = torch.empty_like(feats)
-    _inj_feat_kernel[(n,)](proj, anchor, feats, pred, n, eps, float(transfer_dim) ** 0.5, T=t, BT=bt,
+    _inj_feat_kernel[(n,)](proj, anchor, feats, pred, eps, float(transfer_dim) ** 0.5, T=t, BT=bt,
                            BLOCK=block_size, num_warps=4)
     recv = linear(feats, w_recv)
     pm = linear(pred, w_pred_msg)
