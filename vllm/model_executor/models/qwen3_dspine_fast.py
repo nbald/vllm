@@ -14,7 +14,8 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   ``OLALA_DSPINE_FUSED=3`` is level 2 plus the hand-fused kernels of
   qwen3_dspine_kernels.py (one launch per chain): q/k RMSNorm + rotary in
   every draft layer; the context K/V norm, rotary and every layer's cache
-  write after the fused projection.
+  write after the fused projection; the input embeddings and the anchor
+  features.
   ``OLALA_DSPINE_FUSED=2`` also compiles every draft decoder layer: with custom
   ops off, RMSNorm, rotary and SiluAndMul are native torch chains that only a
   compile fuses.
@@ -528,6 +529,28 @@ def hand_context_kv(inner: nn.Module, context_states, context_positions, context
         slots, caches, inner._num_kv_heads, inner._head_dim,
     )
     return True
+
+
+def hand_prep_ok(inner: nn.Module) -> bool:
+    w = getattr(getattr(inner, "embed_tokens", None), "weight", None)
+    cb = getattr(inner, "transfer_codebook", None)
+    return (
+        HAND_FUSED and isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16
+        and w.is_contiguous() and isinstance(cb, torch.Tensor) and cb.is_contiguous()
+    )
+
+
+def hand_prep(inner: nn.Module, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(input_embeds, anchor_features) of DSpineQwen3Model.forward through
+    qwen3_dspine_kernels.prep_inputs."""
+    from vllm.model_executor.models.qwen3_dspine_kernels import prep_inputs
+
+    use_mask = inner.has_separate_mask_embedding and inner.mask_token_id is not None
+    return prep_inputs(
+        input_ids, inner.embed_tokens.weight, inner.mask_embedding if use_mask else None,
+        inner.mask_token_id if use_mask else None, inner.transfer_codebook,
+        inner.injection.block_size, inner.injection.transfer_dim,
+    )
 
 
 def _hand_fuse_attention(attn: nn.Module) -> bool:

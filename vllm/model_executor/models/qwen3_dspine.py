@@ -320,13 +320,17 @@ class DSpineQwen3Model(DFlashQwen3Model):
         positions: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if input_embeds is None:
-            input_embeds = self.embed_input_ids(input_ids)
+        if input_embeds is None and fast_path.hand_prep_ok(self):
+            # OLALA_DSPINE_FUSED=3: embeddings and anchor features in one launch
+            input_embeds, anchor_features = fast_path.hand_prep(self, input_ids)
+        else:
+            if input_embeds is None:
+                input_embeds = self.embed_input_ids(input_ids)
+            anchor_features = self.injection.token_features(
+                self.transfer_codebook, input_ids[:: self.injection.block_size]
+            )
         hidden_states = input_embeds
         residual = None
-        anchor_features = self.injection.token_features(
-            self.transfer_codebook, input_ids[:: self.injection.block_size]
-        )
         final_pre_injection = hidden_states
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
@@ -337,11 +341,11 @@ class DSpineQwen3Model(DFlashQwen3Model):
             pre_injection = (
                 hidden_states if residual is None else hidden_states + residual
             )
-            if layer_idx == len(self.layers) - 1:
-                final_pre_injection = pre_injection
             hidden_states = self.injection(
                 layer_idx, pre_injection, anchor_features=anchor_features
             )
+            if layer_idx == len(self.layers) - 1:
+                final_pre_injection = pre_injection
             residual = None
         hidden_states = self.norm(hidden_states)
         return hidden_states, final_pre_injection

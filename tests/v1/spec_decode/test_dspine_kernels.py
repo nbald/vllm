@@ -83,3 +83,26 @@ def test_ctx_kv_store_matches_reference(n):
             assert torch.equal(got[:, hd:], kv[i, lay, 1])
     written = sum(int((s >= 0).sum()) for s in slots)
     assert sum(int(c.abs().sum(-1).ne(0).sum()) for c in caches) == written * nkv
+
+
+@requires_gpu
+@pytest.mark.parametrize("n,block", [(4, 4), (6, 6), (48, 6), (13, 4)])
+@pytest.mark.parametrize("with_mask", [True, False])
+def test_prep_inputs_matches_eager(n, block, with_mask):
+    from vllm.model_executor.models.qwen3_dspine_kernels import prep_inputs
+
+    torch.manual_seed(n + block)
+    v, h, t, mask_id = 1000, 1536, 512, 999
+    emb = torch.randn(v, h, device="cuda").to(torch.bfloat16)
+    mask_emb = torch.randn(h, device="cuda")  # fp32 parameter, cast like embed_input_ids
+    cb = torch.randn(v, t, device="cuda").to(torch.bfloat16)
+    ids = torch.randint(0, v - 1, (n,), device="cuda")
+    ids[1::block] = mask_id
+    out, anchor = prep_inputs(ids, emb, mask_emb if with_mask else None, mask_id if with_mask else None, cb,
+                              block, t)
+    ref = emb[ids]
+    if with_mask:
+        ref = torch.where((ids == mask_id)[:, None], mask_emb.to(ref.dtype), ref)
+    assert torch.equal(out, ref)
+    anchor_ref = (cb[ids[::block]].float() * t**0.5).to(cb.dtype)
+    assert torch.equal(anchor, anchor_ref)

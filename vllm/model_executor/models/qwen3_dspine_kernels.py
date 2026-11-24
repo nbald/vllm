@@ -192,3 +192,50 @@ def ctx_kv_store(all_kv_flat, positions, cos_sin_cache, k_norm_weights, eps, slo
         *sms, *cs, c0.stride(0), c0.stride(1), c0.stride(2), c0.shape[2],
         NKV=num_kv_heads, HD=head_dim, num_warps=1,
     )
+
+
+# -- Draft inputs: token embeddings (mask slots take the mask embedding) and anchor features ---------------
+@triton.jit
+def _prep_kernel(
+    ids_ptr, emb_ptr, mask_emb_ptr, cb_ptr, out_ptr, anchor_ptr, n_rows, mask_id, scale,
+    H: tl.constexpr, T: tl.constexpr, BLOCK: tl.constexpr, HAS_MASK: tl.constexpr, BH: tl.constexpr,
+    BT: tl.constexpr,
+):
+    p = tl.program_id(0)
+    if p < n_rows:
+        tok = tl.load(ids_ptr + p)
+        offs_h = tl.arange(0, BH)
+        mh = offs_h < H
+        row = tl.load(emb_ptr + tok.to(tl.int64) * H + offs_h, mask=mh, other=0.0)
+        if HAS_MASK:
+            if tok == mask_id:
+                row = tl.load(mask_emb_ptr + offs_h, mask=mh, other=0.0).to(row.dtype)
+        tl.store(out_ptr + p.to(tl.int64) * H + offs_h, row, mask=mh)
+    else:
+        r = p - n_rows
+        atok = tl.load(ids_ptr + r * BLOCK)
+        offs_t = tl.arange(0, BT)
+        mt = offs_t < T
+        f = tl.load(cb_ptr + atok.to(tl.int64) * T + offs_t, mask=mt, other=0.0).to(tl.float32) * scale
+        tl.store(anchor_ptr + r * T + offs_t, f.to(anchor_ptr.dtype.element_ty), mask=mt)
+
+
+def prep_inputs(input_ids, embed_weight, mask_embedding, mask_token_id, codebook, block_size, transfer_dim):
+    """``(input_embeds, anchor_features)`` of a draft step: embed_input_ids (mask
+    slots take ``mask_embedding`` when it is given) and the injection's
+    token_features of every block's first token, in one launch."""
+    n = input_ids.shape[0]
+    h = embed_weight.shape[1]
+    t = codebook.shape[1]
+    r = (n + block_size - 1) // block_size
+    out = torch.empty(n, h, dtype=embed_weight.dtype, device=input_ids.device)
+    anchor = torch.empty(r, t, dtype=codebook.dtype, device=input_ids.device)
+    if n:
+        has_mask = mask_embedding is not None and mask_token_id is not None
+        _prep_kernel[(n + r,)](
+            input_ids, embed_weight, mask_embedding if has_mask else embed_weight, codebook, out, anchor, n,
+            int(mask_token_id) if has_mask else -1, float(transfer_dim) ** 0.5,
+            H=h, T=t, BLOCK=block_size, HAS_MASK=has_mask, BH=triton.next_power_of_2(h),
+            BT=triton.next_power_of_2(t), num_warps=4,
+        )
+    return out, anchor
