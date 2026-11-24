@@ -519,6 +519,16 @@ class OlalaLatentMoE(nn.Module):
         )
         self._router_w16: torch.Tensor | None = None
 
+        # Volta, 3..8 tokens, INT8 fc1_latent and bf16x2 router rows in the entry: opt-in, the whole MoE in three
+        # launches (volta_cuda.moe_rows, OLALA_VOLTA_MOE_ROWS=1) in place of the entry launch + the small path.
+        self._rows_volta = (
+            self._int8_volta
+            and self._fc1_int8
+            and self._entry_path
+            and self._entry_router_parts == 2
+            and volta_cuda.moe_rows_enabled()
+        )
+
         # Registered like the mixers so the MoE call is one opaque custom op
         # and the small/generic dispatch runs inside it (see forward_dispatch).
         self.registry_name = f"{prefix}.latent_moe"
@@ -692,6 +702,10 @@ class OlalaLatentMoE(nn.Module):
         if self._small_path and (
             small or (self._medium_path and m <= MEDIUM_BATCH_MAX_TOKENS)
         ):
+            if self._rows_volta and small and router_logits is None and x_in is None:
+                out = self._moe_rows(hidden_states, weights)
+                if out is not None:
+                    return out
             logits_lo = None
             if router_logits is None:
                 if self._fc1_int8:
@@ -747,6 +761,22 @@ class OlalaLatentMoE(nn.Module):
             routed = self.experts(hidden_states=latent, router_logits=router_logits)
         out = self.fc2_latent_proj(routed)[0]
         return out + self.shared_experts(hidden_states)
+
+    def _moe_rows(
+        self, h: torch.Tensor, weights: tuple[WqWeight, ...]
+    ) -> torch.Tensor | None:
+        """The rows path's output (volta_cuda.moe_rows), or None where it does not
+        apply (token count, layouts)."""
+        fc1 = int8_linear_weight(self.fc1_latent_proj)
+        router = self._entry_weight()
+        bias = self.gate.e_score_correction_bias
+        if fc1 is None or not volta_cuda.moe_rows_ok(
+            h.shape[0], h, router, fc1, bias, *weights, self.top_k
+        ):
+            return None
+        return volta_cuda.moe_rows(
+            h, router, fc1, bias, *weights, self.routed_scaling_factor
+        )
 
     @staticmethod
     def _int8_own_prefill(w13: WqWeight) -> bool:
@@ -820,6 +850,8 @@ class OlalaLatentMoE(nn.Module):
                     WqWeight(w2, (s2 if s2.dim() == 3 else s2.float()).contiguous()),
                     *dense,
                 )
+            if self._rows_volta:
+                volta_cuda.moe_rows_buffers(w13.device)
         return self._int8_w
 
     def _refresh_router_weight(self) -> None:
