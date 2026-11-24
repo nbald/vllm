@@ -1221,7 +1221,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             return 0
         from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import _scan_tc_ok
 
-        real = tuple(self.kv_cache[:4])
+        real = self._base_pools()  # the committed state's views: column 0 with light columns, as _prefill sees them
         dev, dtype = real[1].device, self.model_config.dtype
         pools = tuple(
             torch.empty_strided((2, *p.shape[1:]), p.stride(), dtype=p.dtype, device=dev).zero_()
