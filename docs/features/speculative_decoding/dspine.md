@@ -29,8 +29,10 @@ vllm serve /path/to/target \
 - Watermarking is not supported, as for the other candidate-head drafters.
 - With an Olala target, the TPA-factorized KV cache (`OLALA_TPA_FACTOR`, on by
   default) keeps its verify path, F1 (`OLALA_TPA_FACTOR_SPEC`), on by default
-  on the GPUs where it was measured: SM70 (V100), the SM80 family (Ampere / Ada)
-  and SM120 (consumer Blackwell), with a log line. Its accuracy is that of the
+  for compute capability majors 7, 8 and 12, with a log line. It was measured
+  on sm_120 (RTX 5090), sm_86 (RTX 3080) and SM70 (V100 through volta-forever);
+  sm_80 (A100) and sm_89 (Ada) share the SM80-family kernels but were not
+  measured. Its accuracy is that of the
   factor cache (the verify adds no loss of its own) and it doubles the KV
   capacity. Elsewhere, or with `OLALA_TPA_FACTOR_SPEC=0`, a speculative config
   turns the factor cache off, with a log line, and uses the dense paged KV
