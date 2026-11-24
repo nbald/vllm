@@ -227,6 +227,41 @@ def _warm_dflash_inputs(runner) -> int:
     return n
 
 
+@torch.inference_mode()
+def _warm_dflash_context_kv(runner) -> int:
+    """DFlash stores the context K/V of the target rows a FULL draft graph does not cover eagerly, through
+    _precompute_context_kv(num_context, num_tokens), with num_context = requests x (1 + K) (speculator.py). With an
+    odd 1 + K, e.g. K = 2 in a dynamic-K schedule, an odd request count starts those int64 slot-mapping and position
+    slices off a 16-byte boundary: a Triton specialization the graph captures (which start at 0) never meet. A V100
+    (K = 2, [[1, 2, 2], [3, 6, 0], [7, 16, 2]]) compiled the fused context store (_ctx_kv_store_kernel,
+    OLALA_DSPINE_FUSED=3, at most OLALA_DSPINE_FUSED_MAX_ROWS rows) and the TRITON_ATTN cache write
+    (reshape_and_cache_kernel_flash, more rows) while serving. Warmed here at both alignments and both row counts,
+    through the speculator's own call, on PAD slots (no K/V is written; every step rewrites the slot mappings and
+    positions)."""
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    spec = getattr(runner, "speculator", None)
+    if not isinstance(spec, DFlashSpeculator) or not hasattr(spec, "_precompute_context_kv"):
+        return 0
+    try:
+        from vllm.model_executor.models.qwen3_dspine_fast import HAND_MAX_ROWS
+    except ImportError:
+        HAND_MAX_ROWS = 64
+    n = 0
+    for rows in (2, HAND_MAX_ROWS + 2):
+        for start in (0, 1):
+            end = start + rows
+            if end > spec.max_num_tokens:
+                continue
+            spec._context_slot_mappings[:, :end].fill_(PAD_SLOT_ID)
+            spec.context_positions[:end].zero_()
+            spec._precompute_context_kv(start, end)
+            n += 1
+    torch.cuda.synchronize()
+    return n
+
+
 def olala_triton_warmup(runner: "GPUModelRunner") -> None:
     """Compile the Olala prefill, logits and logprob Triton specializations before serving, on every
     CUDA GPU (OLALA_TRITON_WARMUP=0 skips it), direct or speculative. Every Mamba-3 (TPA) layer has
@@ -255,6 +290,7 @@ def olala_triton_warmup(runner: "GPUModelRunner") -> None:
     counts["logits and logprobs"] = _warm_logits(runner, model)
     if runner.vllm_config.speculative_config is not None:
         counts["dflash inputs"] = _warm_dflash_inputs(runner)
+        counts["dflash context kv"] = _warm_dflash_context_kv(runner)
     torch.cuda.synchronize()
     logger.info(
         "Warmed the Olala prefill, logits and logprob Triton kernels (%s calls) in %.2f s.",
