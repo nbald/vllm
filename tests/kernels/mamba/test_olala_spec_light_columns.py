@@ -16,15 +16,14 @@ like the pages of the hybrid allocator.
 
 import pytest
 import torch
-from vllm.model_executor.layers.mamba.olala import state as st
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import tpa_decode_qkv_spec
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import mamba3_verify_cuda
 
-# The Mamba-3 light-column commit: the Volta edition of the verify kernel (SM70, natively or through
-# volta-forever, which reports sm_80) implements the column-slot protocol only and refuses light pools.
+# The Mamba-3 light-column commit: the tensor-core edition, or on SM70 (natively or through volta-forever, which
+# reports sm_80) the Volta edition of the verify kernel.
 requires_light_verify = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0) or st._sm70(),
-    reason="light-column Mamba-3 verify: tensor-core edition only (column slots on SM70)",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="needs an sm_80+ GPU (or a V100 through volta-forever)",
 )
 
 H, D, S, R, NA = 48, 64, 128, 4, 32

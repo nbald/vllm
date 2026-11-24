@@ -135,11 +135,10 @@ def test_light_page_and_fold_sizes(monkeypatch, sm80, k):
     assert ts < 0.03 * light
 
 
-def test_sm70_keeps_column_slots(monkeypatch, sm80):
-    """V100 (natively or through volta-forever): the Volta verify kernel implements the column-slot protocol
-    only, so the light layout stays off there."""
+def test_sm70_takes_light_columns(monkeypatch, sm80):
+    """V100 (natively or through volta-forever): the Volta edition of the verify kernel commits light columns
+    too, so the layout does not depend on the family."""
     monkeypatch.setenv("OLALA_SPEC_LIGHT", "1")
-    monkeypatch.setenv("OLALA_VOLTA", "1")
-    assert st.spec_light_cols(_cfg(k=5)) == 0
-    monkeypatch.setenv("OLALA_VOLTA", "0")
-    assert st.spec_light_cols(_cfg(k=5)) == 6
+    for volta in ("1", "0"):
+        monkeypatch.setenv("OLALA_VOLTA", volta)
+        assert st.spec_light_cols(_cfg(k=5)) == 6

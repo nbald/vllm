@@ -20,8 +20,8 @@
 // column-slot protocol, and the rejected positions cost nothing. Memory: ~1.82 MB per layer and request at k = 3
 // against 4 x 1.63 MB; traffic: one state read + one state write per step against one read + (1 + k) writes.
 //
-// VERIFY_VOLTA builds (V100, natively or through volta-forever) launch mamba3_verify_volta_kernel instead: the
-// column-slot protocol (light pools are refused), with the arithmetic of the Volta decode step (STEP_VOLTA builds of
+// VERIFY_VOLTA builds (V100, natively or through volta-forever) launch mamba3_verify_volta_kernel instead: both
+// layouts (column slots and light columns), with the arithmetic of the Volta decode step (STEP_VOLTA builds of
 // mamba3_step.cu), see below.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -355,8 +355,9 @@ __global__ void __launch_bounds__(32 * WARPS, 4) mamba3_verify_f32_kernel(const 
 #ifdef VERIFY_VOLTA
 // ---------------------------------------------------------------------------------------------------------------------
 // Volta edition (VERIFY_VOLTA builds, mamba3_step_cuda.py on the SM70 family). sm_70 has no bf16 mma.sync, ldmatrix or
-// cp.async: through volta-forever the kernel above runs them emulated with scalar code. This kernel keeps the column-slot
-// protocol and the state in registers across the positions, but each position is the arithmetic of the Volta decode
+// cp.async: through volta-forever the kernel above runs them emulated with scalar code. This kernel implements the same
+// two layouts (column slots; light columns with the deferred commit of vlight_commit) and keeps the state in registers
+// across the positions, but each position is the arithmetic of the Volta decode
 // step (mamba3_step_volta_kernel in mamba3_step.cu, its STEP_F32_FMA code: fp32 FMA update and C dot over the same
 // fragment layout, rows p0 and p0 + 8, columns jt * 8 + 2 qd + {0, 1}), operation for operation and in the same order.
 // So on Volta too the outputs and the written states are bit-identical to chaining the CUDA decode step over the
@@ -384,31 +385,89 @@ constexpr int VTHREADS = 128;
 // (jt = 0..15): its fragment, hs[e][jt] for row p0 + 8 e, which stays in registers across the positions. A codec
 // (the 16-bit state of SM70, an anchored layout) replaces these two functions and leaves the arithmetic alone.
 //
-// vstate_load: the start state of a request into hs (fragment) and S_.bst0 / S_.xprev[0] / S_.angst0.
-__device__ __forceinline__ void vstate_load(const Args& a, VSmem& S_, int slot, int h, int t, int p0, int qd,
+// vstate_load: the start state of a request into hs (fragment) and S_.bst0 / S_.xprev[0] / S_.angst0, the small
+// pieces from column `col` of the slot (light columns; column slots have no column stride).
+__device__ __forceinline__ void vstate_load(const Args& a, VSmem& S_, int slot, int col, int h, int t, int p0, int qd,
                                             float2 (&hs)[2][16]) {
   const float* src = a.ssm + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
 #pragma unroll
   for (int e = 0; e < 2; ++e)
 #pragma unroll
     for (int jt = 0; jt < 16; ++jt) hs[e][jt] = *reinterpret_cast<const float2*>(src + (p0 + e * 8) * S + jt * 8 + 2 * qd);
-  if (t < 64) { const int rr = t >> 4, q = t & 15; *reinterpret_cast<uint4*>(S_.bst0 + rr * S + q * 8) = *reinterpret_cast<const uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)rr * H + h) * S + q * 8); }
-  else if (t < 72) *reinterpret_cast<uint4*>(S_.xprev[0] + (t - 64) * 8) = *reinterpret_cast<const uint4*>(a.vp + (size_t)slot * a.vp_sst + (size_t)h * D + (t - 64) * 8);
-  else if (t < 80) *reinterpret_cast<float4*>(S_.angst0 + (t - 72) * 4) = *reinterpret_cast<const float4*>(a.angle + (size_t)slot * a.ang_sst + (size_t)h * NA + (t - 72) * 4);
+  const size_t kc = (size_t)slot * a.kp_sst + (size_t)col * a.kp_cst, vc = (size_t)slot * a.vp_sst + (size_t)col * a.vp_cst;
+  const size_t ac = (size_t)slot * a.ang_sst + (size_t)col * a.ang_cst;
+  if (t < 64) { const int rr = t >> 4, q = t & 15; *reinterpret_cast<uint4*>(S_.bst0 + rr * S + q * 8) = *reinterpret_cast<const uint4*>(a.kp + kc + ((size_t)rr * H + h) * S + q * 8); }
+  else if (t < 72) *reinterpret_cast<uint4*>(S_.xprev[0] + (t - 64) * 8) = *reinterpret_cast<const uint4*>(a.vp + vc + (size_t)h * D + (t - 64) * 8);
+  else if (t < 80) *reinterpret_cast<float4*>(S_.angst0 + (t - 72) * 4) = *reinterpret_cast<const float4*>(a.angle + ac + (size_t)h * NA + (t - 72) * 4);
 }
 
-// vstate_store: the state after the current position into column `slot`: hs, the rotated B' (S_.sBk rows 0..3),
-// x (S_.x) and the phase (S_.sTheta).
-__device__ __forceinline__ void vstate_store(const Args& a, const VSmem& S_, int slot, int h, int t, int p0, int qd,
+// vstate_store: the state after the current position: hs into the slot when `state` (always with column slots, at
+// position 0 only with light columns), and the small pieces into column `col` of the slot: the rotated B' (S_.sBk
+// rows 0..3), x (S_.x), the phase (S_.sTheta) and, with light columns, (alpha, gamma, beta).
+__device__ __forceinline__ void vstate_store(const Args& a, const VSmem& S_, int slot, int col, bool state, float alpha,
+                                             float gamma, float beta, int h, int t, int p0, int qd,
                                              const float2 (&hs)[2][16]) {
-  float* dst = a.ssm + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+  if (state) {
+    float* dst = a.ssm + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
 #pragma unroll
-  for (int e = 0; e < 2; ++e)
+    for (int e = 0; e < 2; ++e)
 #pragma unroll
-    for (int jt = 0; jt < 16; ++jt) *reinterpret_cast<float2*>(dst + (p0 + e * 8) * S + jt * 8 + 2 * qd) = hs[e][jt];
-  if (t < 64) { const int rr = t >> 4, q = t & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)rr * H + h) * S + q * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[rr][q * 8]); }
-  if (t < D) a.vp[(size_t)slot * a.vp_sst + (size_t)h * D + t] = S_.x[t];
-  if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
+      for (int jt = 0; jt < 16; ++jt) *reinterpret_cast<float2*>(dst + (p0 + e * 8) * S + jt * 8 + 2 * qd) = hs[e][jt];
+  }
+  const size_t kc = (size_t)slot * a.kp_sst + (size_t)col * a.kp_cst, vc = (size_t)slot * a.vp_sst + (size_t)col * a.vp_cst;
+  const size_t ac = (size_t)slot * a.ang_sst + (size_t)col * a.ang_cst;
+  if (t < 64) { const int rr = t >> 4, q = t & 15; *reinterpret_cast<uint4*>(a.kp + kc + ((size_t)rr * H + h) * S + q * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[rr][q * 8]); }
+  if (t < D) a.vp[vc + (size_t)h * D + t] = S_.x[t];
+  if (t < NA) a.angle[ac + (size_t)h * NA + t] = S_.sTheta[t];
+  if (a.light_cols && t == 0) {
+    float* g = a.agb + (size_t)slot * a.agb_sst + (size_t)col * a.agb_cst + (size_t)h * 4;
+    g[0] = alpha; g[1] = gamma; g[2] = beta; g[3] = 0.f;
+  }
+}
+
+// Light columns (state.spec_light_cols): last step's accepted drafts 1..c0 are committed from the light columns of
+// the slot before the positions, each with the main loop's update below (rotated B' and x of j and j - 1,
+// (alpha, gamma, beta) of j as stored): the same operands, expressions and FMA order, so the committed state is the
+// state the column-slot protocol would have kept for position c0.
+__device__ __forceinline__ void vlight_commit(const Args& a, VSmem& S_, int slot, int c0, int h, int t, int p0, int qd,
+                                              float2 (&hs)[2][16]) {
+  for (int j = 1; j <= c0; ++j) {
+    const size_t kj = (size_t)slot * a.kp_sst + (size_t)j * a.kp_cst, kq = kj - (size_t)a.kp_cst;
+    for (int i = t; i < R * S; i += VTHREADS) {
+      const int rr = i / S, e = i % S;
+      S_.sBk[rr][e] = a.kp[kj + ((size_t)rr * H + h) * S + e];
+      S_.sBk[4 + rr][e] = a.kp[kq + ((size_t)rr * H + h) * S + e];
+    }
+    const size_t vj = (size_t)slot * a.vp_sst + (size_t)j * a.vp_cst + (size_t)h * D;
+    for (int i = t; i < D; i += VTHREADS) { S_.x[i] = a.vp[vj + i]; S_.xprev[1][i] = a.vp[vj - (size_t)a.vp_cst + i]; }
+    const float* g = a.agb + (size_t)slot * a.agb_sst + (size_t)j * a.agb_cst + (size_t)h * 4;
+    const float alpha = g[0], gamma = g[1], beta = g[2];
+    __syncthreads();
+    float av[2][8];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int p = p0 + e * 8;
+      const float xp = bf2f(S_.x[p]), xs = bf2f(S_.xprev[1][p]);
+#pragma unroll
+      for (int rr = 0; rr < R; ++rr) { const float xpj = S_.xproj[rr * D + p]; av[e][rr] = gamma * xp * xpj; av[e][4 + rr] = beta * xs * xpj; }
+    }
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt) {
+      const int n = jt * 8 + 2 * qd;
+      float2 bk[8];
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) bk[kk] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sBk[kk][n]));
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        float2 hv = hs[e][jt];
+        hv.x *= alpha; hv.y *= alpha;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) { hv.x = fmaf(av[e][kk], bk[kk].x, hv.x); hv.y = fmaf(av[e][kk], bk[kk].y, hv.y); }
+        hs[e][jt] = hv;
+      }
+    }
+    __syncthreads();   // sBk / x / xprev[1] are reloaded by the next j and rewritten by position 0
+  }
 }
 
 __global__ void __launch_bounds__(VTHREADS, 3) mamba3_verify_volta_kernel(const Args a) {
@@ -428,18 +487,22 @@ __global__ void __launch_bounds__(VTHREADS, 3) mamba3_verify_volta_kernel(const 
     const int start = a.qsl[r];
     const int qlen = min(a.qsl[r + 1] - start, a.ncols);
     if (qlen <= 0) continue;
-    const int c0 = max(a.num_accepted[r] - 1, 0);
-    const int in_slot = a.cols[(size_t)r * a.cols_stride + c0];
+    // light columns: one slot per request (cols column 0), the current small pieces in its light column c0 and the
+    // SSM state advanced over columns 1..c0 below; column slots: column c0 of cols
+    const bool light = a.light_cols > 0;
+    const int c0 = light ? min(max(a.num_accepted[r] - 1, 0), a.light_cols - 1) : max(a.num_accepted[r] - 1, 0);
+    const int in_slot = a.cols[(size_t)r * a.cols_stride + (light ? 0 : c0)];
     if (in_slot < 0 || in_slot >= a.P) {   // no state to start from: zero outputs, no writes
       for (int i = t; i < qlen * D; i += VTHREADS) a.y[((size_t)(start + i / D) * H + h) * D + i % D] = __float2bfloat16(0.f);
       continue;
     }
     float2 hs[2][16];   // the thread's fragment of the SSM state, in registers across the positions
-    vstate_load(a, S_, in_slot, h, t, p0, qd, hs);
+    vstate_load(a, S_, in_slot, light ? c0 : 0, h, t, p0, qd, hs);
+    if (light && c0 > 0) vlight_commit(a, S_, in_slot, c0, h, t, p0, qd, hs);
     for (int pos = 0; pos < qlen; ++pos) {
       const int tok = start + pos;
-      const int out_slot = a.cols[(size_t)r * a.cols_stride + pos];
-      const bool wr = out_slot >= 0 && out_slot < a.P;
+      const int out_slot = light ? in_slot : a.cols[(size_t)r * a.cols_stride + pos];
+      const bool wr = out_slot >= 0 && out_slot < a.P && (!light || pos < a.light_cols);
       // token rows of this position: 148 16-byte chunks (B 64, C 64, x 8, z 8, angle_proj 4)
       for (int c = t; c < 148; c += VTHREADS) {
         if (c < 64) *reinterpret_cast<uint4*>(S_.bm + c * 8) = *reinterpret_cast<const uint4*>(a.Bm + (size_t)tok * a.bc_bstride + c * 8);
@@ -530,7 +593,9 @@ __global__ void __launch_bounds__(VTHREADS, 3) mamba3_verify_volta_kernel(const 
         ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
       }
       if (qd == 0) { a.y[((size_t)tok * H + h) * D + p0] = __float2bfloat16(ys[0]); a.y[((size_t)tok * H + h) * D + p0 + 8] = __float2bfloat16(ys[1]); }
-      if (wr) vstate_store(a, S_, out_slot, h, t, p0, qd, hs);   // column pos
+      // column slots: the state and pieces of position pos in column pos; light columns: the state in place at
+      // position 0 only, the pieces in light column pos
+      if (wr) vstate_store(a, S_, out_slot, light ? pos : 0, !light || pos == 0, alpha, gamma, beta, h, t, p0, qd, hs);
       if (t < D) S_.xprev[(pos + 1) & 1][t] = S_.x[t];
       __syncthreads();   // the token rows, sBk / sCb / sTheta and xprev[pos & 1] are reused by the next position
     }
@@ -594,9 +659,7 @@ void mamba3_verify_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Ten
   a.pdl = pdl ? 1 : 0;
   if (a.N == 0) return;
 #ifdef VERIFY_VOLTA
-  // The Volta edition implements the column-slot protocol only (state.py keeps the column-slot layout on SM70);
-  // light pools would be misread, so they are refused.
-  TORCH_CHECK(!light, "the Volta verify kernel implements the column-slot protocol only (OLALA_SPEC_LIGHT is off on SM70)");
+  // The Volta edition implements both layouts: column slots, and light columns (a.light_cols > 0).
   {   // static shared memory; head h = blockIdx.x % H stays fixed per CTA, so the grid is a multiple of H
     const c10::cuda::CUDAGuard device_guard(x.device());
     int nsm = 80; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, x.get_device());
