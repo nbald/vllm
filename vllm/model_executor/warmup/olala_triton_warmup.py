@@ -7,10 +7,12 @@ Triton compiles a kernel once per specialization: the 16-divisibility of its int
 prefill slots after the decodes, ...), plus its constexprs. A specialization first met by a
 serving batch compiles while the batch waits. On a V100 through volta-forever a cold compile and
 translation costs 0.4-1.5 s: a 128-prompt burst on a fresh Triton cache spent 3.3 s of 19.5 s in
-them, and the first 8-request burst after a start took 8.8 s instead of 4.3 s. The profiling and
+them, and the first 8-request burst after a start took 8.8 s instead of 4.3 s. On an RTX 5090 the
+first requests of a new configuration stalled 0.6-1.9 s per compile. The profiling and
 graph-capture runs meet only a few of these classes. The kernels:
   - the Mamba-3 hybrid prefill: prologue, ``_ssd_prep``, ``_ssd_state_pass_pool``,
-    ``_ssd_pool_tail`` (OlalaMamba3Mixer.warmup_prefill_kernels);
+    ``_ssd_pool_tail``, and ReplaySSM's reset of the prefilled slots
+    (OlalaMamba3Mixer.warmup_prefill_kernels);
   - the TPA-factor prefill: ``_tpa_rows_kernel``, ``_tpa_pools_kernel``, ``_tpa_q_kernel``,
     ``_reconstruct_dense_kernel2``;
   - the lm_head kernels of compute_logits, which runs outside the CUDA graphs on the unpadded
@@ -181,14 +183,10 @@ def _warm_logits(runner, model) -> int:
 
 
 def olala_triton_warmup(runner: "GPUModelRunner") -> None:
-    """SM70 family (V100, natively or through volta-forever): compile the Olala prefill, logits
-    and logprob Triton specializations before serving. Every Mamba-3 (TPA) layer has the same shapes
-    and kernels, so one layer of each kind covers them all."""
-    if runner.device.type != "cuda":
-        return
-    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
-
-    if gpu_family() is not GpuFamily.SM70:
+    """Compile the Olala prefill, logits and logprob Triton specializations before serving, on every
+    CUDA GPU (OLALA_TRITON_WARMUP=0 skips it), direct or speculative. Every Mamba-3 (TPA) layer has
+    the same shapes and kernels, so one layer of each kind covers them all."""
+    if runner.device.type != "cuda" or os.environ.get("OLALA_TRITON_WARMUP", "1") == "0":
         return
     from vllm.model_executor.layers.mamba.olala.diff_tpa import OlalaDiffTPAAttention
     from vllm.model_executor.layers.mamba.olala.mamba3 import OlalaMamba3Mixer

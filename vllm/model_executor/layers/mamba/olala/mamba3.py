@@ -1213,7 +1213,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         on reading initial states or not, and on the long-sequence tile (32+
         chunks). One small batch per class runs through ``_prefill_hybrid`` as
         a step would, on dummy pools with the real pools' strides: the KV
-        cache is not touched and no output changes. Returns the batch count."""
+        cache is not touched and no output changes. With ReplaySSM, its reset
+        of the prefilled slots too. Returns the batch count."""
         _lazy_import_kernels()
         if _mamba3_mimo_hybrid_pools is None or not self._hybrid_ok:
             return 0
@@ -1251,6 +1252,18 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 for has_init in (None, torch.ones(len(lens), dtype=torch.bool, device=dev)):
                     self._prefill_hybrid(h, out, slots, qsl, pools, has_init, qsl_cpu)
                     n += 1
+        if self._replay is not None:
+            # ReplaySSM marks the just-prefilled slots (replay.py) after a step's prefills, which the
+            # profiling and graph-capture runs never do: one dummy slot, the real pools' strides, the
+            # slots aligned or not (a slice after 0 / 1 decodes).
+            own = self.kv_cache[: self.num_own_state_tensors]
+            dummies = tuple(
+                torch.empty_strided((2, *p.shape[1:]), p.stride(), dtype=p.dtype, device=dev).zero_()
+                for p in own
+            )
+            for off in (0, 1):
+                replay_reset(dummies, torch.zeros(2, dtype=torch.int32, device=dev)[off : off + 1])
+                n += 1
         torch.cuda.synchronize(dev)
         return n
 
