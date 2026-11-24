@@ -19,6 +19,15 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
 - ``OLALA_DSPINE_CUDA_NORM=1``: the drafter's RMSNorms call vLLM's CUDA
   ``rms_norm`` / ``fused_add_rms_norm`` kernels instead of the native chain
   (~8 kernels each, opaque to the compile above). The target is untouched.
+- ``OLALA_DSPINE_INT8=1``: the drafter's decoder linears (qkv, o, gate_up,
+  down) and its context projection ``fc`` are quantized at load time to INT8
+  with one fp32 scale per output channel (symmetric RTN of the bf16 weights,
+  as the Q8 target) and run through the target's W8A16 linear method
+  (``ModelOptW8A16LinearMethod``), as does the fused context K/V projection. The
+  injection and transition weights, the codebook and the norms stay bf16
+  (they are read directly by the fused functions). Halves the bytes of those
+  linears per draft step (about 0.15 ms on a V100); weight reloads after the
+  quantization are not supported.
 
 The fused functions keep the eager casts and order of operations; they are
 not bit-identical to it (different GEMM splits and fusion), so they are
@@ -28,6 +37,7 @@ token, and accepted lengths matched the eager drafter on the validation set.
 
 import math
 import os
+import re
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +48,9 @@ FUSED = FUSED_MODE in ("1", "2")
 COMPILE_LAYERS = FUSED_MODE == "2"
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
 CUDA_NORM = os.environ.get("OLALA_DSPINE_CUDA_NORM", "0") == "1"
+INT8 = os.environ.get("OLALA_DSPINE_INT8", "0") == "1"
+# The linears OLALA_DSPINE_INT8 quantizes: decoder projections and the context projection.
+_INT8_NAME = re.compile(r"(^|\.)layers\.\d+\.(self_attn\.(qkv|o)_proj|mlp\.(gate_up|down)_proj)$|(^|\.)fc$")
 
 _TINY = torch.finfo(torch.float32).tiny
 
@@ -275,11 +288,73 @@ class GemvLinearMethod:
         return getattr(self.base, name)
 
 
+def quantize_int8_rtn(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-output-channel RTN of a bf16 ``[N, K]`` weight: int8
+    ``q`` and fp32 ``scale [N]`` with ``weight ~= scale[:, None] * q``."""
+    w = weight.float()
+    scale = w.abs().amax(dim=1).clamp_min(1e-12) / 127.0
+    q = torch.round(w / scale[:, None]).clamp_(-127, 127).to(torch.int8)
+    return q.contiguous(), scale.contiguous()
+
+
+def install_int8(model: nn.Module) -> int:
+    """Quantize the drafter linears of _INT8_NAME in place (idempotent) and
+    rebuild the fused context K/V projection from the INT8 rows. Returns the
+    number of linears quantized by this call."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
+        ModelOptW8A16LinearMethod,
+    )
+
+    n = 0
+    for name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        if (
+            _INT8_NAME.search(name)
+            and type(getattr(module, "quant_method", None)) is UnquantizedLinearMethod
+            and isinstance(weight, torch.Tensor)
+            and weight.dim() == 2
+            and weight.dtype == torch.bfloat16
+            and getattr(module, "bias", None) is None
+        ):
+            q, scale = quantize_int8_rtn(weight.data)
+            module.weight = nn.Parameter(q, requires_grad=False)
+            module.weight_scale = nn.Parameter(scale, requires_grad=False)
+            # The target's W8A16 linear method: its apply, and its post-load step (the SM70
+            # family's fp16 tensor-core copy where that edition exists).
+            method = ModelOptW8A16LinearMethod()
+            method.process_weights_after_loading(module)
+            module.quant_method = method
+            n += 1
+    inner = model.model
+    attn = [layer.self_attn for layer in inner.layers]
+    if all(isinstance(a.qkv_proj.quant_method, ModelOptW8A16LinearMethod) for a in attn):
+        inner._fused_kv_weight = torch.cat([a.qkv_proj.weight[a.q_size :] for a in attn], 0)
+        inner._fused_kv_scale = torch.cat([a.qkv_proj.weight_scale[a.q_size :] for a in attn], 0)
+        inner._fused_kv_bias = None
+        _register_volta_tc(inner._fused_kv_weight, "dspine.fused_kv")
+    return n
+
+
+def _register_volta_tc(weight: torch.Tensor, name: str) -> None:
+    """An INT8 weight built outside a quant method: the fp16 tensor-core copy that
+    ModelOptW8A16LinearMethod makes for its own weights on the SM70 family (no-op
+    elsewhere, and on trees without that edition)."""
+    try:
+        from vllm.model_executor.layers.quantization.utils.w8a16_utils import volta_tc
+    except ImportError:
+        return
+    if (tc := volta_tc()) is not None:
+        tc.register_int8(weight, 1, name)
+
+
 def apply_fast_path(model: nn.Module) -> None:
     """Install the flagged fast paths on a loaded DSpineQwen3ForCausalLM.
     Called after every load_weights; idempotent."""
     if FUSED:
         refresh_fused_weights(model.model.injection)
+    if INT8:
+        install_int8(model)
     if GEMV:
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.model_executor.layers.vocab_parallel_embedding import (
