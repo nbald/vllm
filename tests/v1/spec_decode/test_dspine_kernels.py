@@ -48,6 +48,34 @@ def test_qk_norm_rope_matches_eager(n, cache_dtype):
 
 
 @requires_gpu
+@pytest.mark.parametrize("n,block", [(4, 4), (6, 6), (12, 6), (48, 6), (64, 8), (33, 3)])
+@pytest.mark.parametrize("with_residual", [True, False])
+def test_inject_matches_inject_fn(n, block, with_residual):
+    from vllm.model_executor.models.qwen3_dspine_fast import inject_fn
+    from vllm.model_executor.models.qwen3_dspine_kernels import inject
+
+    torch.manual_seed(n * 10 + block)
+    h, t, g, eps = 1536, 512, 256, 1e-6
+    bf = torch.bfloat16
+    hidden = (torch.randn(n, h, device="cuda") * 2).to(bf)
+    residual = (torch.randn(n, h, device="cuda") * 2).to(bf) if with_residual else None
+    anchor = (torch.randn((n + block - 1) // block, t, device="cuda") * 4).to(bf)
+    w_read = (torch.randn(t, h, device="cuda") / h**0.5).to(bf)
+    w_recv = (torch.randn(g, t, device="cuda") / t**0.5).to(bf)
+    w_pred_msg = (torch.randn(2 * g, t, device="cuda") / t**0.5).to(bf)
+    w_write = (torch.randn(h, g, device="cuda") / g**0.5).to(bf)
+    bias = (torch.randn(g, device="cuda") * 0.1).to(bf)
+    pre_ref = hidden if residual is None else hidden + residual
+    out_ref = inject_fn(pre_ref, anchor, w_read, w_recv, w_pred_msg, w_write, bias, block, t, eps)
+    out, pre = inject(hidden, residual, anchor, w_read, w_recv, w_pred_msg, w_write, bias, block, t, eps)
+    assert torch.equal(pre, pre_ref)
+    # block position 0 keeps the pre-injection state exactly
+    first = torch.arange(n, device="cuda") % block == 0
+    assert torch.equal(out[first], pre_ref[first])
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=2e-2, atol=5e-2)
+
+
+@requires_gpu
 @pytest.mark.parametrize("n", [1, 6, 30, 200])
 def test_ctx_kv_store_matches_reference(n):
     from vllm.model_executor.models.qwen3_dspine_kernels import ctx_kv_store, ctx_kv_store_ok
@@ -106,3 +134,55 @@ def test_prep_inputs_matches_eager(n, block, with_mask):
     assert torch.equal(out, ref)
     anchor_ref = (cb[ids[::block]].float() * t**0.5).to(cb.dtype)
     assert torch.equal(anchor, anchor_ref)
+
+
+@requires_gpu
+@pytest.mark.parametrize("n,block", [(4, 4), (6, 6), (48, 6), (64, 8), (33, 3), (768, 6)])
+@pytest.mark.parametrize("with_residual", [True, False])
+def test_inject_rows_matches_inject_fn(n, block, with_residual):
+    import torch.nn.functional as F
+
+    from vllm.model_executor.models.qwen3_dspine_fast import inject_fn
+    from vllm.model_executor.models.qwen3_dspine_kernels import inject_rows
+
+    torch.manual_seed(n * 7 + block)
+    h, t, g, eps = 1536, 512, 256, 1e-6
+    bf = torch.bfloat16
+    hidden = (torch.randn(n, h, device="cuda") * 2).to(bf)
+    residual = (torch.randn(n, h, device="cuda") * 2).to(bf) if with_residual else None
+    anchor = (torch.randn((n + block - 1) // block, t, device="cuda") * 4).to(bf)
+    w_read = (torch.randn(t, h, device="cuda") / h**0.5).to(bf)
+    w_recv = (torch.randn(g, t, device="cuda") / t**0.5).to(bf)
+    w_pred_msg = (torch.randn(2 * g, t, device="cuda") / t**0.5).to(bf)
+    w_write = (torch.randn(h, g, device="cuda") / g**0.5).to(bf)
+    bias = (torch.randn(g, device="cuda") * 0.1).to(bf)
+    pre_ref = hidden if residual is None else hidden + residual
+    out_ref = inject_fn(pre_ref, anchor, w_read, w_recv, w_pred_msg, w_write, bias, block, t, eps)
+    out, pre = inject_rows(hidden, residual, anchor, w_read, w_recv, w_pred_msg, w_write, bias, block, t, eps,
+                           F.linear)
+    assert torch.equal(pre, pre_ref)
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=2e-2, atol=5e-2)
+
+
+@requires_gpu
+@pytest.mark.parametrize("n,block", [(6, 6), (48, 6), (33, 3)])
+def test_inject_rows_delta_adds_up(n, block):
+    import torch.nn.functional as F
+
+    from vllm.model_executor.models.qwen3_dspine_fast import inject_fn
+    from vllm.model_executor.models.qwen3_dspine_kernels import inject_rows
+
+    torch.manual_seed(n + 3 * block)
+    h, t, g, eps = 1536, 512, 256, 1e-6
+    bf = torch.bfloat16
+    hidden = (torch.randn(n, h, device="cuda") * 2).to(bf)
+    residual = (torch.randn(n, h, device="cuda") * 2).to(bf)
+    anchor = (torch.randn((n + block - 1) // block, t, device="cuda") * 4).to(bf)
+    ws = [(torch.randn(o, i, device="cuda") / i**0.5).to(bf) for o, i in ((t, h), (g, t), (2 * g, t), (h, g))]
+    bias = (torch.randn(g, device="cuda") * 0.1).to(bf)
+    out_ref = inject_fn(hidden + residual, anchor, *ws, bias, block, t, eps)
+    delta, pre = inject_rows(hidden, residual, anchor, *ws, bias, block, t, eps, F.linear, as_delta=True)
+    first = torch.arange(n, device="cuda") % block == 0
+    assert torch.equal(delta[first], torch.zeros_like(delta[first]))
+    # rms * gated is rounded before the GEMV instead of after: a few elements move by a bf16 step or two
+    torch.testing.assert_close((pre.float() + delta.float()).to(bf).float(), out_ref.float(), rtol=5e-2, atol=1e-1)

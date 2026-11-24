@@ -13,7 +13,8 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   batch size) instead of ~50 eager elementwise kernels per layer.
   ``OLALA_DSPINE_FUSED=3`` is level 2 plus the hand-fused kernels of
   qwen3_dspine_kernels.py (one launch per chain): q/k RMSNorm + rotary in
-  every draft layer; the context K/V norm, rotary and every layer's cache
+  every draft layer; the residual add and the adjacent injection around the
+  drafter's GEMVs (four row-wise launches); the context K/V norm, rotary and every layer's cache
   write after the fused projection; the input embeddings and the anchor
   features.
   ``OLALA_DSPINE_FUSED=2`` also compiles every draft decoder layer: with custom
@@ -491,6 +492,42 @@ def _fused_attention_forward(self, positions: torch.Tensor, hidden_states: torch
     attn_output = self.attn(q, k, v)
     output, _ = self.o_proj(attn_output)
     return output
+
+
+def hand_inject_ok(hidden_states: torch.Tensor) -> bool:
+    """OLALA_DSPINE_FUSED=3: the residual add and the injection through
+    qwen3_dspine_kernels.inject_rows (the drafter's GEMVs plus four row-wise
+    launches)."""
+    return HAND_FUSED and hidden_states.dim() == 2
+
+
+def hand_inject(
+    injection: nn.Module,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    anchor_features: torch.Tensor,
+    as_delta: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(injected, pre_injection) of one layer, or (delta, pre_injection) with
+    ``as_delta`` (injected = pre + delta, added by the next RMSNorm).
+    OLALA_DSPINE_FUSED_INJECT=1 takes the
+    experimental three-launch FMA-tile kernels (qwen3_dspine_kernels.inject) for
+    at most 64 rows: slower than the GEMV path on an RTX 5090 (91 against 15 us
+    per layer)."""
+    from vllm.model_executor.models import qwen3_dspine_kernels as k
+
+    if getattr(injection, "fused_pred_msg_weight", None) is None:
+        refresh_fused_weights(injection)
+    args = (
+        hidden_states, residual, anchor_features, injection.readouts[layer_idx].weight,
+        injection.receiver_gate.weight, injection.fused_pred_msg_weight,
+        injection.writes[layer_idx].weight, injection.gate_bias, injection.block_size,
+        injection.transfer_dim, injection.eps,
+    )
+    if os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") == "1" and hidden_states.shape[0] <= k.INJECT_MAX_ROWS:
+        return k.inject(*args)
+    return k.inject_rows(*args, _linear, as_delta=as_delta)
 
 
 def hand_context_kv(inner: nn.Module, context_states, context_positions, context_slot_mapping) -> bool:

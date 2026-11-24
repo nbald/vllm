@@ -332,18 +332,35 @@ class DSpineQwen3Model(DFlashQwen3Model):
         hidden_states = input_embeds
         residual = None
         final_pre_injection = hidden_states
+        hand_inject = fast_path.hand_inject_ok(hidden_states)
+        delta_inject = hand_inject and os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") != "1"
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
-            pre_injection = (
-                hidden_states if residual is None else hidden_states + residual
-            )
-            hidden_states = self.injection(
-                layer_idx, pre_injection, anchor_features=anchor_features
-            )
+            if hand_inject:
+                # OLALA_DSPINE_FUSED=3: the residual add and the injection around the GEMVs. Before
+                # the last layer the row-wise path returns (delta, pre), and the next layer's input
+                # norm adds them in place; the last layer's pre is the transition scoring's input.
+                last = layer_idx == len(self.layers) - 1
+                as_delta = delta_inject and not last
+                hidden_states, pre_injection = fast_path.hand_inject(
+                    self.injection, layer_idx, hidden_states, residual, anchor_features,
+                    as_delta=as_delta,
+                )
+                if last:
+                    final_pre_injection = pre_injection
+                residual = pre_injection if as_delta else None
+                continue
+            else:
+                pre_injection = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                hidden_states = self.injection(
+                    layer_idx, pre_injection, anchor_features=anchor_features
+                )
             if layer_idx == len(self.layers) - 1:
                 final_pre_injection = pre_injection
             residual = None
