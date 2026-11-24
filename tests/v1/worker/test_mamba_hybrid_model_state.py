@@ -38,6 +38,17 @@ def _recoverssm_attn_groups(layer_name: str) -> list[list[AttentionGroup]]:
 
 GPU_DEVICE = current_platform.device_type
 HAS_GPU = current_platform.is_cuda_alike() or current_platform.is_xpu()
+# _create_gdn_builder builds its VllmConfig from this model's Hub config.
+GDN_MODEL = "Qwen/Qwen3.5-0.8B"
+
+
+def _hub_config_available(repo: str) -> bool:
+    """False when the Hub is offline and the model's config is not cached."""
+    from huggingface_hub import constants, try_to_load_from_cache
+
+    if not constants.HF_HUB_OFFLINE:
+        return True
+    return isinstance(try_to_load_from_cache(repo, "config.json"), str)
 
 
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,6 +109,10 @@ def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
     assert state._mamba_state_idx_gpu[1] == 121
 
 
+@pytest.mark.skipif(
+    not _hub_config_available(GDN_MODEL),
+    reason=f"offline and {GDN_MODEL} is not in the Hub cache",
+)
 def test_padded_prompt_tail_builds_as_spec_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
