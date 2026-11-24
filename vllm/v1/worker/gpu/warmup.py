@@ -245,6 +245,21 @@ def warmup_kernels(
             _warmup_kernels(
                 model_runner, worker_execute_model, worker_sample_tokens, greedy=True
             )
+        if not model_runner.is_pooling_model:
+            # A request with an explicit seed (OpenAI clients often send one) is
+            # never eligible for the fused sampler: it takes the Gumbel path with
+            # the Triton top-k / top-p kernel (one specialization per top-k / top-p
+            # combination), and under speculative decoding the rejection sampler's
+            # seeded path. The passes above draw unseeded, so the first seeded
+            # requests compiled _gumbel_sample_kernel and _topk_topp_kernel while
+            # serving.
+            for params in _SEEDED_WARMUP_PARAMS:
+                _warmup_kernels(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                    sampling_params=params,
+                )
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
@@ -252,11 +267,19 @@ def warmup_kernels(
             rejection_sampler.enable_adaptive_verification = True
 
 
+# Seeded sampling for warmup_kernels: top-k and top-p, top-p only, top-k only.
+_SEEDED_WARMUP_PARAMS = tuple(
+    SamplingParams(temperature=0.8, seed=0, **knobs)
+    for knobs in ({"top_p": 0.9, "top_k": 40}, {"top_p": 0.9}, {"top_k": 40})
+)
+
+
 def _warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
     greedy: bool = False,
+    sampling_params: SamplingParams | None = None,
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
@@ -329,11 +352,12 @@ def _warmup_kernels(
         pooling_params = PoolingParams(task=pooling_task)
         pooling_params.verify(model_runner.model_config)
     else:
-        sampling_params = (
-            SamplingParams(temperature=0)
-            if greedy
-            else SamplingParams.for_sampler_warmup()
-        )
+        if sampling_params is None:
+            sampling_params = (
+                SamplingParams(temperature=0)
+                if greedy
+                else SamplingParams.for_sampler_warmup()
+            )
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
