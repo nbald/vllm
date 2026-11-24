@@ -22,7 +22,10 @@ vllm serve /path/to/target \
   trained one.
 - Dynamic speculative decoding (`num_speculative_tokens_per_batch_size`) is
   supported. The drafter always drafts its full block and the runner truncates
-  it to the scheduled length; a length of 0 skips the draft forward.
+  it to the scheduled length; a length of 0 skips the draft forward. A shorter
+  non-zero length therefore saves verify work only: on a V100, `K = 1` in a
+  `K = 2` server drafted at the `K = 2` width (draft 6.5 ms against 2.1 ms for a
+  static `K = 1` at 4 requests).
 - An attention backend for the drafter alone can be set with
   `"attention_backend"` in the speculative config. Prefer it over the global
   `--attention-backend`, which also changes the target's kernels.
@@ -144,6 +147,55 @@ greedy and 3.625 sampled. Served greedy against the BF16 drafter (`K = 5`, `K = 
 
 It is on by default on the GPUs measured (SM70, the SM80 family, SM120) despite the RTX 3080 point at c = 32.
 `OLALA_DSPINE_INT8=0` keeps the BF16 linears, and `1` forces INT8 on other GPUs.
+
+## Serving on a V100
+
+On a V100 (SM70 through volta-forever, the Q8 Olala-v1.0-mini-7A1B target and the Télégraphe drafter), the
+speculative server takes up to 16 concurrent streams. **Above 16 streams, route the traffic to a direct server**
+(the same target without a speculative config). This is the role of `MAX_SEQS` in the RTX 5090 setting.
+Up to 16 streams, the speculative server uses:
+- `num_speculative_tokens = 2`, with `num_speculative_tokens_per_batch_size` `[[1, 2, 2], [3, 6, 0], [7, 16, 2]]`:
+  K = 2 at 1-2 and 7-16 requests, no drafts at 3-6;
+- `--max-num-seqs 16`;
+- the INT8 drafter (default), `OLALA_DSPINE_FUSED=3`, and F1 (default under spec on SM70);
+- `OLALA_VOLTA_MOE_ROWS=1`, the multi-row MoE, as the V100 spec option: +6-7 % at one request, neutral elsewhere.
+
+The decode CUDA graphs need every request count's size, n × (1 + K). The Olala capture list adds them for up to
+32 requests (`OLALA_SPEC_GRAPHS_MAX_REQS`). Without them, K = 2 at 4 requests pads its 12 tokens to the 18-token
+graph: 26.4 ms per step against 20.0 ms.
+
+```bash
+# On a V100 node, through run-node.sh (CUDA_VISIBLE_DEVICES, caches, the VF proxy cache) and volta-forever 0.1.5.
+OLALA_GPU=0 OLALA_VF=0.1.5 /srv/cache/olala/run-node.sh env \
+  VLLM_USE_V2_MODEL_RUNNER=1 VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1 VF_JIT_LINEINFO=1 \
+  OLALA_MAMBA3_VERIFY=cuda OLALA_SPLIT_PREFILL=1 OLALA_SPLIT_PREFILL_MAX_DECODES=16 OLALA_PREFILL_NOSYNC=1 \
+  OLALA_TS_FOLD=1 OLALA_SPEC_LIGHT=1 VLLM_KV_CACHE_GROUP_SIZE=7 OLALA_TPA_MIXED_FUSED=1 \
+  OLALA_TPA_FACTOR=1 OLALA_TPA_FACTOR_SPEC=1 \
+  OLALA_DSPINE_SHARED_HEAD=1 OLALA_DSPINE_FUSED=3 OLALA_DSPINE_GEMV=1 OLALA_DSPINE_CUDA_NORM=1 \
+  OLALA_VOLTA_MOE_ROWS=1 \
+  vf python3 -m vllm.entrypoints.cli.main serve /path/to/Olala-v1.0-mini-7A1B-Q8 \
+    --trust-remote-code --served-model-name olala --reasoning-parser olala \
+    --max-model-len 65536 --max-num-seqs 16 \
+    --speculative-config '{"method": "dflash", "model": "/path/to/Olala-v1.0-mini-7A1B-Telegraphe",
+      "num_speculative_tokens": 2, "attention_backend": "TRITON_ATTN",
+      "num_speculative_tokens_per_batch_size": [[1, 2, 2], [3, 6, 0], [7, 16, 2]]}'
+```
+
+Output tokens/s against the direct server (max-num-seqs 128), same run, 512-token outputs, one round. These were
+measured through volta-forever 0.1.3 with its later fixes; the snippet takes the 0.1.5 release.
+
+| c | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| sampled | ×1.206 | ×1.036 | ×0.988 | ×1.064 | ×1.242 |
+| greedy | ×1.271 | ×1.084 | ×0.993 | ×1.116 | ×1.311 |
+
+Why this schedule, on the same stack:
+- **Static K = 2:** ×0.91 sampled / ×0.97 greedy at c = 4, even with the exact graph sizes. Verifying 12 tokens costs
+  more on this MoE target than the drafts return.
+- **c = 32:** every static K loses (×0.92-0.94 sampled).
+- **c = 128:** under KV pressure the running batch stays at 25-64 requests, the range where c = 32 needs K = 0.
+  No batch-size schedule serves both: a K = 0 range there gave ×0.96-0.98 at c = 128.
+- **KV at 64k-token requests:** the speculative layout holds 11.1×, against 16.4× for direct.
 
 ## Limitations
 
