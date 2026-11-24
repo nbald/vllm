@@ -16,7 +16,7 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   every draft layer; the residual add and the adjacent injection around the
   drafter's GEMVs (four row-wise launches); the context K/V norm, rotary and every layer's cache
   write after the fused projection; the input embeddings and the anchor
-  features.
+  features; the transition scoring's candidate side (three fp32 launches).
   ``OLALA_DSPINE_FUSED=2`` also compiles every draft decoder layer: with custom
   ops off, RMSNorm, rotary and SiluAndMul are native torch chains that only a
   compile fuses.
@@ -65,6 +65,12 @@ FUSED_MODE = os.environ.get("OLALA_DSPINE_FUSED", "0")
 FUSED = FUSED_MODE in ("1", "2", "3")
 COMPILE_LAYERS = FUSED_MODE in ("2", "3")
 HAND_FUSED = FUSED_MODE == "3"
+# Debug / attribution: OLALA_DSPINE_FUSED_OFF=qk,ctx,prep,inject,delta,transitions turns groups of level 3 off.
+_FUSED_OFF = frozenset(g for g in os.environ.get("OLALA_DSPINE_FUSED_OFF", "").split(",") if g)
+
+
+def _group(name: str) -> bool:
+    return HAND_FUSED and name not in _FUSED_OFF
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
 CUDA_NORM = os.environ.get("OLALA_DSPINE_CUDA_NORM", "0") == "1"
 # OLALA_DSPINE_INT8 unset: on for these compute-capability majors (V100, A100 / RTX 30-40, RTX 50),
@@ -498,7 +504,7 @@ def hand_inject_ok(hidden_states: torch.Tensor) -> bool:
     """OLALA_DSPINE_FUSED=3: the residual add and the injection through
     qwen3_dspine_kernels.inject_rows (the drafter's GEMVs plus four row-wise
     launches)."""
-    return HAND_FUSED and hidden_states.dim() == 2
+    return _group("inject") and hidden_states.dim() == 2
 
 
 def hand_inject(
@@ -534,7 +540,7 @@ def hand_context_kv(inner: nn.Module, context_states, context_positions, context
     """DFlash's precompute_and_store_context_kv through qwen3_dspine_kernels.ctx_kv_store
     (OLALA_DSPINE_FUSED=3): False, and nothing done, when the case is not covered
     (dummy runs, no fused K/V weight, a V scale, another cache layout)."""
-    if not HAND_FUSED or context_slot_mapping is None or not hasattr(inner, "_num_attn_layers"):
+    if not _group("ctx") or context_slot_mapping is None or not hasattr(inner, "_num_attn_layers"):
         return False
     if getattr(inner, "_fused_kv_weight", None) is None or getattr(inner.layers[0].self_attn, "v_scale", None) is not None:
         return False
@@ -572,7 +578,7 @@ def hand_prep_ok(inner: nn.Module) -> bool:
     w = getattr(getattr(inner, "embed_tokens", None), "weight", None)
     cb = getattr(inner, "transfer_codebook", None)
     return (
-        HAND_FUSED and isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16
+        _group("prep") and isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16
         and w.is_contiguous() and isinstance(cb, torch.Tensor) and cb.is_contiguous()
     )
 
@@ -587,6 +593,37 @@ def hand_prep(inner: nn.Module, input_ids: torch.Tensor) -> tuple[torch.Tensor, 
         input_ids, inner.embed_tokens.weight, inner.mask_embedding if use_mask else None,
         inner.mask_token_id if use_mask else None, inner.transfer_codebook,
         inner.injection.block_size, inner.injection.transfer_dim,
+    )
+
+
+def hand_transitions_ok(lm_head: nn.Module, candidate_ids: torch.Tensor) -> bool:
+    """OLALA_DSPINE_FUSED=3 transition scoring: one tensor-parallel rank, a bf16 or
+    per-channel INT8 head, a power-of-two top-k, at most TRANSITION_MAX_ROWS
+    candidate rows (larger batches keep transitions_fn's cuBLAS GEMMs)."""
+    if not _group("transitions") or getattr(lm_head, "tp_size", 1) != 1 or candidate_ids.dim() != 3:
+        return False
+    from vllm.model_executor.models.qwen3_dspine_kernels import TRANSITION_MAX_ROWS
+
+    w = lm_head.weight
+    k = candidate_ids.shape[-1]
+    scale_ok = w.dtype == torch.bfloat16 or (
+        w.dtype == torch.int8 and getattr(lm_head, "weight_scale", None) is not None
+        and lm_head.weight_scale.dim() == 1
+    )
+    return scale_ok and k & (k - 1) == 0 and candidate_ids.numel() <= TRANSITION_MAX_ROWS
+
+
+def hand_score_transitions(injection, norm, lm_head, transfer_codebook, candidate_ids, final_pre_injection,
+                           anchor_token_ids, final_layer_idx):
+    from vllm.model_executor.models.qwen3_dspine_kernels import score_transitions
+
+    w = lm_head.weight
+    return score_transitions(
+        final_pre_injection, candidate_ids, anchor_token_ids, injection.readouts[final_layer_idx].weight,
+        injection.receiver_gate.weight, injection.predecessor_gate.weight, injection.message.weight,
+        injection.writes[final_layer_idx].weight, injection.gate_bias, norm.weight, w,
+        None if w.is_floating_point() else lm_head.weight_scale, transfer_codebook, injection.transfer_dim,
+        injection.eps, norm.variance_epsilon, _linear,
     )
 
 
@@ -639,7 +676,7 @@ def apply_fast_path(model: nn.Module) -> None:
         for module in model.model.modules():
             if type(module) is RMSNorm:
                 bind_cuda_rms_norm(module)
-    if HAND_FUSED:
+    if _group("qk"):
         for layer in model.model.layers:
             if not getattr(layer.self_attn, "dspine_hand_fused", False):
                 layer.self_attn.dspine_hand_fused = _hand_fuse_attention(layer.self_attn)

@@ -526,3 +526,161 @@ def inject_rows(hidden, residual, anchor, w_read, w_recv, w_pred_msg, w_write, g
     out = torch.empty_like(hidden)
     _inj_out_kernel[(n,)](pre, upd, rms, out, H=h, BH=bh, BLOCK=block_size, num_warps=4)
     return out, pre
+
+
+# -- Transition scoring (qwen3_dspine._score_transitions, tp 1) --------------------------------------------------
+# Rows q = (request, position) carry the receiver state (pre-injection state of the last layer); candidate rows
+# m = (q, a) the top-k successor candidates. In fp32 as the reference: per candidate row the exact predecessor
+# code (codebook row of the anchor at position 0, of the previous position's candidate a elsewhere) gives
+# gate = sigmoid(recv_gate[q] + code @ w_pred.T + bias) and message = code @ w_msg.T (K_A); the refined state
+# pre[q] + rms[q] * ((gate * message) @ w_write.T) (K_B, with its row sum of squares); scores = RMSNorm(refined)
+# . successor head rows (K_C). Weight tiles are loaded [BN, BK] (contiguous along K) and transposed.
+
+TRANSITION_MAX_ROWS = 2048
+
+
+@triton.jit
+def _tr_gate_kernel(
+    cand_ptr, anchor_ptr, cb_ptr, recv_ptr, wp_ptr, wm_ptr, b_ptr, gm_ptr, n_rows, n_pos, scale,
+    TOPK: tl.constexpr, T: tl.constexpr, G: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    MMA: tl.constexpr,
+):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    rmask = rows < n_rows
+    q = rows // TOPK
+    a = rows % TOPK
+    req = q // n_pos
+    pos = q % n_pos
+    prev_cand = tl.load(cand_ptr + (q - 1) * TOPK + a, mask=rmask & (pos > 0), other=0)
+    anc = tl.load(anchor_ptr + req, mask=rmask & (pos == 0), other=0)
+    pid = tl.where(pos == 0, anc, prev_cand).to(tl.int64)
+    cols = pn * BN + tl.arange(0, BN)
+    ks = tl.arange(0, BK)
+    acc_p = tl.zeros((BM, BN), dtype=tl.float32)
+    acc_m = tl.zeros((BM, BN), dtype=tl.float32)
+    # (scale * code) @ w.T = scale * (code @ w.T): bf16 operands, exact products, fp32 sums
+    for k0 in range(0, T, BK):
+        code = tl.load(cb_ptr + pid[:, None] * T + k0 + ks[None, :], mask=rmask[:, None], other=0.0)
+        wp = tl.load(wp_ptr + cols[:, None] * T + k0 + ks[None, :])   # [BN, BK]
+        wm = tl.load(wm_ptr + cols[:, None] * T + k0 + ks[None, :])
+        if MMA:
+            acc_p += tl.dot(code, tl.trans(wp))
+            acc_m += tl.dot(code, tl.trans(wm))
+        else:   # SM70: FMA code (no bf16 mma)
+            code_f = code.to(tl.float32)
+            acc_p += tl.dot(code_f, tl.trans(wp.to(tl.float32)), input_precision="ieee")
+            acc_m += tl.dot(code_f, tl.trans(wm.to(tl.float32)), input_precision="ieee")
+    acc_p = acc_p * scale
+    acc_m = acc_m * scale
+    r = tl.load(recv_ptr + q[:, None] * G + cols[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    bias = tl.load(b_ptr + cols).to(tl.float32)
+    gate = 1.0 / (1.0 + tl.exp(-(r + acc_p + bias[None, :])))
+    tl.store(gm_ptr + rows[:, None] * G + cols[None, :], gate * acc_m, mask=rmask[:, None])
+
+
+@triton.jit
+def _tr_write_kernel(
+    gm_ptr, ww_ptr, pre_ptr, rms_ptr, ref_ptr, ss_ptr, n_rows,
+    TOPK: tl.constexpr, H: tl.constexpr, G: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    rmask = rows < n_rows
+    q = rows // TOPK
+    cols = pn * BN + tl.arange(0, BN)
+    ks = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k0 in range(0, G, BK):
+        g = tl.load(gm_ptr + rows[:, None] * G + k0 + ks[None, :], mask=rmask[:, None], other=0.0)
+        w = tl.load(ww_ptr + cols[:, None] * G + k0 + ks[None, :]).to(tl.float32)   # [BN, BK]
+        acc += tl.dot(g, tl.trans(w), input_precision="ieee")
+    pre = tl.load(pre_ptr + q[:, None] * H + cols[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    rms = tl.load(rms_ptr + q, mask=rmask, other=0.0)
+    refined = pre + rms[:, None] * acc
+    tl.store(ref_ptr + rows[:, None] * H + cols[None, :], refined, mask=rmask[:, None])
+    tl.atomic_add(ss_ptr + rows, tl.sum(refined * refined, 1), mask=rmask)
+
+
+@triton.jit
+def _tr_score_kernel(
+    ref_ptr, ss_ptr, nw_ptr, cand_ptr, head_ptr, hs_ptr, out_ptr, eps,
+    TOPK: tl.constexpr, H: tl.constexpr, BK: tl.constexpr, HAS_SCALE: tl.constexpr,
+):
+    q = tl.program_id(0)
+    k0 = tl.program_id(1) * BK   # one slice of H per program, summed into the zeroed output
+    a = tl.arange(0, TOPK)
+    rows = q * TOPK + a
+    ks = tl.arange(0, BK)
+    inv = 1.0 / tl.sqrt(tl.load(ss_ptr + rows) / H + eps)
+    cid = tl.load(cand_ptr + rows).to(tl.int64)   # the successors j of row q are its own candidates
+    nrm = tl.load(ref_ptr + rows[:, None] * H + k0 + ks[None, :]) * inv[:, None]
+    nrm = nrm * tl.load(nw_ptr + k0 + ks).to(tl.float32)[None, :]
+    succ = tl.load(head_ptr + cid[:, None] * H + k0 + ks[None, :]).to(tl.float32)   # [j, BK]
+    if HAS_SCALE:
+        succ = succ * tl.load(hs_ptr + cid).to(tl.float32)[:, None]
+    acc = tl.dot(nrm, tl.trans(succ), input_precision="ieee")
+    tl.atomic_add(out_ptr + q * TOPK * TOPK + a[:, None] * TOPK + a[None, :], acc)
+
+
+def score_transitions(final_pre, candidate_ids, anchor_ids, w_read, w_recv, w_pred, w_msg, w_write, gate_bias,
+                      norm_w, head_w, head_scale, codebook, transfer_dim, eps, norm_eps, linear):
+    """Transition scores ``[R, n, k, k]`` (the reference's einsum layout) of
+    ``final_pre [R, n, H]`` and its ``candidate_ids [R, n, k]``; ``anchor_ids [R]``
+    are the predecessors of position 0. ``linear`` is the drafter's GEMV for the
+    receiver-side bf16 linears; the candidate side runs in fp32 as the reference."""
+    R, n, h = final_pre.shape
+    k = candidate_ids.shape[-1]
+    t, g = w_read.shape[0], w_recv.shape[0]
+    qn = R * n
+    m = qn * k
+    dev = final_pre.device
+    pre2 = final_pre.reshape(qn, h)
+    pre_c = torch.empty_like(pre2)
+    xn = torch.empty_like(pre2)
+    rms = torch.empty(qn, dtype=torch.float32, device=dev)
+    bh, bt = triton.next_power_of_2(h), triton.next_power_of_2(t)
+    _inj_pre_kernel[(qn,)](pre2, pre2, pre_c, xn, rms, eps, H=h, BH=bh, HAS_RES=False, num_warps=4)
+    proj = linear(xn, w_read)
+    feats = torch.empty(qn, t, dtype=final_pre.dtype, device=dev)
+    _tr_feat_kernel[(qn,)](proj, feats, eps, float(transfer_dim) ** 0.5, T=t, BT=bt, num_warps=4)
+    recv = linear(feats, w_recv)
+    cand = candidate_ids.reshape(m).contiguous()
+    gm = torch.empty(m, g, dtype=torch.float32, device=dev)
+    bm = 16
+    _tr_gate_kernel[(triton.cdiv(m, bm), g // 16)](
+        cand, anchor_ids, codebook, recv, w_pred, w_msg, gate_bias, gm, m, n, float(transfer_dim) ** 0.5,
+        TOPK=k, T=t, G=g, BM=bm, BN=16, BK=64, MMA=_has_bf16_mma(), num_warps=4,
+    )
+    refined = torch.empty(m, h, dtype=torch.float32, device=dev)
+    zeros = torch.zeros(m + qn * k * k, dtype=torch.float32, device=dev)   # row sums of squares | scores
+    ss = zeros[:m]
+    _tr_write_kernel[(triton.cdiv(m, bm), h // 64)](
+        gm, w_write, pre2, rms, refined, ss, m, TOPK=k, H=h, G=g, BM=bm, BN=64, BK=32, num_warps=4,
+    )
+    out = zeros[m:].view(R, n, k, k)
+    _tr_score_kernel[(qn, h // 64)](
+        refined, ss, norm_w, cand, head_w, head_scale if head_scale is not None else norm_w, out, norm_eps,
+        TOPK=k, H=h, BK=64, HAS_SCALE=head_scale is not None, num_warps=4,
+    )
+    return out
+
+
+def _has_bf16_mma() -> bool:
+    """bf16 tensor-core dots: not on the SM70 family (also through volta-forever,
+    which tells the process sm_80 and would emulate them)."""
+    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+
+    sm70 = getattr(GpuFamily, "SM70", None)   # trees with the V100 support only
+    return sm70 is None or gpu_family() is not sm70
+
+
+@triton.jit
+def _tr_feat_kernel(p_ptr, f_ptr, eps, scale, T: tl.constexpr, BT: tl.constexpr):
+    i = tl.program_id(0)
+    offs = tl.arange(0, BT)
+    msk = offs < T
+    p = tl.load(p_ptr + i * T + offs, mask=msk, other=0.0).to(tl.float32)
+    tl.store(f_ptr + i * T + offs, (scale * p / (tl.sqrt(tl.sum(p * p, 0)) + eps)).to(tl.bfloat16), mask=msk)

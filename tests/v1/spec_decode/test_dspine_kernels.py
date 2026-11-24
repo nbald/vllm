@@ -186,3 +186,40 @@ def test_inject_rows_delta_adds_up(n, block):
     assert torch.equal(delta[first], torch.zeros_like(delta[first]))
     # rms * gated is rounded before the GEMV instead of after: a few elements move by a bf16 step or two
     torch.testing.assert_close((pre.float() + delta.float()).to(bf).float(), out_ref.float(), rtol=5e-2, atol=1e-1)
+
+
+@requires_gpu
+@pytest.mark.parametrize("R,n", [(1, 5), (1, 3), (8, 5), (3, 7)])
+@pytest.mark.parametrize("int8_head", [True, False])
+def test_score_transitions_matches_transitions_fn(R, n, int8_head):
+    import torch.nn.functional as F
+
+    from vllm.model_executor.models.qwen3_dspine_fast import transitions_fn
+    from vllm.model_executor.models.qwen3_dspine_kernels import score_transitions
+
+    torch.manual_seed(R * 10 + n)
+    h, t, g, k, v, eps, neps = 1536, 512, 256, 16, 5000, 1e-6, 1e-6
+    bf = torch.bfloat16
+    pre = (torch.randn(R, n, h, device="cuda") * 2).to(bf)
+    cand = torch.randint(0, v, (R, n, k), device="cuda")
+    anchor = torch.randint(0, v, (R,), device="cuda")
+    pred_ids = torch.cat((anchor[:, None, None].expand(-1, 1, k), cand[:, :-1]), dim=1)
+    cb = torch.randn(v, t, device="cuda").to(bf)
+    w_read = (torch.randn(t, h, device="cuda") / h**0.5).to(bf)
+    w_recv = (torch.randn(g, t, device="cuda") / t**0.5).to(bf)
+    w_pred = (torch.randn(g, t, device="cuda") / t**0.5).to(bf)
+    w_msg = (torch.randn(g, t, device="cuda") / t**0.5).to(bf)
+    w_write = (torch.randn(h, g, device="cuda") / g**0.5).to(bf)
+    bias = (torch.randn(g, device="cuda") * 0.1).to(bf)
+    norm_w = (torch.rand(h, device="cuda") + 0.5).to(bf)
+    if int8_head:
+        head = torch.randint(-127, 128, (v, h), device="cuda", dtype=torch.int8)
+        scale = torch.rand(v, device="cuda") / 100
+    else:
+        head, scale = (torch.randn(v, h, device="cuda") * 0.02).to(bf), None
+    ref = transitions_fn(pre, cand, pred_ids, head, scale, cb, w_read, w_recv, w_pred, w_msg, w_write, bias,
+                         norm_w, t, eps, neps)
+    out = score_transitions(pre, cand, anchor, w_read, w_recv, w_pred, w_msg, w_write, bias, norm_w, head, scale,
+                            cb, t, eps, neps, F.linear)
+    assert out.shape == ref.shape
+    torch.testing.assert_close(out, ref.float(), rtol=1e-2, atol=1e-2 * float(ref.abs().max()))

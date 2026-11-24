@@ -202,6 +202,18 @@ def _score_transitions(
     anchor_token_ids: torch.Tensor,
     final_layer_idx: int,
 ) -> torch.Tensor:
+    if fast_path.hand_transitions_ok(lm_head, candidate_ids):
+        # OLALA_DSPINE_FUSED=3: the candidate side in three fused fp32 launches
+        return fast_path.hand_score_transitions(
+            injection,
+            norm,
+            lm_head,
+            transfer_codebook,
+            candidate_ids,
+            final_pre_injection,
+            anchor_token_ids,
+            final_layer_idx,
+        )
     top_k = candidate_ids.shape[-1]
     predecessor_ids = torch.cat(
         (
@@ -333,7 +345,11 @@ class DSpineQwen3Model(DFlashQwen3Model):
         residual = None
         final_pre_injection = hidden_states
         hand_inject = fast_path.hand_inject_ok(hidden_states)
-        delta_inject = hand_inject and os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") != "1"
+        delta_inject = (
+            hand_inject
+            and os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") != "1"
+            and fast_path._group("delta")
+        )
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,
