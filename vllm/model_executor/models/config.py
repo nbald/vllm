@@ -1209,6 +1209,25 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+# Compute capability majors where F1 (the TPA factor cache in speculative
+# verify) was measured and is on by default: SM70 (V100), the SM80 family
+# (Ampere / Ada) and SM120 (consumer Blackwell). Hopper and sm_100 keep it opt-in.
+_F1_DEFAULT_MAJORS = (7, 8, 12)
+
+
+def _f1_default_device() -> bool:
+    """Whether this process's GPU takes F1 by default. NVML-backed in the API
+    server (no CUDA context). Through volta-forever a V100 reports 8.0 to CUDA
+    programs and 7.0 to NVML: both are covered."""
+    from vllm.platforms import current_platform
+
+    try:
+        cap = current_platform.get_device_capability()
+    except Exception:  # no GPU visible
+        return False
+    return cap is not None and cap.major in _F1_DEFAULT_MAJORS
+
+
 class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
     """Reconcile Olala's HF config with vLLM's hybrid-model assumptions."""
 
@@ -1258,34 +1277,45 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
             logger.info("Olala: prefix caching disabled (not supported).")
 
         # The TPA-factorized KV cache (OLALA_TPA_FACTOR, on by default) has a
-        # multi-token verify path only under OLALA_TPA_FACTOR_SPEC=1 (opt-in;
-        # tpa_factor.factor_spec_enabled reads the same switch). Without it the
-        # factor metadata builder refuses a speculative config, which surfaces
-        # only at KV-cache init, minutes into startup: use the dense paged KV
-        # cache instead, or refuse an explicit request now. The switch is read
-        # from the environment by every process, so set it before the engine
-        # core starts.
-        spec_factor = os.environ.get("OLALA_TPA_FACTOR_SPEC", "0") == "1"
-        if vllm_config.speculative_config is not None and spec_factor:
-            if os.environ.get("OLALA_TPA_FACTOR", "1") != "0":
+        # multi-token verify path, F1 (OLALA_TPA_FACTOR_SPEC; tpa_factor.
+        # factor_spec_enabled reads the same switch). Under a speculative config
+        # it is on by default where it was measured (SM70, the SM80 family and
+        # SM120: _F1_DEFAULT_MAJORS), off elsewhere; OLALA_TPA_FACTOR_SPEC=0 or 1
+        # decides explicitly. Without F1 the factor metadata builder refuses a
+        # speculative config, which surfaces only at KV-cache init, minutes into
+        # startup: use the dense paged KV cache instead, or refuse an explicit
+        # request now. The switches are read from the environment by every
+        # process, so they are set here, before the engine core starts. Runs
+        # without a speculative config are unchanged.
+        if vllm_config.speculative_config is not None:
+            spec_factor = os.environ.get("OLALA_TPA_FACTOR_SPEC")
+            factor = os.environ.get("OLALA_TPA_FACTOR")
+            if spec_factor is None and factor != "0" and _f1_default_device():
+                os.environ["OLALA_TPA_FACTOR_SPEC"] = "1"
+                spec_factor = "1"
+                logger.info(
+                    "Olala: speculative decoding keeps the TPA-factorized KV "
+                    "cache (F1, OLALA_TPA_FACTOR_SPEC on by default on this "
+                    "GPU; =0 for the dense paged KV cache)."
+                )
+            elif spec_factor == "1" and factor != "0":
                 logger.info(
                     "Olala: speculative decoding keeps the TPA-factorized KV "
                     "cache (OLALA_TPA_FACTOR_SPEC=1)."
                 )
-        elif vllm_config.speculative_config is not None:
-            factor = os.environ.get("OLALA_TPA_FACTOR")
-            if factor is None:
-                os.environ["OLALA_TPA_FACTOR"] = "0"
-                logger.info(
-                    "Olala: speculative decoding uses the dense paged KV "
-                    "cache (OLALA_TPA_FACTOR=0)."
-                )
-            elif factor != "0":
-                raise ValueError(
-                    "The TPA-factorized KV cache supports speculative decoding "
-                    "only with OLALA_TPA_FACTOR_SPEC=1; set it, or unset "
-                    "OLALA_TPA_FACTOR or set it to 0."
-                )
+            if spec_factor != "1":
+                if factor is None:
+                    os.environ["OLALA_TPA_FACTOR"] = "0"
+                    logger.info(
+                        "Olala: speculative decoding uses the dense paged KV "
+                        "cache (OLALA_TPA_FACTOR=0)."
+                    )
+                elif factor != "0":
+                    raise ValueError(
+                        "The TPA-factorized KV cache supports speculative "
+                        "decoding only with OLALA_TPA_FACTOR_SPEC=1; set it, or "
+                        "unset OLALA_TPA_FACTOR or set it to 0."
+                    )
 
         # Chunked prefill (continuation chunks run in the packed varlen call
         # with Input_States, verified bit-stable) follows vLLM's
