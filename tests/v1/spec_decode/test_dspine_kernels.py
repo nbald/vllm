@@ -224,3 +224,11 @@ def test_score_transitions_matches_transitions_fn(R, n, int8_head):
                             cb, t, eps, neps, F.linear)
     assert out.shape == ref.shape
     torch.testing.assert_close(out, ref.float(), rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
+
+
+def test_row_cap_default():
+    """CPU: level 3 serves draft steps of at most OLALA_DSPINE_FUSED_MAX_ROWS rows (64)."""
+    from vllm.model_executor.models import qwen3_dspine_fast as fp
+
+    assert fp.HAND_MAX_ROWS == int(__import__("os").environ.get("OLALA_DSPINE_FUSED_MAX_ROWS", "64"))
+    assert fp._rows_ok(fp.HAND_MAX_ROWS) and not fp._rows_ok(fp.HAND_MAX_ROWS + 1)
