@@ -11,6 +11,9 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   the transition scoring each run as one ``torch.compile``'d function of
   tensors (the weights are arguments, so one graph serves every layer and
   batch size) instead of ~50 eager elementwise kernels per layer.
+  ``OLALA_DSPINE_FUSED=3`` is level 2 plus the hand-fused kernels of
+  qwen3_dspine_kernels.py (one launch per chain): q/k RMSNorm + rotary in
+  every draft layer.
   ``OLALA_DSPINE_FUSED=2`` also compiles every draft decoder layer: with custom
   ops off, RMSNorm, rotary and SiluAndMul are native torch chains that only a
   compile fuses.
@@ -44,6 +47,7 @@ token, and accepted lengths matched the eager drafter on the validation set.
 import math
 import os
 import re
+import types
 
 import torch
 import torch.nn.functional as F
@@ -55,8 +59,9 @@ from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
 from vllm.utils.torch_utils import direct_register_custom_op
 
 FUSED_MODE = os.environ.get("OLALA_DSPINE_FUSED", "0")
-FUSED = FUSED_MODE in ("1", "2")
-COMPILE_LAYERS = FUSED_MODE == "2"
+FUSED = FUSED_MODE in ("1", "2", "3")
+COMPILE_LAYERS = FUSED_MODE in ("2", "3")
+HAND_FUSED = FUSED_MODE == "3"
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
 CUDA_NORM = os.environ.get("OLALA_DSPINE_CUDA_NORM", "0") == "1"
 # OLALA_DSPINE_INT8 unset: on for these compute-capability majors (V100, A100 / RTX 30-40, RTX 50),
@@ -468,6 +473,42 @@ def _register_volta_tc(weight: torch.Tensor, name: str) -> None:
         tc.register_int8(weight, 1, name)
 
 
+def _fused_attention_forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    """DFlashQwen3Attention.forward with the q/k RMSNorms and the rotary in one
+    kernel (qwen3_dspine_kernels.qk_norm_rope)."""
+    from vllm.model_executor.models.qwen3_dspine_kernels import qk_norm_rope
+
+    qkv, _ = self.qkv_proj(hidden_states)
+    q, k = qk_norm_rope(
+        qkv, positions, self.rotary_emb.cos_sin_cache, self.q_norm.weight, self.k_norm.weight,
+        self.q_norm.variance_epsilon, self.num_heads, self.num_kv_heads, self.head_dim,
+    )
+    v = qkv[:, self.q_size + self.kv_size :]
+    if self.v_scale is not None:
+        v = v * self.v_scale
+    attn_output = self.attn(q, k, v)
+    output, _ = self.o_proj(attn_output)
+    return output
+
+
+def _hand_fuse_attention(attn: nn.Module) -> bool:
+    """Install _fused_attention_forward on one drafter attention module; False
+    when its configuration is not covered (partial or GPT-J rotary, norms
+    without weights)."""
+    rope = attn.rotary_emb
+    if (
+        getattr(rope, "rotary_dim", None) != attn.head_dim
+        or not getattr(rope, "is_neox_style", False)
+        or getattr(attn.q_norm, "weight", None) is None
+        or getattr(attn.k_norm, "weight", None) is None
+        or attn.q_norm.variance_epsilon != attn.k_norm.variance_epsilon
+        or attn.head_dim % 2
+    ):
+        return False
+    attn.forward = types.MethodType(_fused_attention_forward, attn)
+    return True
+
+
 def apply_fast_path(model: nn.Module) -> None:
     """Install the flagged fast paths on a loaded DSpineQwen3ForCausalLM.
     Called after every load_weights; idempotent."""
@@ -499,6 +540,10 @@ def apply_fast_path(model: nn.Module) -> None:
         for module in model.model.modules():
             if type(module) is RMSNorm:
                 bind_cuda_rms_norm(module)
+    if HAND_FUSED:
+        for layer in model.model.layers:
+            if not getattr(layer.self_attn, "dspine_hand_fused", False):
+                layer.self_attn.dspine_hand_fused = _hand_fuse_attention(layer.self_attn)
     if COMPILE_LAYERS:
         for layer in model.model.layers:
             if not getattr(layer, "dspine_compiled", False):
