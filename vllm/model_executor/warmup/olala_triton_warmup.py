@@ -102,12 +102,23 @@ def _warm_tpa_prefill(runner, layer, max_tokens: int) -> int:
         nb, bs = kv.shape[0], kv.shape[-2]
         kv = kv.reshape(nb, 2, bs, kv.shape[-1] // 2).transpose(0, 1)
     kplane, vplane = kv[0], kv[1]
-    real_pools = layer.shift_state.kv_cache
+    # The token-shift pools, where _ts_kv reads them: the layer's own state, or (OLALA_TS_FOLD) views of the
+    # page of its Mamba3 host. Dummies with the same strides take their place for the warmup.
+    shift = layer.shift_state
+    host = getattr(layer, "_ts_host", None) if shift.folded else None
+    if shift.folded and host is None:
+        logger.info("Olala TPA prefill warmup skipped: folded token shift without its Mamba3 host.")
+        return 0
+    real_pools = host.folded_token_shift_pools() if host is not None else shift.kv_cache
+    dummies = tuple(_dummy_like(p) for p in real_pools)
     dev, dtype = kplane.device, kplane.dtype
     hidden = layer.c_q.input_size
     md = SimpleNamespace(block_table=bt)
     n = 0
-    layer.shift_state.kv_cache = [_dummy_like(p) for p in real_pools]
+    if host is not None:
+        host.folded_token_shift_pools = lambda: dummies  # instance attribute: shadows the method
+    else:
+        shift.kv_cache = list(dummies)
     try:
         for total in (6, 200, 1100):  # decode kernels / mid / prefill GEMM regimes of the projections
             for ndt in (0, 1):
@@ -133,7 +144,10 @@ def _warm_tpa_prefill(runner, layer, max_tokens: int) -> int:
                                               slots[rows], kplane, vplane, reqs=reqs)
                         n += 1
     finally:
-        layer.shift_state.kv_cache = real_pools
+        if host is not None:
+            del host.folded_token_shift_pools
+        else:
+            shift.kv_cache = real_pools
     return n
 
 
