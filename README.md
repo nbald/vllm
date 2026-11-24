@@ -19,7 +19,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_TPA_SPEC_FUSED` | `1` | Speculative verify of the DiffTPA layers: fused K/V reconstruction, token shift, q/k norms and scaling (`tpa_decode_qkv_spec`); `0` = eager per-op path. |
 | `OLALA_DSPINE_FUSED`, `OLALA_DSPINE_GEMV`, `OLALA_DSPINE_CUDA_NORM` | `0` | Opt-in fast path of a DSpine drafter (compiled injection and transition scoring, `2` also compiles the draft layers; skinny GEMV; CUDA RMSNorm). See [DSpine](docs/features/speculative_decoding/dspine.md). |
 | `OLALA_DSPINE_SHARED_HEAD` | `0` | A DSpine drafter uses the target's LM head (INT8 on W8A16 checkpoints) instead of its own copy, which is not loaded. |
-| `OLALA_SPLIT_PREFILL` | `1` on SM120 and the SM80 family, `0` elsewhere | Scheduler, while running decodes and prefill work are both pending: alternate prefill-only and decode-only steps, so that decode steps replay the FULL CUDA graph. `OLALA_SPLIT_PREFILL_MAX_DECODES` (`0` = no limit) splits only up to that many running decodes; where the split is on by default and it is unset, it is `0` without a speculative config and `16` with one. V100s (volta-forever included) keep `0`; `OLALA_SPLIT_PREFILL_DECODE_STEPS` (`1`) and `OLALA_SPLIT_PREFILL_BACKOFF` (`4`) tune the alternation. |
+| `OLALA_SPLIT_PREFILL` | `1` on SM120, `0` elsewhere | Scheduler, while running decodes and prefill work are both pending: alternate prefill-only and decode-only steps, so that decode steps replay the FULL CUDA graph. `OLALA_SPLIT_PREFILL_MAX_DECODES` (`0` = no limit) splits only up to that many running decodes; where the split is on by default and it is unset, it is `0` without a speculative config and `16` with one. The SM80 family keeps `0` (RTX 3080: no gain, the KV cache bounds the batch first), V100s too; `OLALA_SPLIT_PREFILL_DECODE_STEPS` (`1`) and `OLALA_SPLIT_PREFILL_BACKOFF` (`4`) tune the alternation. |
 | `OLALA_PREFILL_NOSYNC` | `0` | Prefill metadata of the Mamba-3, DiffTPA and factor-cache builders from the CPU, without a device-to-host copy; `OLALA_PREFILL_NOSYNC_CHECK=1` compares with the device values (debug). |
 | `OLALA_TS_FOLD` | `0` | DiffTPA token-shift buffers stored in the page of the preceding Mamba-3 layer (no token-shift KV groups). |
 | `OLALA_SPEC_LIGHT` | `0` | Speculative decoding: one Mamba-3 page per request with `1 + K` light columns instead of `1 + K` state pages. Needs the fused verify kernel (`OLALA_MAMBA3_VERIFY=cuda`, SM80 or later, 7A1B shapes at TP=1, fp32 state); ignored elsewhere. |
@@ -92,7 +92,7 @@ dynamic speculative decoding (`num_speculative_tokens_per_batch_size`, `0` above
 route batched traffic to a direct server.
 
 Five opt-in flags remove most of that gap: `OLALA_SPLIT_PREFILL=1 OLALA_SPLIT_PREFILL_MAX_DECODES=16` (decode
-steps stay in the FULL graphs; the default on SM120 and the SM80 family), `OLALA_PREFILL_NOSYNC=1`, `OLALA_TS_FOLD=1 OLALA_SPEC_LIGHT=1
+steps stay in the FULL graphs; the default on SM120), `OLALA_PREFILL_NOSYNC=1`, `OLALA_TS_FOLD=1 OLALA_SPEC_LIGHT=1
 VLLM_KV_CACHE_GROUP_SIZE=7` (x1.55-1.74 KV capacity, so `--max-num-seqs 128`), `OLALA_TPA_MIXED_FUSED=1` and
 `OLALA_DSPINE_SHARED_HEAD=1`. On an RTX 5090 (heretic-v3-Q8 target, v3 DSpine drafter, `K = 5`, 512 output
 tokens, continuous arrivals), spec then beats direct serving with ReplaySSM and the factorized cache at every
