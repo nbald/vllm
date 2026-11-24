@@ -202,7 +202,8 @@ def test_score_transitions_matches_transitions_fn(R, n, int8_head):
     bf = torch.bfloat16
     pre = (torch.randn(R, n, h, device="cuda") * 2).to(bf)
     cand = torch.randint(0, v, (R, n, k), device="cuda")
-    anchor = torch.randint(0, v, (R,), device="cuda")
+    # as DSpineSpeculator passes it: every request's first query token, a strided view of the input ids
+    anchor = torch.randint(0, v, (R * (n + 1),), device="cuda")[:: n + 1]
     pred_ids = torch.cat((anchor[:, None, None].expand(-1, 1, k), cand[:, :-1]), dim=1)
     cb = torch.randn(v, t, device="cuda").to(bf)
     w_read = (torch.randn(t, h, device="cuda") / h**0.5).to(bf)

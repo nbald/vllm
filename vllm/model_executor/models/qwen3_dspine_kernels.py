@@ -649,6 +649,7 @@ def score_transitions(final_pre, candidate_ids, anchor_ids, w_read, w_recv, w_pr
     _tr_feat_kernel[(qn,)](proj, feats, eps, float(transfer_dim) ** 0.5, T=t, BT=bt, num_warps=4)
     recv = linear(feats, w_recv)
     cand = candidate_ids.reshape(m).contiguous()
+    anchor_ids = anchor_ids.contiguous()   # the speculator passes a strided view of the input ids
     gm = torch.empty(m, g, dtype=torch.float32, device=dev)
     bm = 16
     _tr_gate_kernel[(triton.cdiv(m, bm), g // 16)](
