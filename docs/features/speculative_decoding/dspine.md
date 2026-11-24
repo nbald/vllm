@@ -37,6 +37,11 @@ vllm serve /path/to/target \
   capacity. Elsewhere, or with `OLALA_TPA_FACTOR_SPEC=0`, a speculative config
   turns the factor cache off, with a log line, and uses the dense paged KV
   cache; `OLALA_TPA_FACTOR=1` set explicitly is then refused at startup.
+- With an Olala target, the verify reads and writes the fp32 Mamba-3 state at
+  every draft position. ReplaySSM (`OLALA_REPLAY_SSM`, on in `serve.sh`'s
+  defaults) has no multi-token verify, so a speculative config turns it off
+  with a warning and takes `--mamba-ssm-cache-dtype auto` as `float32`; an
+  explicit `bfloat16` or `float16` is refused at startup.
 
 ## Checkpoint format
 

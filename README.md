@@ -74,9 +74,11 @@ EAGLE-3, DFlash and [DSpine](docs/features/speculative_decoding/dspine.md) draft
 layers 1, 9, 17, 25 and 33.
 
 Requirements: the factorized TPA cache with F1 (`OLALA_TPA_FACTOR_SPEC`, on by default on SM70 / SM80 / SM120)
-or the dense paged KV cache (`OLALA_TPA_FACTOR=0`, the default elsewhere), `OLALA_REPLAY_SSM` unset or `0`, fp32
-Mamba-3 state (the default). With a DSpine drafter, e.g. on an
-RTX 5090 with a Q8 target:
+or the dense paged KV cache (`OLALA_TPA_FACTOR=0`, the default elsewhere), and the fp32 Mamba-3 state. ReplaySSM has
+no multi-token verify: with a speculative config the engine turns it off (`OLALA_REPLAY_SSM=0`, with a warning) and
+takes `--mamba-ssm-cache-dtype auto` as `float32`, so `serve.sh`'s defaults plus `--speculative-config` start; an
+explicit `bfloat16` or `float16` SSM dtype is refused at startup. The speculative gains below are measured against
+direct serving with ReplaySSM, so they include this. With a DSpine drafter, e.g. on an RTX 5090 with a Q8 target:
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 OLALA_REPLAY_SSM=0 \
