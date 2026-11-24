@@ -16,6 +16,8 @@ graph-capture runs meet only a few of these classes. The kernels:
   - the TPA-factor prefill: ``_tpa_rows_kernel``, ``_tpa_pools_kernel``, ``_tpa_q_kernel``,
     ``_reconstruct_dense_kernel2``;
   - with a DFlash / DSpine drafter, DFlash's input preparation per span class;
+  - the routed experts of an INT8 / INT4 checkpoint's prefill above the medium batch, at both token-count classes
+    (``_route_topk_kernel``: eager steps above the PIECEWISE graphs' cap take any count);
   - the lm_head kernels of compute_logits, which runs outside the CUDA graphs on the unpadded
     rows (e.g. ``_gemv_rows_many_kernel``), and the logprob kernels of the sampler and of prompt
     logprobs (``_topk_log_softmax_kernel`` per number of requested logprobs, ``_ranks_kernel``).
@@ -356,6 +358,33 @@ def _warm_dflash_context_kv(runner) -> int:
     return n
 
 
+@torch.inference_mode()
+def _warm_moe_prefill(model) -> int:
+    """The routed experts of an INT8 / INT4 checkpoint's prefill (latent_moe_int8.wq_routed_experts) at the two
+    token-count classes of its steps above the medium batch. Up to the PIECEWISE graphs' cap a step is padded to a
+    captured size (a multiple of 16); an eager step above it (a chunked-prefill budget past the cap, e.g. 8192 on an
+    RTX 5090, or the offline LLM's 8192) can take any count, and compiled ``_route_topk_kernel`` while serving."""
+    from vllm.model_executor.layers.mamba.olala.latent_moe_int8 import wq_routed_experts
+    from vllm.model_executor.layers.mamba.olala.latent_moe_medium import MEDIUM_BATCH_MAX_TOKENS
+    from vllm.model_executor.models.olala import OlalaLatentMoE
+
+    moe = next((m for m in model.modules() if isinstance(m, OlalaLatentMoE) and m._int8), None)
+    if moe is None:
+        return 0
+    weights = moe._int8_weights()
+    if not moe._int8_own_prefill(weights[0]):
+        return 0
+    bias = moe.gate.e_score_correction_bias
+    n = 0
+    for m in (MEDIUM_BATCH_MAX_TOKENS + 16, MEDIUM_BATCH_MAX_TOKENS + 17):
+        latent = torch.zeros(m, moe.latent_size, dtype=torch.bfloat16, device=bias.device)
+        logits = torch.zeros(m, moe.num_experts, dtype=torch.float32, device=bias.device)
+        wq_routed_experts(latent, logits, bias, weights[0], weights[1], moe.top_k, moe.routed_scaling_factor)
+        n += 1
+    torch.cuda.synchronize()
+    return n
+
+
 def olala_triton_warmup(runner: "GPUModelRunner") -> None:
     """Compile the Olala prefill, logits and logprob Triton specializations before serving, on every
     CUDA GPU (OLALA_TRITON_WARMUP=0 skips it), direct or speculative. Every Mamba-3 (TPA) layer has
@@ -385,6 +414,9 @@ def olala_triton_warmup(runner: "GPUModelRunner") -> None:
         if verify:
             counts["tpa verify"] = verify
     counts["logits and logprobs"] = _warm_logits(runner, model)
+    moe_prefill = _warm_moe_prefill(model)
+    if moe_prefill:
+        counts["moe prefill"] = moe_prefill
     if runner.vllm_config.speculative_config is not None:
         counts["dflash inputs"] = _warm_dflash_inputs(runner)
         counts["dflash context kv"] = _warm_dflash_context_kv(runner)
