@@ -115,8 +115,11 @@ from vllm.model_executor.layers.mamba.olala import (
     volta_cuda,
 )
 from vllm.model_executor.layers.mamba.olala.state import (
+    folded_token_shift_layout,
     mamba3_state_dtype,
     mamba3_state_shape,
+    spec_light_cols,
+    ts_fold_active,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1384,6 +1387,16 @@ class OlalaModel(nn.Module, EagleModelMixin):
         ):
             if prev.geo_fuse and layer.geo_fuse and layer.layer_type == "M":
                 object.__setattr__(layer.mixer, "_pre_geo", prev.geodesic_mlp)
+        # Token-shift fold (layers/mamba/olala/state.py): each V layer keeps its
+        # one-token (k, v) buffer in the page of the Mamba3 layer right before it.
+        for prev, layer in zip(
+            self.layers[self.start_layer : self.end_layer - 1],
+            self.layers[self.start_layer + 1 : self.end_layer],
+        ):
+            shift = getattr(layer.mixer, "shift_state", None) if layer.layer_type == "V" else None
+            if shift is not None and shift.folded:
+                assert prev.layer_type == "M" and prev.mixer.ts_fold
+                layer.mixer.set_token_shift_host(prev.mixer)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
@@ -1499,12 +1512,25 @@ class OlalaForCausalLM(
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype, ...]:
-        # Representative: the larger Mamba3 state.
-        return mamba3_state_dtype(
+        # Representative: the larger Mamba3 state (with the folded token-shift
+        # buffer when OLALA_TS_FOLD is active, see OlalaMamba3Mixer.get_state_dtype).
+        light = spec_light_cols(vllm_config)
+        dtypes = mamba3_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            light,
         )
+        hf_config = vllm_config.model_config.hf_config
+        if ts_fold_active(hf_config, vllm_config.parallel_config.pipeline_parallel_size):
+            dtypes = tuple(dtypes) + folded_token_shift_layout(
+                hf_config,
+                vllm_config.parallel_config.tensor_parallel_size,
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                light,
+            )[1]
+        return dtypes
 
     @classmethod
     def get_mamba_state_shape_from_config(
@@ -1515,14 +1541,24 @@ class OlalaForCausalLM(
         split = int(hf_config.mamba_d_state * 0.5)  # rope_fraction
         if split % 2:
             split -= 1
-        return mamba3_state_shape(
+        shapes = mamba3_state_shape(
             tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
             num_heads=d_inner // hf_config.mamba_headdim,
             head_dim=hf_config.mamba_headdim,
             d_state=hf_config.mamba_d_state,
             mimo_dim=hf_config.mamba_mimo_dim,
             num_rope_angles=split // 2,
+            light_cols=spec_light_cols(vllm_config),
         )
+        if ts_fold_active(hf_config, vllm_config.parallel_config.pipeline_parallel_size):
+            shapes = tuple(shapes) + folded_token_shift_layout(
+                hf_config,
+                vllm_config.parallel_config.tensor_parallel_size,
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                spec_light_cols(vllm_config),
+            )[0]
+        return shapes
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:

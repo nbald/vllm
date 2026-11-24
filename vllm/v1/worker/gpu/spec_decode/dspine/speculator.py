@@ -3,9 +3,11 @@
 
 import torch
 from transformers import PreTrainedConfig
-
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+
+logger = init_logger(__name__)
 
 
 class DSpineSpeculator(DFlash2Speculator):
@@ -16,6 +18,10 @@ class DSpineSpeculator(DFlash2Speculator):
         assert vllm_config.speculative_config is not None
         draft_config = vllm_config.speculative_config.draft_model_config.hf_config
         _maybe_override_dspine_config(draft_config)
+        if _maybe_share_target_head(draft_config):
+            logger.info_once(
+                "DSpine: sharing the target's LM head (own head not loaded)."
+            )
         super().__init__(vllm_config, device)
 
     def _prepare_candidates(
@@ -40,6 +46,18 @@ class DSpineSpeculator(DFlash2Speculator):
             candidate_ids, final_pre_injection, anchor_token_ids
         )
         return candidate_ids, scores
+
+
+def _maybe_share_target_head(config: PreTrainedConfig) -> bool:
+    """OLALA_DSPINE_SHARED_HEAD: turn off ``has_own_lm_head`` before the draft
+    model is built, so that load_dflash_model shares the target's LM head (an
+    INT8 W8A16 head on Q8 targets) instead of the drafter's own bf16 copy."""
+    from vllm.model_executor.models.qwen3_dspine import shared_target_head
+
+    if not (shared_target_head() and getattr(config, "has_own_lm_head", False)):
+        return False
+    config.has_own_lm_head = False
+    return True
 
 
 def _maybe_override_dspine_config(config: PreTrainedConfig) -> None:

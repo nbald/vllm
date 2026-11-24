@@ -80,6 +80,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm.v1.core.sched.olala_split import SplitPrefillPolicy, StepKind
+
 logger = init_logger(__name__)
 
 
@@ -423,6 +425,17 @@ class Scheduler(SchedulerInterface):
         # schedule() call including empty ones, so it would expire the hold
         # early; it keeps its own meaning (next_decode_eligible_step).
         self.num_executed_steps = 0
+        # Opt-in (OLALA_SPLIT_PREFILL=1): never mix prefill and decode tokens in
+        # one step while both are pending (olala_split.py).
+        self.split_prefill = SplitPrefillPolicy.from_env()
+        if self.split_prefill is not None:
+            logger.info_once(
+                "Split prefill: prefill-only and decode-only steps alternate "
+                "while both are pending (%d decode step(s) between prefill "
+                "steps, max decodes %s).",
+                self.split_prefill.decode_steps,
+                self.split_prefill.max_decodes or "unlimited",
+            )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -790,6 +803,23 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        # Split prefill (opt-in): a step carrying prefill cannot replay the
+        # FULL decode graph, so keep prefill and decode work in separate steps.
+        split_kind = StepKind.MIXED
+        defer_decodes = False
+        if self.split_prefill is not None and not defer_prefills and token_budget > 0:
+            num_running_decodes = sum(1 for r in self.running if not r.is_prefill_chunk)
+            has_prefill_work = any(r.is_prefill_chunk for r in self.running) or (
+                bool(self.waiting or self.kv_holding_waiting)
+                and len(self.running) + self.num_waiting_for_streaming_input
+                < self.max_num_active_reqs
+            )
+            split_kind = self.split_prefill.plan(num_running_decodes, has_prefill_work)
+            if split_kind is StepKind.DECODE:
+                defer_prefills = True
+            elif split_kind is StepKind.PREFILL:
+                defer_decodes = True
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -822,6 +852,11 @@ class Scheduler(SchedulerInterface):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            if defer_decodes and not request.is_prefill_chunk:
+                # Split prefill: this is a prefill-only step.
                 req_index += 1
                 continue
 
@@ -1627,6 +1662,12 @@ class Scheduler(SchedulerInterface):
         # whether a new admission or a running chunk.
         if self.local_prefill_interval > 1 and (prefill_scheduled or prefill_admitted):
             self.last_prefill_step = self.num_executed_steps
+        if self.split_prefill is not None:
+            self.split_prefill.record(
+                split_kind,
+                carried_prefill=prefill_scheduled or prefill_admitted,
+                scheduled=total_num_scheduled_tokens > 0,
+            )
 
         assert token_budget >= 0
         assert input_budget >= 0

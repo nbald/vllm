@@ -3,6 +3,7 @@
 """KV cache planning: grouping, sizing, and memory-fit logic."""
 
 import math
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
@@ -530,6 +531,20 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    # Opt-in override (evaluation): every padding layer costs a full page per
+    # block of its group, i.e. a lot for attention types at long context and
+    # nothing for single-block state types; group size 1 removes all padding
+    # at the cost of one KV cache group (block table, metadata build) per layer.
+    if (forced := os.environ.get("VLLM_KV_CACHE_GROUP_SIZE")) is not None:
+        group_size = int(forced)
+        assert group_size >= 1
+        logger.info(
+            "KV cache group size forced to %d (heuristic: %d)",
+            group_size,
+            min_num_layers
+            if max_num_layers >= min_num_layers * 1.5
+            else max_num_layers,
+        )
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size

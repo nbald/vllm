@@ -29,6 +29,8 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.olala_spec_utils import (
     OlalaSpecMetadata,
     build_olala_spec_metadata,
+    prefill_computed_cpu,
+    prefill_nosync,
 )
 from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
@@ -168,11 +170,21 @@ class OlalaDiffTPAMetadataBuilder(AttentionMetadataBuilder[OlalaDiffTPAMetadata]
             has_initial_state = m.compute_num_computed_tokens()[num_decodes:] > 0
             qsl = m.query_start_loc[num_decodes:]
             query_start_loc_p = qsl - qsl[0]
-            # Sync once here instead of once per V layer downstream.
-            has_initial_state_cpu = has_initial_state.to("cpu")
+            computed_cpu = (
+                prefill_computed_cpu(m, num_decodes, num_prefills)
+                if prefill_nosync()
+                else None
+            )
+            if computed_cpu is not None:
+                # OLALA_PREFILL_NOSYNC: from the CPU; the V layers index the
+                # pools with the device slots (state_indices_p_cpu stays None).
+                has_initial_state_cpu = computed_cpu > 0
+            else:
+                # Sync once here instead of once per V layer downstream.
+                has_initial_state_cpu = has_initial_state.to("cpu")
+                state_indices_p_cpu = state_indices_tensor[num_decodes:].tolist()
             qsl_cpu = m.query_start_loc_cpu[num_decodes:]
             query_start_loc_p_cpu = qsl_cpu - qsl_cpu[0]
-            state_indices_p_cpu = state_indices_tensor[num_decodes:].tolist()
 
         return OlalaDiffTPAMetadata(
             num_prefills=num_prefills,

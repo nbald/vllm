@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from collections.abc import Iterable
 
 import torch
@@ -160,6 +161,37 @@ class AdjacentCausalInjection(nn.Module):
         return torch.where((pos == 0)[:, None], pre_injection_states, written)
 
 
+def shared_target_head() -> bool:
+    """OLALA_DSPINE_SHARED_HEAD=1: a drafter exported with its own LM head
+    (``has_own_lm_head``) uses the target's head instead, whatever its
+    quantization (the INT8 W8A16 head of a Q8 target, the bf16 head of a bf16
+    one). The own copy is neither allocated past construction nor loaded."""
+    return os.environ.get("OLALA_DSPINE_SHARED_HEAD", "0") == "1"
+
+
+def drop_head_weights(weights: Iterable[tuple[str, torch.Tensor]]):
+    """The checkpoint weights without the drafter's own LM head (shared-head
+    mode: they are not read into memory, and the loader does not mark the
+    drafter as having its own head)."""
+    return ((n, w) for n, w in weights if not n.startswith("lm_head."))
+
+
+def head_rows(lm_head: nn.Module, ids: torch.Tensor) -> torch.Tensor:
+    """fp32 rows of the LM head for the token ids ``ids``: the floating-point
+    weight, or the dequantized rows ``q * scale`` of an INT8 W8A16 head (weight
+    ``[V, H]`` int8; ``weight_scale`` ``[V]`` per channel or ``[V, H // g]`` per
+    group), i.e. the rows its own GEMM multiplies by."""
+    weight = lm_head.weight
+    rows = weight[ids].float()
+    if weight.is_floating_point():
+        return rows
+    scale = lm_head.weight_scale
+    if scale.dim() == 1:
+        return rows * scale[ids].float().unsqueeze(-1)
+    group = weight.shape[1] // scale.shape[1]
+    return rows * scale[ids].float().repeat_interleave(group, dim=-1)
+
+
 def _score_transitions(
     injection: AdjacentCausalInjection,
     norm: nn.Module,
@@ -202,7 +234,7 @@ def _score_transitions(
             shard.added_vocab_start_index,
             shard.added_vocab_end_index,
         )
-    successor_weights = lm_head.weight[local_ids].float()
+    successor_weights = head_rows(lm_head, local_ids)
     exact_features = transfer_codebook[predecessor_ids].float() * math.sqrt(
         injection.transfer_dim
     )
@@ -373,6 +405,9 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = DSpineQwen3Model
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        if self.shares_target_head:
+            # The target's head replaces this one after loading (load_dflash_model).
+            weights = drop_head_weights(weights)
         loaded = super().load_weights(weights)
         # Opt-in fast draft path (OLALA_DSPINE_* flags, qwen3_dspine_fast.py).
         fast_path.apply_fast_path(self)
@@ -383,6 +418,14 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             raise ValueError("DSpine requires the full target vocabulary.")
+        # OLALA_DSPINE_SHARED_HEAD: DSpineSpeculator turned has_own_lm_head off;
+        # free the unquantized placeholder head now (load_dflash_model installs
+        # the target's).
+        self.shares_target_head = shared_target_head() and not getattr(
+            self.config, "has_own_lm_head", False
+        )
+        if self.shares_target_head:
+            del self.lm_head
 
     def compute_candidates(
         self, hidden_states: torch.Tensor

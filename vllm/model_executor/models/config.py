@@ -1257,6 +1257,26 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
             vllm_config.cache_config.enable_prefix_caching = False
             logger.info("Olala: prefix caching disabled (not supported).")
 
+        # The TPA-factorized KV cache (OLALA_TPA_FACTOR, on by default) has no
+        # multi-token verify path: its metadata builder refuses a speculative
+        # config, which surfaces only at KV-cache init, minutes into startup.
+        # Use the dense paged KV cache instead, or refuse an explicit request
+        # now. The switch is read from the environment by every process, so set
+        # it before the engine core starts.
+        if vllm_config.speculative_config is not None:
+            factor = os.environ.get("OLALA_TPA_FACTOR")
+            if factor is None:
+                os.environ["OLALA_TPA_FACTOR"] = "0"
+                logger.info(
+                    "Olala: speculative decoding uses the dense paged KV "
+                    "cache (OLALA_TPA_FACTOR=0)."
+                )
+            elif factor != "0":
+                raise ValueError(
+                    "The TPA-factorized KV cache does not support speculative "
+                    "decoding; unset OLALA_TPA_FACTOR or set it to 0."
+                )
+
         # Chunked prefill (continuation chunks run in the packed varlen call
         # with Input_States, verified bit-stable) follows vLLM's
         # --enable-chunked-prefill, on by default: it bounds the TTFT of long

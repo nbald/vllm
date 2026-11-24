@@ -20,6 +20,7 @@ and Olala's custom p-rope (vLLM's ``get_rope`` is used instead).
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import torch
@@ -82,8 +83,10 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
 from vllm.model_executor.layers.mamba.olala.state import (
+    spec_light_cols,
     token_shift_state_dtype,
     token_shift_state_shape,
+    ts_fold_active,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
@@ -170,6 +173,10 @@ def _token_shift_decode_kernel(
 # Speculative verify batches run the fused decode preamble too
 # (tpa_decode_qkv_spec); OLALA_TPA_SPEC_FUSED=0 keeps the eager per-op path.
 _FUSED_SPEC = os.environ.get("OLALA_TPA_SPEC_FUSED", "1") != "0"
+# OLALA_TPA_MIXED_FUSED=1 (opt-in): in a step that mixes prefill and verify rows,
+# the verify rows keep the fused spec path (tpa_decode_qkv_spec, as in a pure
+# verify step); only the prefill rows take the op-by-op path.
+_MIXED_FUSED = os.environ.get("OLALA_TPA_MIXED_FUSED", "0") == "1"
 
 
 class OlalaTokenShiftState(nn.Module, MambaBase):
@@ -199,10 +206,27 @@ class OlalaTokenShiftState(nn.Module, MambaBase):
         self.cache_config = vllm_config.cache_config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.prefix = prefix
+        # Token-shift fold (state.py): the buffer lives in the page of the
+        # Mamba3 layer right before this V layer, so this layer asks for no
+        # KV cache of its own.
+        self.folded = ts_fold_active(
+            vllm_config.model_config.hf_config,
+            vllm_config.parallel_config.pipeline_parallel_size,
+        )
+        # Speculative light columns (state.py): 1 + k buffers in one page.
+        self.light_cols = spec_light_cols(vllm_config)
         compilation = get_current_vllm_config().compilation_config
         if prefix in compilation.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation.static_forward_context[prefix] = self
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig):
+        if self.folded:
+            return None
+        spec = super().get_kv_cache_spec(vllm_config)
+        if self.light_cols and spec is not None:
+            spec = dataclasses.replace(spec, num_speculative_blocks=0)
+        return spec
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -221,6 +245,7 @@ class OlalaTokenShiftState(nn.Module, MambaBase):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             rank=self.rank,
+            light_cols=self.light_cols,
         )
 
 
@@ -485,8 +510,17 @@ class OlalaDiffTPAAttention(PluggableLayer):
         md = None
         if shift_alphas is not None and self._fused_decode_ok:
             attn_metadata = get_forward_context().attn_metadata
-            if attn_metadata is not None and self.shift_state.prefix in attn_metadata:
-                md = attn_metadata[self.shift_state.prefix]
+            if attn_metadata is not None and self._ts_md_key in attn_metadata:
+                md = attn_metadata[self._ts_md_key]
+                if (
+                    _MIXED_FUSED and _FUSED_SPEC and md.spec is not None
+                    and md.num_prefills != 0 and md.num_decodes != 0
+                ):
+                    self._forward_mixed_fused(
+                        md, positions, out, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                        lam_all, shift_alphas,
+                    )
+                    return
                 if md.num_prefills != 0 or (md.spec is not None and not _FUSED_SPEC):
                     md = None
         if md is not None:
@@ -494,7 +528,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
             # reconstruction, token shift, q/k norms and softmax scaling; for a
             # verify batch one program per (request, kv head) chains the
             # positions (column-slot protocol).
-            k_pool, v_pool = self.shift_state.kv_cache
+            k_pool, v_pool = self._ts_kv(spec=md.spec is not None)
             common = (
                 k_pool, v_pool,
                 self.q_norm.norm.weight, self.k_norm.norm.weight,
@@ -567,9 +601,114 @@ class OlalaDiffTPAAttention(PluggableLayer):
         diff = sig - torch.sigmoid(lam) * noi
         out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
 
+    def _common_fused_args(self, k_pool, v_pool) -> tuple:
+        return (
+            k_pool, v_pool,
+            self.q_norm.norm.weight, self.k_norm.norm.weight,
+            self.q_norm.norm.eps, self.softmax_scaler,
+            float(getattr(self.config, "sliding_window_size", 0) or 0),
+            self.num_kv_heads_local, self.snr + 1, self.rank, self.head_dim,
+        )
+
+    def _mixed_fused_qkv(
+        self, md, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, shift_alphas
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q / k / v of a mixed (verify + prefill) batch: the verify rows through
+        the fused spec kernel, the prefill rows (and any cudagraph padding rows
+        after them) through the op-by-op path."""
+        n = q_all.shape[0]
+        ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
+        spec = md.spec
+        k_cols, v_cols = self._ts_kv(spec=True)
+        q_d, k_d, v_d = tpa_decode_qkv_spec(
+            q_all[:ndt], A_k_all[:ndt], A_v_all[:ndt], B_k_all[:ndt], B_v_all[:ndt],
+            shift_alphas[0][:ndt], shift_alphas[1][:ndt], positions[:ndt],
+            spec.query_start_loc_d, spec.state_cols, spec.num_accepted_tokens,
+            *self._common_fused_args(k_cols, v_cols),
+        )
+        rows = slice(ndt, n)
+        m = n - ndt
+        H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
+        q = q_all[rows].view(m, self.num_attention_heads_local, D)
+        k = torch.bmm(A_k_all[rows].view(m, H, R), B_k_all[rows].view(m, R, D)).div_(R)
+        v = torch.bmm(A_v_all[rows].view(m, H, R), B_v_all[rows].view(m, R, D)).div_(R)
+        pos = positions[rows]
+        if self.token_shift:
+            k_pool, v_pool = self._ts_kv()
+            k_s, v_s = self._alloc_shift(k, v, npt)
+            self._shift_prefill_rows(
+                md, k, v, md.state_indices_tensor, k_pool, v_pool,
+                shift_alphas[0][rows], shift_alphas[1][rows], pos,
+                md.num_decodes, md.num_prefills, 0, npt, k_s, v_s,
+            )
+            k, v = k_s, v_s
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q_p = q.reshape(m, self.q_size_local)
+        k_p = k.reshape(m, self.kv_size_local)
+        v_p = v.reshape(m, self.kv_size_local)
+        if self.rotary_emb is not None:
+            q_p, k_p = self.rotary_emb(pos, q_p, k_p)
+        if self.scalable_softmax:
+            p1 = (pos.float() + 1.0).clamp_min(1.0)
+            wsize = float(getattr(self.config, "sliding_window_size", 0) or 0)
+            log_pos = p1.clamp_max(wsize).log() if wsize > 0 else p1.log()
+            scale = self.softmax_scaler.to(q_p.dtype) * log_pos.to(q_p.dtype).unsqueeze(-1)
+            q_p = q_p.view(m, self.num_attention_heads_local, D)
+            q_p = (q_p * scale.unsqueeze(-1)).reshape(m, self.q_size_local)
+        return torch.cat([q_d, q_p]), torch.cat([k_d, k_p]), torch.cat([v_d, v_p])
+
+    def _forward_mixed_fused(
+        self, md, positions, out, q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all,
+        shift_alphas,
+    ) -> None:
+        n = q_all.shape[0]
+        ndt = md.num_decode_tokens
+        q_flat, k_flat, v_flat = self._mixed_fused_qkv(
+            md, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, shift_alphas
+        )
+        attn_out = self.attn(q_flat, k_flat, v_flat)  # (N, H_local*D)
+        tpa_diff_combine(attn_out[:ndt], lam_all[:ndt], out[:ndt], self.num_noise_heads_local,
+                         self.snr, self.head_dim)
+        m = n - ndt
+        a = attn_out[ndt:].view(m, self.num_noise_heads_local, self.snr + 1, self.head_dim)
+        lam = lam_all[ndt:].view(m, self.num_noise_heads_local, 1, 1)
+        diff = a[:, :, : self.snr, :] - torch.sigmoid(lam) * a[:, :, self.snr :, :]
+        out[ndt:].copy_(diff.reshape(m, self.num_signal_heads_local * self.head_dim))
+
     # ------------------------------------------------------------------
     # TPA-factorized KV cache path
     # ------------------------------------------------------------------
+
+    # -- token-shift buffer: own MambaSpec layer, or folded into a Mamba3 page -------
+    def set_token_shift_host(self, host) -> None:
+        """Fold: read this layer's token-shift buffer from ``host`` (the
+        Mamba3 mixer right before it), whose page carries it, and its metadata
+        under the host's prefix (same block table, so the same state slots,
+        spec columns and prefill layout)."""
+        object.__setattr__(self, "_ts_host", host)
+
+    @property
+    def _ts_md_key(self) -> str:
+        host = getattr(self, "_ts_host", None)
+        if self.shift_state.folded:
+            assert host is not None, f"{self.prefix}: folded token shift without a Mamba3 host"
+            return host.prefix
+        return self.shift_state.prefix
+
+    def _ts_kv(self, spec: bool = False) -> tuple[torch.Tensor, ...]:
+        """(k_last, v_last[, A_k_last, A_v_last]) pools. With light columns
+        the spec paths take the (slots, 1 + k, ...) tensors, the others
+        column 0 (the committed buffer)."""
+        if self.shift_state.folded:
+            pools = self._ts_host.folded_token_shift_pools()
+            pools = pools[:4] if self.factor_mode else pools[:2]
+        else:
+            pools = tuple(self.shift_state.kv_cache)
+        if self.shift_state.light_cols and not spec:
+            pools = tuple(p[:, 0] for p in pools)
+        return pools
 
     def _q_for_attention(self, q_all: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Eager q pre-processing: zero-centered RMSNorm + scalable softmax scale."""
@@ -606,14 +745,14 @@ class OlalaDiffTPAAttention(PluggableLayer):
             n, self.num_attention_heads_local * self.head_dim,
             dtype=hidden_states.dtype, device=hidden_states.device,
         )
-        if fc.attn_metadata is None or self.shift_state.prefix not in fc.attn_metadata:
+        if fc.attn_metadata is None or self._ts_md_key not in fc.attn_metadata:
             # Profiling / dry run: no paged cache yet; dense causal attention
             # over the batch as one document (same activation footprint).
             self._factor_dry_run(positions, q_all, A_k_all, A_v_all, B_k_all,
                                  B_v_all, alpha_k_all, alpha_v_all, attn_out)
         else:
             md = fc.attn_metadata[self.factor_cache.prefix]
-            ms: OlalaDiffTPAMetadata = fc.attn_metadata[self.shift_state.prefix]
+            ms: OlalaDiffTPAMetadata = fc.attn_metadata[self._ts_md_key]
             kv = self.factor_cache.kv_cache
             if kv.shape[0] != 2 or kv.dim() != 4 or kv.shape[1] == 1:
                 # vLLM >= 0.33 hands a block-major view (blocks, 1, block_size,
@@ -643,7 +782,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
                 )
             elif nd > 0:
                 assert ndt == nd, "factor decode path expects one token per decode request"
-                k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+                k_pool, v_pool, ak_pool, av_pool = self._ts_kv()
                 q_d = factor_decode_write(
                     q_all[:nd], A_k_all[:nd], A_v_all[:nd], B_k_all[:nd], B_v_all[:nd],
                     alpha_k_all[:nd], alpha_v_all[:nd], positions[:nd],
@@ -707,14 +846,24 @@ class OlalaDiffTPAAttention(PluggableLayer):
         for L in lengths:
             cu_k.append(cu_k[-1] + L)
         nk = len(keep)
-        meta = torch.tensor([qsl[r] for r in keep] + [qsl[r + 1] for r in keep] + [int(pslots[r]) for r in keep]
+        if pslots is None:
+            # OLALA_PREFILL_NOSYNC: slots stay on the device (no host copy).
+            dev_slots = ms.state_indices_tensor[bt0 : bt0 + nreq]
+            if nk < nreq:
+                dev_slots = dev_slots[torch.tensor(keep, dtype=torch.long).to(dev, non_blocking=True)]
+            pslots_cpu = [0] * nk
+        else:
+            pslots_cpu = [int(pslots[r]) for r in keep]
+        meta = torch.tensor([qsl[r] for r in keep] + [qsl[r + 1] for r in keep] + pslots_cpu
                             + [int(bool(has_init[r])) for r in keep] + [int(x) for x in qsl] + cu_k,
                             dtype=torch.int64).to(dev, non_blocking=True)
         starts, ends, pslots_t = meta[:nk], meta[nk:2 * nk], meta[2 * nk:3 * nk]
+        if pslots is None:
+            pslots_t = dev_slots.to(torch.int64)
         init_t = meta[3 * nk:4 * nk].bool()
         cu_q_dev = meta[4 * nk:4 * nk + nreq + 1].to(torch.int32)
         cu_k_dev = meta[4 * nk + nreq + 1:].to(torch.int32)
-        k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+        k_pool, v_pool, ak_pool, av_pool = self._ts_kv()
         if fused_glue:
             tpa_prefill_rows(
                 A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, positions, slots,
@@ -759,7 +908,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
         B_v = B_v_all.view(npt, R, D)
         k = torch.bmm(A_k, B_k).div_(R)
         v = torch.bmm(A_v, B_v).div_(R)
-        k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+        k_pool, v_pool, ak_pool, av_pool = self._ts_kv()
 
         def seeded(cur: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
             prev = torch.empty_like(cur)
@@ -951,14 +1100,15 @@ class OlalaDiffTPAAttention(PluggableLayer):
             alpha_v_all, _ = self.shift_proj_v(hidden_states)
 
         attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata is None or self.shift_state.prefix not in attn_metadata:
+        if attn_metadata is None or self._ts_md_key not in attn_metadata:
             # Profiling / dry run (or a warmup building attention metadata only): treat every token as a sequence start.
             a_k = torch.sigmoid(alpha_k_all.float()).unsqueeze(-1).to(k.dtype)
             a_v = torch.sigmoid(alpha_v_all.float()).unsqueeze(-1).to(v.dtype)
             return (1 - a_k) * k, (1 - a_v) * v
 
-        md: OlalaDiffTPAMetadata = attn_metadata[self.shift_state.prefix]
-        k_pool, v_pool = self.shift_state.kv_cache
+        md: OlalaDiffTPAMetadata = attn_metadata[self._ts_md_key]
+        k_pool, v_pool = self._ts_kv()
+        k_cols, v_cols = self._ts_kv(spec=True) if md.spec is not None else (k_pool, v_pool)
         slots = md.state_indices_tensor
         nd, np_ = md.num_decodes, md.num_prefills
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
@@ -969,8 +1119,8 @@ class OlalaDiffTPAAttention(PluggableLayer):
                 md.spec,
                 k,
                 v,
-                k_pool,
-                v_pool,
+                k_cols,
+                v_cols,
                 alpha_k_all,
                 alpha_v_all,
                 positions,
@@ -1111,9 +1261,16 @@ class OlalaDiffTPAAttention(PluggableLayer):
         prev_rows = (rows - 1).clamp_(min=0)
         k_prev = k.index_select(0, prev_rows)
         v_prev = v.index_select(0, prev_rows)
-        init = spec.initial_slots().long()
-        k_prev.index_copy_(0, starts, k_pool[init].to(k.dtype))
-        v_prev.index_copy_(0, starts, v_pool[init].to(v.dtype))
+        light = k_pool.dim() == 4  # (slots, 1 + k, kv, D): light columns (state.py)
+        if light:
+            slot0 = spec.state_cols[:, 0].long()
+            col0 = (spec.num_accepted_tokens.long() - 1).clamp_(min=0, max=k_pool.shape[1] - 1)
+            k_prev.index_copy_(0, starts, k_pool[slot0, col0].to(k.dtype))
+            v_prev.index_copy_(0, starts, v_pool[slot0, col0].to(v.dtype))
+        else:
+            init = spec.initial_slots().long()
+            k_prev.index_copy_(0, starts, k_pool[init].to(k.dtype))
+            v_prev.index_copy_(0, starts, v_pool[init].to(v.dtype))
         self._blend(
             k_shift[:ndt],
             v_shift[:ndt],
@@ -1129,8 +1286,17 @@ class OlalaDiffTPAAttention(PluggableLayer):
         T = spec.max_qlen
         t_idx = torch.arange(T, device=k.device)
         active = t_idx.unsqueeze(0) < qlens.unsqueeze(1)  # (nd, T)
-        dest = torch.where(active, spec.state_cols[:, :T].long(), 0).view(-1)
         src = torch.where(active, starts.unsqueeze(1) + t_idx.unsqueeze(0), 0).view(-1)
+        if light:
+            T = min(T, k_pool.shape[1])
+            active = active[:, :T]
+            src = torch.where(active, starts.unsqueeze(1) + t_idx[:T].unsqueeze(0), 0).view(-1)
+            dslot = torch.where(active, spec.state_cols[:, :1].long(), 0).view(-1)
+            dcol = torch.where(active, t_idx[:T].unsqueeze(0), 0).view(-1)
+            k_pool[dslot, dcol] = k.index_select(0, src).to(k_pool.dtype)
+            v_pool[dslot, dcol] = v.index_select(0, src).to(v_pool.dtype)
+            return
+        dest = torch.where(active, spec.state_cols[:, :T].long(), 0).view(-1)
         k_pool[dest] = k.index_select(0, src).to(k_pool.dtype)
         v_pool[dest] = v.index_select(0, src).to(v_pool.dtype)
 
@@ -1200,6 +1366,18 @@ class OlalaDiffTPAAttention(PluggableLayer):
         k_prev = torch.empty_like(k_pref)
         v_prev = torch.empty_like(v_pref)
 
+        if md.state_indices_p_cpu is None:
+            # OLALA_PREFILL_NOSYNC: no host copy of the slots; the same copies
+            # with device indices, for every request at once.
+            self._seed_prefill_rows_dev(
+                md, k_pref, v_pref, k_prev, v_prev, slots, k_pool, v_pool, nd, np_
+            )
+            self._blend(
+                k_shift[rows], v_shift[rows], k_pref, v_pref, k_prev, v_prev,
+                alpha_k_all[rows], alpha_v_all[rows], positions[rows],
+            )
+            return
+
         qsl = md.query_start_loc_p_cpu.tolist()
         has_init = md.has_initial_state_cpu.tolist()
         pslots = md.state_indices_p_cpu
@@ -1231,6 +1409,36 @@ class OlalaDiffTPAAttention(PluggableLayer):
             alpha_v_all[rows],
             positions[rows],
         )
+
+    @staticmethod
+    def _seed_prefill_rows_dev(
+        md, k_pref, v_pref, k_prev, v_prev, slots, k_pool, v_pool, nd: int, np_: int
+    ) -> None:
+        """Previous-token K/V of the prefill rows and the pool update, from device
+        slots: row s of a request is seeded from its pool slot (or zero without an
+        initial state), every other row from the row before; each request's last
+        raw K/V is then stored to its slot. Same values as the per-request loop
+        (copies only; the slots of one step are distinct)."""
+        qsl = md.query_start_loc_p_cpu.tolist()
+        keep = [r for r in range(np_) if qsl[r + 1] > qsl[r]]
+        if not keep:
+            return
+        qsl_d = md.query_start_loc_p
+        pslots = slots[nd : nd + np_]
+        init = md.has_initial_state[:np_]
+        starts, ends = qsl_d[:np_], qsl_d[1 : np_ + 1]
+        if len(keep) < np_:
+            idx = torch.tensor(keep, dtype=torch.long).to(k_pref.device, non_blocking=True)
+            pslots, init, starts, ends = pslots[idx], init[idx], starts[idx], ends[idx]
+        pslots, starts, ends = pslots.long(), starts.long(), ends.long()
+        if k_pref.shape[0] > 1:
+            k_prev[1:] = k_pref[:-1]
+            v_prev[1:] = v_pref[:-1]
+        m = init.view(-1, *([1] * (k_pref.dim() - 1)))
+        k_prev.index_copy_(0, starts, torch.where(m, k_pool[pslots].to(k_pref.dtype), 0))
+        v_prev.index_copy_(0, starts, torch.where(m, v_pool[pslots].to(v_pref.dtype), 0))
+        k_pool[pslots] = k_pref[ends - 1].to(k_pool.dtype)
+        v_pool[pslots] = v_pref[ends - 1].to(v_pool.dtype)
 
 
 def olala_diff_tpa(
