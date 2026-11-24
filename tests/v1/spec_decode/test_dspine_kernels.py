@@ -165,6 +165,50 @@ def test_inject_rows_matches_inject_fn(n, block, with_residual):
 
 
 @requires_gpu
+@pytest.mark.parametrize("kernel", ["rows", "rows_delta", "tile"])
+@pytest.mark.parametrize("fill", [float("nan"), float("inf"), 1e4])
+def test_inject_ignores_padded_rows(kernel, fill):
+    """A CUDA graph pads the draft batch with whole blocks, whose rows can hold NaN (an empty attention) or
+    anything else. The real rows must not see them: bit for bit those of the same batch padded with zeros, and
+    those of the unpadded batch up to the GEMMs' row-count dependent rounding. Regression: block position 0 took
+    the previous row (the padded block's last row for the first request) and the delta form zeroed it with a
+    multiply, so a NaN reached the first request; served greedy tau at 5 requests padded to 6, K5: 2.22
+    against 3.26 unpadded."""
+    import torch.nn.functional as F
+
+    from vllm.model_executor.models import qwen3_dspine_kernels as k
+
+    torch.manual_seed(11)
+    h, t, g, eps, block, reqs = 1536, 512, 256, 1e-6, 6, 5
+    bf = torch.bfloat16
+    n = reqs * block
+    hidden = (torch.randn(n, h, device="cuda") * 2).to(bf)
+    residual = (torch.randn(n, h, device="cuda") * 2).to(bf)
+    anchor = (torch.randn(reqs, t, device="cuda") * 4).to(bf)
+    ws = [(torch.randn(o, i, device="cuda") / i**0.5).to(bf) for o, i in ((t, h), (g, t), (2 * g, t), (h, g))]
+    bias = (torch.randn(g, device="cuda") * 0.1).to(bf)
+
+    def run(pad_value: float | None) -> tuple[torch.Tensor, torch.Tensor]:
+        hs, rs, an = hidden, residual, anchor
+        if pad_value is not None:
+            pad = torch.full((block, h), pad_value, device="cuda", dtype=bf)
+            hs, rs = torch.cat([hidden, pad]), torch.cat([residual, pad])
+            an = torch.cat([anchor, torch.zeros(1, t, device="cuda", dtype=bf)])
+        if kernel == "tile":
+            out, pre = k.inject(hs, rs, an, *ws, bias, block, t, eps)
+        else:
+            out, pre = k.inject_rows(hs, rs, an, *ws, bias, block, t, eps, F.linear, as_delta=kernel == "rows_delta")
+        return out[:n], pre[:n]
+
+    out, pre = run(fill)
+    out_zero, pre_zero = run(0.0)
+    assert torch.isfinite(out).all()
+    assert torch.equal(out, out_zero) and torch.equal(pre, pre_zero)
+    out_exact, _ = run(None)
+    torch.testing.assert_close(out.float(), out_exact.float(), rtol=2e-2, atol=5e-2)
+
+
+@requires_gpu
 @pytest.mark.parametrize("n,block", [(6, 6), (48, 6), (33, 3)])
 def test_inject_rows_delta_adds_up(n, block):
     import torch.nn.functional as F
