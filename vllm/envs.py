@@ -2507,4 +2507,16 @@ def compile_factors() -> dict[str, object]:
     for var in ray_noset_env_vars:
         factors[var] = normalize_value(os.getenv(var))
 
+    # Olala's kernels choose their dispatch from OLALA_* switches and, on a V100,
+    # from running under volta-forever (whose launcher exports VOLTA_FOREVER):
+    # both change the traced graph, so a graph compiled under one setting must
+    # not be reused under another (e.g. after switching OLALA_VOLTA).
+    # OLALA_TPA_BUILD_DIR only says where JIT extensions are built; the
+    # volta-forever version does not change the graph, only its presence does.
+    for var in sorted(os.environ):
+        if var.startswith("OLALA_") and var != "OLALA_TPA_BUILD_DIR":
+            factors[var] = normalize_value(os.environ[var])
+    if "VOLTA_FOREVER" in os.environ:
+        factors["VOLTA_FOREVER"] = True
+
     return factors
