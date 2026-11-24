@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -487,6 +488,21 @@ def _warmup_kernels(
                 decode_steps.append(([0], [False]))
         elif use_spec_decode:
             decode_steps.append(([0], [False]))
+        if use_spec_decode:
+            # Triton specializes integer arguments on divisibility by 16, and the
+            # rejection sampler's kernels take the request and logits counts. The
+            # full batch above is capped by the KV cache, so neither count need be
+            # a multiple of 16 (RTX 3080: _gather_draft_sampled_kernel and
+            # _compute_local_logits_stats_kernel compiled on the first such batch
+            # while serving). Warm a spec batch whose logits count is a multiple
+            # of 16, and one of 16 requests. The last requests are used: request 0
+            # is never among them, so no request decodes more than
+            # num_decode_steps times and the block allocation above covers them.
+            for num in sorted({16 // math.gcd(16, decode_query_len), 16}):
+                if num < num_reqs:
+                    decode_steps.append(
+                        (list(range(num_reqs - num, num_reqs)), [True] * num)
+                    )
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)

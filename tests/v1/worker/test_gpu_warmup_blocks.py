@@ -8,6 +8,7 @@ writes KV past the token range the target model was scheduled for. The warmup
 hand-builds its `SchedulerOutput`s, so it has to reserve the same blocks.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -180,6 +181,48 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
     assert set(recorder.num_spec_tokens_to_schedule) == {num_spec_steps}
+
+
+class _SpecBatchRecorder(_StepRecorder):
+    """Also records (requests, logits) of every all-spec decode step."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spec_batches: list[tuple[int, int]] = []
+
+    def execute_model(self, scheduler_output) -> None:
+        spec = scheduler_output.scheduled_spec_decode_tokens
+        reqs = scheduler_output.num_scheduled_tokens
+        if spec and set(spec) == set(reqs):
+            self.spec_batches.append(
+                (len(reqs), sum(1 + len(tokens) for tokens in spec.values()))
+            )
+        super().execute_model(scheduler_output)
+
+
+@pytest.mark.parametrize("num_spec_steps", [2, 3, 5])
+def test_warmup_kernels_covers_divisible_spec_batches(num_spec_steps):
+    """Triton specializes integer arguments on divisibility by 16, and the
+    rejection sampler's kernels take the request and logits counts. With a
+    warmup batch of 55 requests (as when the KV cache caps it), neither count
+    of the full batch is a multiple of 16: the warmup must still run a spec
+    batch whose logits count is, and one of 16 requests."""
+    runner = _make_runner([_attention_group()], num_spec_steps, num_spec_steps)
+    runner.scheduler_config.max_num_seqs = 55
+    runner.max_num_reqs = 55
+    recorder = _SpecBatchRecorder()
+
+    warmup_kernels(runner, recorder.execute_model, recorder.sample_tokens)
+
+    _assert_covers_lookahead(recorder.steps, num_spec_steps)
+    batches = recorder.spec_batches
+    decode_query_len = num_spec_steps + 1
+    assert (55, 55 * decode_query_len) in batches
+    # The fewest requests whose logits count is a multiple of 16 (16 for an odd
+    # decode_query_len), and 16 requests.
+    fewest = 16 // math.gcd(16, decode_query_len)
+    assert (fewest, fewest * decode_query_len) in batches, batches
+    assert (16, 16 * decode_query_len) in batches, batches
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():
