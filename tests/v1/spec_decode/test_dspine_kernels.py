@@ -40,7 +40,7 @@ def test_qk_norm_rope_matches_eager(n, cache_dtype):
 
     q = ref_norm(qkv[:, : nq * hd].view(n, nq, hd), qw).view(n, -1)
     k = ref_norm(qkv[:, nq * hd : (nq + nk) * hd].view(n, nk, hd), kw).view(n, -1)
-    q_ref, k_ref = RotaryEmbedding.forward_static(pos, q.float(), k.float(), hd, hd, cache.float(), True)
+    q_ref, k_ref = RotaryEmbedding.forward_static(pos, q.float(), k.float(), hd, hd, cache.to(torch.bfloat16).float(), True)
     q_out, k_out = qk_norm_rope(qkv, pos, cache, qw, kw, eps, nq, nk, hd)
     assert q_out.shape == (n, nq * hd) and k_out.shape == (n, nk * hd)
     torch.testing.assert_close(q_out.float(), q_ref.float(), rtol=2e-2, atol=3e-2)

@@ -46,8 +46,9 @@ def _qk_norm_rope_kernel(
     n1 = (x1 * r).to(tl.bfloat16).to(tl.float32) * w1
     n2 = (x2 * r).to(tl.bfloat16).to(tl.float32) * w2
     pos = tl.load(pos_ptr + row)
-    c = tl.load(cs_ptr + pos * stride_cs + offs).to(tl.float32)
-    s = tl.load(cs_ptr + pos * stride_cs + HALF + offs).to(tl.float32)
+    # cos / sin rounded to bf16, as the reference rotary (cache cast to the query dtype)
+    c = tl.load(cs_ptr + pos * stride_cs + offs).to(tl.bfloat16).to(tl.float32)
+    s = tl.load(cs_ptr + pos * stride_cs + HALF + offs).to(tl.bfloat16).to(tl.float32)
     o1 = (n1 * c - n2 * s).to(tl.bfloat16)
     o2 = (n2 * c + n1 * s).to(tl.bfloat16)
     mq = is_q & (offs >= 0)
@@ -334,8 +335,8 @@ def _ctx_kv_store_kernel(
         n1 = (k1 * r).to(tl.bfloat16).to(tl.float32) * w1
         n2 = (k2 * r).to(tl.bfloat16).to(tl.float32) * w2
         pos = tl.load(pos_ptr + t)
-        cs = tl.load(cs_ptr + pos * stride_cs + offs).to(tl.float32)
-        sn = tl.load(cs_ptr + pos * stride_cs + HALF + offs).to(tl.float32)
+        cs = tl.load(cs_ptr + pos * stride_cs + offs).to(tl.bfloat16).to(tl.float32)   # as ops.rotary_embedding
+        sn = tl.load(cs_ptr + pos * stride_cs + HALF + offs).to(tl.bfloat16).to(tl.float32)
         o1 = (n1 * cs - n2 * sn).to(tl.bfloat16)
         o2 = (n2 * cs + n1 * sn).to(tl.bfloat16)
         dst = cache + (slot // block_size) * s_blk + h * s_head + (slot % block_size) * s_tok
