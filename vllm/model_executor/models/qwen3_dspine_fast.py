@@ -345,7 +345,7 @@ def install_int8(model: nn.Module) -> int:
             n += 1
     inner = model.model
     attn = [layer.self_attn for layer in inner.layers]
-    if all(isinstance(a.qkv_proj.quant_method, ModelOptW8A16LinearMethod) for a in attn):
+    if attn and all(isinstance(a.qkv_proj.quant_method, ModelOptW8A16LinearMethod) for a in attn):
         inner._fused_kv_weight = torch.cat([a.qkv_proj.weight[a.q_size :] for a in attn], 0)
         inner._fused_kv_scale = torch.cat([a.qkv_proj.weight_scale[a.q_size :] for a in attn], 0)
         inner._fused_kv_bias = None
