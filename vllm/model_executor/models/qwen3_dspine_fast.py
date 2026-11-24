@@ -11,7 +11,8 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   the transition scoring each run as one ``torch.compile``'d function of
   tensors (the weights are arguments, so one graph serves every layer and
   batch size) instead of ~50 eager elementwise kernels per layer.
-  ``OLALA_DSPINE_FUSED=3`` is level 2 plus the hand-fused kernels of
+  ``OLALA_DSPINE_FUSED=3`` is level 2 plus, for draft steps of at most
+  ``OLALA_DSPINE_FUSED_MAX_ROWS`` rows (64), the hand-fused kernels of
   qwen3_dspine_kernels.py (one launch per chain): q/k RMSNorm + rotary in
   every draft layer; the residual add and the adjacent injection around the
   drafter's GEMVs (four row-wise launches); the context K/V norm, rotary and every layer's cache
@@ -72,6 +73,15 @@ _FUSED_OFF = frozenset(g for g in os.environ.get("OLALA_DSPINE_FUSED_OFF", "").s
 
 def _group(name: str) -> bool:
     return HAND_FUSED and name not in _FUSED_OFF
+
+
+# Level 3 serves draft steps of at most this many rows (requests x (1 + K)); larger ones keep level 2. On a V100
+# (K3) the row-wise kernels lost 2.3 % at 128 requests (512 rows) and 0.6 % at 32 (128 rows); the gains are at 1-2.
+HAND_MAX_ROWS = int(os.environ.get("OLALA_DSPINE_FUSED_MAX_ROWS", "64"))
+
+
+def _rows_ok(n: int) -> bool:
+    return n <= HAND_MAX_ROWS
 
 
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
@@ -490,6 +500,8 @@ def _fused_attention_forward(self, positions: torch.Tensor, hidden_states: torch
     kernel (qwen3_dspine_kernels.qk_norm_rope)."""
     from vllm.model_executor.models.qwen3_dspine_kernels import qk_norm_rope
 
+    if not _rows_ok(hidden_states.shape[0]):   # large draft steps: the layer's own forward
+        return type(self).forward(self, positions, hidden_states)
     qkv, _ = self.qkv_proj(hidden_states)
     q, k = qk_norm_rope(
         qkv, positions, self.rotary_emb.cos_sin_cache, self.q_norm.weight, self.k_norm.weight,
@@ -507,7 +519,7 @@ def hand_inject_ok(hidden_states: torch.Tensor) -> bool:
     """OLALA_DSPINE_FUSED=3: the residual add and the injection through
     qwen3_dspine_kernels.inject_rows (the drafter's GEMVs plus four row-wise
     launches)."""
-    return _group("inject") and hidden_states.dim() == 2
+    return _group("inject") and hidden_states.dim() == 2 and _rows_ok(hidden_states.shape[0])
 
 
 def delta_inject_ok() -> bool:
@@ -554,7 +566,12 @@ def hand_context_kv(inner: nn.Module, context_states, context_positions, context
     """DFlash's precompute_and_store_context_kv through qwen3_dspine_kernels.ctx_kv_store
     (OLALA_DSPINE_FUSED=3): False, and nothing done, when the case is not covered
     (dummy runs, no fused K/V weight, a V scale, another cache layout)."""
-    if not _group("ctx") or context_slot_mapping is None or not hasattr(inner, "_num_attn_layers"):
+    if (
+        not _group("ctx")
+        or context_slot_mapping is None
+        or not hasattr(inner, "_num_attn_layers")
+        or not _rows_ok(context_states.shape[0])
+    ):
         return False
     if getattr(inner, "_fused_kv_weight", None) is None or getattr(inner.layers[0].self_attn, "v_scale", None) is not None:
         return False
@@ -590,7 +607,9 @@ def hand_context_kv(inner: nn.Module, context_states, context_positions, context
     return True
 
 
-def hand_prep_ok(inner: nn.Module) -> bool:
+def hand_prep_ok(inner: nn.Module, input_ids: torch.Tensor) -> bool:
+    if not _rows_ok(input_ids.shape[0]):
+        return False
     w = getattr(getattr(inner, "embed_tokens", None), "weight", None)
     cb = getattr(inner, "transfer_codebook", None)
     return (
@@ -616,7 +635,12 @@ def hand_transitions_ok(lm_head: nn.Module, candidate_ids: torch.Tensor) -> bool
     """OLALA_DSPINE_FUSED=3 transition scoring: one tensor-parallel rank, a bf16 or
     per-channel INT8 head, a power-of-two top-k, at most TRANSITION_MAX_ROWS
     candidate rows (larger batches keep transitions_fn's cuBLAS GEMMs)."""
-    if not _group("transitions") or getattr(lm_head, "tp_size", 1) != 1 or candidate_ids.dim() != 3:
+    if (
+        not _group("transitions")
+        or getattr(lm_head, "tp_size", 1) != 1
+        or candidate_ids.dim() != 3
+        or not _rows_ok(candidate_ids.shape[0] * (candidate_ids.shape[1] + 1))
+    ):
         return False
     from vllm.model_executor.models.qwen3_dspine_kernels import TRANSITION_MAX_ROWS
 

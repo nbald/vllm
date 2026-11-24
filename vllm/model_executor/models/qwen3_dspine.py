@@ -332,7 +332,7 @@ class DSpineQwen3Model(DFlashQwen3Model):
         positions: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if input_embeds is None and fast_path.hand_prep_ok(self):
+        if input_embeds is None and fast_path.hand_prep_ok(self, input_ids):
             # OLALA_DSPINE_FUSED=3: embeddings and anchor features in one launch
             input_embeds, anchor_features = fast_path.hand_prep(self, input_ids)
         else:
