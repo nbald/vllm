@@ -45,3 +45,41 @@ def test_qk_norm_rope_matches_eager(n, cache_dtype):
     assert q_out.shape == (n, nq * hd) and k_out.shape == (n, nk * hd)
     torch.testing.assert_close(q_out.float(), q_ref.float(), rtol=2e-2, atol=3e-2)
     torch.testing.assert_close(k_out.float(), k_ref.float(), rtol=2e-2, atol=3e-2)
+
+
+@requires_gpu
+@pytest.mark.parametrize("n", [1, 6, 30, 200])
+def test_ctx_kv_store_matches_reference(n):
+    from vllm.model_executor.models.qwen3_dspine_kernels import ctx_kv_store, ctx_kv_store_ok
+
+    torch.manual_seed(n)
+    L, nkv, hd, eps, blocks, bs = 5, 4, 128, 1e-6, 64, 16
+    bf = torch.bfloat16
+    all_kv = (torch.randn(n, L * 2 * nkv * hd, device="cuda") * 3).to(bf)
+    knw = (torch.rand(L, hd, device="cuda") + 0.5).to(bf)
+    pos = torch.randint(0, 4096, (n,), device="cuda")
+    cache_cs = _rope_cache(4096, hd).to("cuda", bf)
+    caches = [torch.zeros(blocks, nkv, bs, 2 * hd, device="cuda", dtype=bf) for _ in range(L)]
+    slots = [torch.randperm(blocks * bs, device="cuda")[:n] for _ in range(L)]
+    slots[2][0] = -1   # a padded row: nothing written for it
+    assert ctx_kv_store_ok(caches, hd)
+    ctx_kv_store(all_kv, pos, cache_cs, knw, eps, slots, caches, nkv, hd)
+
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    kv = all_kv.view(n, L, 2, nkv, hd)
+    for lay in range(L):
+        k = kv[:, lay, 0].float()
+        kn = (k * torch.rsqrt(k.square().mean(-1, keepdim=True) + eps)).to(bf).float() * knw[lay].float()
+        k_ref, _ = RotaryEmbedding.forward_static(pos, kn.to(bf).float().view(n, -1), None, hd, hd,
+                                                  cache_cs.float(), True)
+        k_ref = k_ref.view(n, nkv, hd)
+        for i in range(n):
+            slot = int(slots[lay][i])
+            if slot < 0:
+                continue
+            got = caches[lay][slot // bs, :, slot % bs]
+            torch.testing.assert_close(got[:, :hd].float(), k_ref[i].float(), rtol=2e-2, atol=3e-2)
+            assert torch.equal(got[:, hd:], kv[i, lay, 1])
+    written = sum(int((s >= 0).sum()) for s in slots)
+    assert sum(int(c.abs().sum(-1).ne(0).sum()) for c in caches) == written * nkv

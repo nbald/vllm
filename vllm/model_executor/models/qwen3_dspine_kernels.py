@@ -99,3 +99,96 @@ def qk_norm_rope(qkv, positions, cos_sin_cache, q_weight, k_weight, eps, num_q_h
     return torch.ops.vllm.dspine_qk_norm_rope(
         qkv, positions, cos_sin_cache, q_weight, k_weight, eps, num_q_heads, num_kv_heads, head_dim
     )
+
+
+# -- Context K/V of every draft layer into its cache (DFlash precompute_and_store_context_kv) -----------------
+# After the fused K/V projection ``all_kv [num_ctx, L * 2 * nkv * hd]`` (layer-major, then K | V, heads, dims):
+# per-layer K RMSNorm, neox rotary at the context positions, and the cache writes of every layer, in one launch
+# instead of the layer-major copy, the grouped RMSNorm, the positions repeat, the rotary and one cache-update
+# kernel per layer. TRITON_ATTN cache layout: ``kv_cache [blocks, nkv, block_size, 2 * hd]`` (K | V).
+
+CTX_KV_MAX_LAYERS = 8
+
+
+@triton.jit
+def _ctx_kv_store_kernel(
+    kv_ptr, stride_kv, pos_ptr, cs_ptr, stride_cs, knw_ptr, eps,
+    sm0, sm1, sm2, sm3, sm4, sm5, sm6, sm7,
+    c0, c1, c2, c3, c4, c5, c6, c7,
+    s_blk, s_head, s_tok, block_size,
+    NKV: tl.constexpr, HD: tl.constexpr,
+):
+    t = tl.program_id(0)
+    lay = tl.program_id(1)
+    h = tl.program_id(2)
+    HALF: tl.constexpr = HD // 2
+    offs = tl.arange(0, HALF)
+    if lay == 0:
+        sm, cache = sm0, c0
+    elif lay == 1:
+        sm, cache = sm1, c1
+    elif lay == 2:
+        sm, cache = sm2, c2
+    elif lay == 3:
+        sm, cache = sm3, c3
+    elif lay == 4:
+        sm, cache = sm4, c4
+    elif lay == 5:
+        sm, cache = sm5, c5
+    elif lay == 6:
+        sm, cache = sm6, c6
+    else:
+        sm, cache = sm7, c7
+    slot = tl.load(sm + t)
+    if slot >= 0:
+        base = kv_ptr + t * stride_kv + lay * (2 * NKV * HD) + h * HD
+        k1 = tl.load(base + offs).to(tl.float32)
+        k2 = tl.load(base + HALF + offs).to(tl.float32)
+        v1 = tl.load(base + NKV * HD + offs)
+        v2 = tl.load(base + NKV * HD + HALF + offs)
+        r = 1.0 / tl.sqrt((tl.sum(k1 * k1, 0) + tl.sum(k2 * k2, 0)) / HD + eps)
+        w1 = tl.load(knw_ptr + lay * HD + offs).to(tl.float32)
+        w2 = tl.load(knw_ptr + lay * HD + HALF + offs).to(tl.float32)
+        n1 = (k1 * r).to(tl.bfloat16).to(tl.float32) * w1
+        n2 = (k2 * r).to(tl.bfloat16).to(tl.float32) * w2
+        pos = tl.load(pos_ptr + t)
+        cs = tl.load(cs_ptr + pos * stride_cs + offs).to(tl.float32)
+        sn = tl.load(cs_ptr + pos * stride_cs + HALF + offs).to(tl.float32)
+        o1 = (n1 * cs - n2 * sn).to(tl.bfloat16)
+        o2 = (n2 * cs + n1 * sn).to(tl.bfloat16)
+        dst = cache + (slot // block_size) * s_blk + h * s_head + (slot % block_size) * s_tok
+        tl.store(dst + offs, o1)
+        tl.store(dst + HALF + offs, o2)
+        tl.store(dst + HD + offs, v1)
+        tl.store(dst + HD + HALF + offs, v2)
+
+
+def ctx_kv_store_ok(kv_caches: list[torch.Tensor], head_dim: int) -> bool:
+    """The layout ctx_kv_store writes: bf16 TRITON_ATTN caches of one shape and
+    stride, ``[blocks, nkv, block_size, 2 * head_dim]``, at most CTX_KV_MAX_LAYERS."""
+    if not kv_caches or len(kv_caches) > CTX_KV_MAX_LAYERS:
+        return False
+    c0 = kv_caches[0]
+    return all(
+        c.dtype == torch.bfloat16 and c.dim() == 4 and c.shape == c0.shape and c.stride() == c0.stride()
+        and c.shape[-1] == 2 * head_dim and c.stride(-1) == 1
+        for c in kv_caches
+    )
+
+
+def ctx_kv_store(all_kv_flat, positions, cos_sin_cache, k_norm_weights, eps, slot_mappings, kv_caches,
+                 num_kv_heads, head_dim):
+    """K (per-layer RMSNorm + neox rotary) and V of every context token into
+    every layer's cache at its slot (negative slot: skipped)."""
+    n = all_kv_flat.shape[0]
+    L = len(kv_caches)
+    if n == 0:
+        return
+    sms = list(slot_mappings) + [slot_mappings[0]] * (CTX_KV_MAX_LAYERS - L)
+    cs = list(kv_caches) + [kv_caches[0]] * (CTX_KV_MAX_LAYERS - L)
+    c0 = kv_caches[0]
+    _ctx_kv_store_kernel[(n, L, num_kv_heads)](
+        all_kv_flat, all_kv_flat.stride(0), positions, cos_sin_cache, cos_sin_cache.stride(0), k_norm_weights, eps,
+        *sms, *cs, c0.stride(0), c0.stride(1), c0.stride(2), c0.shape[2],
+        NKV=num_kv_heads, HD=head_dim, num_warps=1,
+    )

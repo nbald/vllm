@@ -346,6 +346,20 @@ class DSpineQwen3Model(DFlashQwen3Model):
         hidden_states = self.norm(hidden_states)
         return hidden_states, final_pre_injection
 
+    def precompute_and_store_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> None:
+        # OLALA_DSPINE_FUSED=3: projection, then norm + rotary + every layer's cache write in one launch
+        if not fast_path.hand_context_kv(
+            self, context_states, context_positions, context_slot_mapping
+        ):
+            super().precompute_and_store_context_kv(
+                context_states, context_positions, context_slot_mapping
+            )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
         if not any(name.startswith("selected_prefix_bridge.") for name, _ in weights):

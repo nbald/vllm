@@ -13,7 +13,8 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   batch size) instead of ~50 eager elementwise kernels per layer.
   ``OLALA_DSPINE_FUSED=3`` is level 2 plus the hand-fused kernels of
   qwen3_dspine_kernels.py (one launch per chain): q/k RMSNorm + rotary in
-  every draft layer.
+  every draft layer; the context K/V norm, rotary and every layer's cache
+  write after the fused projection.
   ``OLALA_DSPINE_FUSED=2`` also compiles every draft decoder layer: with custom
   ops off, RMSNorm, rotary and SiluAndMul are native torch chains that only a
   compile fuses.
@@ -489,6 +490,44 @@ def _fused_attention_forward(self, positions: torch.Tensor, hidden_states: torch
     attn_output = self.attn(q, k, v)
     output, _ = self.o_proj(attn_output)
     return output
+
+
+def hand_context_kv(inner: nn.Module, context_states, context_positions, context_slot_mapping) -> bool:
+    """DFlash's precompute_and_store_context_kv through qwen3_dspine_kernels.ctx_kv_store
+    (OLALA_DSPINE_FUSED=3): False, and nothing done, when the case is not covered
+    (dummy runs, no fused K/V weight, a V scale, another cache layout)."""
+    if not HAND_FUSED or context_slot_mapping is None or not hasattr(inner, "_num_attn_layers"):
+        return False
+    if getattr(inner, "_fused_kv_weight", None) is None or getattr(inner.layers[0].self_attn, "v_scale", None) is not None:
+        return False
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.models.qwen3_dspine_kernels import ctx_kv_store, ctx_kv_store_ok
+
+    L = inner._num_attn_layers
+    slots = list(context_slot_mapping) if isinstance(context_slot_mapping, (list, tuple)) else [context_slot_mapping] * L
+    caches = [a.kv_cache for a in inner._attn_layers]
+    if (
+        any(m is None for m in slots)
+        or not all(isinstance(c, torch.Tensor) for c in caches)
+        or not ctx_kv_store_ok(caches, inner._head_dim)
+        or not inner._rope_is_neox
+        or inner._rope_head_size != inner._head_dim
+        or inner._rope_cos_sin_cache.shape[-1] != inner._head_dim
+    ):
+        return False
+    normed = torch.empty_like(context_states)
+    ops.rms_norm(normed, context_states, inner._hidden_norm_weight, inner._rms_norm_eps)
+    if inner._fused_kv_scale is not None:
+        from vllm.model_executor.layers.quantization.utils.w8a16_utils import w8a16_int8_linear
+
+        all_kv = w8a16_int8_linear(normed, inner._fused_kv_weight, inner._fused_kv_scale)
+    else:
+        all_kv = F.linear(normed, inner._fused_kv_weight, inner._fused_kv_bias)
+    ctx_kv_store(
+        all_kv, context_positions, inner._rope_cos_sin_cache, inner._k_norm_weights, inner._rms_norm_eps,
+        slots, caches, inner._num_kv_heads, inner._head_dim,
+    )
+    return True
 
 
 def _hand_fuse_attention(attn: nn.Module) -> bool:
