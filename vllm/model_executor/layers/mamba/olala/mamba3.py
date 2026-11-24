@@ -565,7 +565,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self._replay = replay_config()
         if self._replay is not None:
             if vllm_config.speculative_config is not None:
-                # Normally refused at config time (OlalaForCausalLMConfig)
+                # Normally turned off at config time (OlalaForCausalLMConfig
+                # falls back to the fp32 state): a backstop
                 from vllm.model_executor.models.config import OLALA_REPLAY_SPEC_ERROR
 
                 raise ValueError(
