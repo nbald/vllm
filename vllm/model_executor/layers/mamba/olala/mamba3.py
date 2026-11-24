@@ -553,9 +553,13 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self._replay = replay_config()
         if self._replay is not None:
             if vllm_config.speculative_config is not None:
+                # Normally refused at config time (OlalaForCausalLMConfig)
+                from vllm.model_executor.models.config import OLALA_REPLAY_SPEC_ERROR
+
                 raise ValueError(
-                    "OLALA_REPLAY_SSM does not support speculative decoding yet "
-                    "(the verify step reads the full state); unset it."
+                    OLALA_REPLAY_SPEC_ERROR.format(
+                        value=os.environ.get("OLALA_REPLAY_SSM")
+                    )
                 )
             if not (
                 replay_step_supported(
