@@ -135,10 +135,15 @@ def test_light_page_and_fold_sizes(monkeypatch, sm80, k):
     assert ts < 0.03 * light
 
 
-def test_sm70_takes_light_columns(monkeypatch, sm80):
-    """V100 (natively or through volta-forever): the Volta edition of the verify kernel commits light columns
-    too, so the layout does not depend on the family."""
+def test_sm70_light_columns_are_opt_in(monkeypatch, sm80):
+    """V100 (natively or through volta-forever): column slots by default; the Volta edition of the verify kernel
+    commits light columns when OLALA_VOLTA_SPEC_LIGHT=1 (the capacity setting)."""
     monkeypatch.setenv("OLALA_SPEC_LIGHT", "1")
-    for volta in ("1", "0"):
-        monkeypatch.setenv("OLALA_VOLTA", volta)
-        assert st.spec_light_cols(_cfg(k=5)) == 6
+    monkeypatch.delenv("OLALA_VOLTA_SPEC_LIGHT", raising=False)
+    monkeypatch.setenv("OLALA_VOLTA", "1")
+    assert st.spec_light_cols(_cfg(k=5)) == 0
+    monkeypatch.setenv("OLALA_VOLTA_SPEC_LIGHT", "1")
+    assert st.spec_light_cols(_cfg(k=5)) == 6
+    monkeypatch.setenv("OLALA_VOLTA", "0")
+    monkeypatch.delenv("OLALA_VOLTA_SPEC_LIGHT")
+    assert st.spec_light_cols(_cfg(k=5)) == 6

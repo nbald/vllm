@@ -24,6 +24,7 @@ Its kernels and fast paths are controlled by the variables below; every default 
 | `OLALA_PREFILL_NOSYNC` | `0` | Prefill metadata of the Mamba-3, DiffTPA and factor-cache builders from the CPU, without a device-to-host copy; `OLALA_PREFILL_NOSYNC_CHECK=1` compares with the device values (debug). |
 | `OLALA_TS_FOLD` | `0` | DiffTPA token-shift buffers stored in the page of the preceding Mamba-3 layer (no token-shift KV groups). |
 | `OLALA_SPEC_LIGHT` | `0` | Speculative decoding: one Mamba-3 page per request with `1 + K` light columns instead of `1 + K` state pages. Needs the fused verify kernel (`OLALA_MAMBA3_VERIFY=cuda`, SM80 or later, 7A1B shapes at TP=1, fp32 state); ignored elsewhere. |
+| `OLALA_VOLTA_SPEC_LIGHT` | `0` | SM70 (V100): `1` takes the light columns of `OLALA_SPEC_LIGHT=1` (the Volta verify edition commits them); unset, SM70 keeps column slots. The capacity / long-context setting: on a V100 (Q8, K3) about 30 % more KV capacity, +13 % at c = 128 with no preemptions, -3.5 % at c = 1 (the committed drafts are replayed position by position). |
 | `VLLM_KV_CACHE_GROUP_SIZE` | unset | Overrides the hybrid allocator's group size (`7` with `OLALA_TS_FOLD`). |
 | `OLALA_TPA_MIXED_FUSED` | `0` | Speculative steps that mix prefills and verifies: the verify rows keep the fused DiffTPA path (`tpa_decode_qkv_spec`). |
 | `OLALA_STEP_TRACE` | unset | Development: per-step JSONL trace of Model Runner V2 at that path (phase timings, CUDA-graph modes); `OLALA_STEP_TRACE_SYNCS=1` also counts host syncs. |

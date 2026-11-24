@@ -79,6 +79,23 @@ def replay_config() -> ReplayConfig | None:
     return ReplayConfig(buffer_len=L, read_fp8=read == "fp8")
 
 
+def _sm70() -> bool:
+    """SM70 (V100, natively or through volta-forever, which reports a later
+    capability to CUDA programs). Decided without a CUDA context (the API server
+    process sizes pages too)."""
+    forced = os.environ.get("OLALA_VOLTA")
+    if forced in ("0", "1"):
+        return forced == "1"
+    from vllm.model_executor.layers.mamba.olala import arch
+
+    volta_forever = getattr(arch, "volta_forever", None)
+    if volta_forever is not None and volta_forever():
+        return True
+    from vllm.platforms import current_platform
+
+    return current_platform.has_device_capability(70) and not current_platform.has_device_capability(75)
+
+
 def spec_light_cols(vllm_config) -> int:
     """Columns per state page under speculative decoding with light columns
     (``OLALA_SPEC_LIGHT=1``, opt-in): ``1 + k``, or 0 for the column-slot
@@ -94,6 +111,12 @@ def spec_light_cols(vllm_config) -> int:
         return 0
     k = int(getattr(vllm_config, "num_speculative_tokens", 0) or 0)
     if k <= 0 or replay_config() is not None:
+        return 0
+    if _sm70() and os.environ.get("OLALA_VOLTA_SPEC_LIGHT", "0") != "1":
+        # SM70 keeps column slots unless asked: the Volta edition commits light
+        # columns too, but replays the committed drafts position by position
+        # (-3.5 % at c = 1 on a V100), for about 30 % more KV capacity (+13 % at
+        # c = 128, no preemptions): the capacity / long-context setting.
         return 0
     if vllm_config.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32"):
         return 0
