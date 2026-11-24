@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,56 @@ import torch
 
 MODEL = os.getenv("VLLM_TEST_OLALA_CONFIG", "OVHaiLLM/Olala-v1.0-mini-7A1B")
 AUX = (2, 10, 18, 26, 34)
+# Beyond the weights: activations of the eager 2048-token prefill, the sampler,
+# the CUDA context and a small KV cache.
+HEADROOM = 3 * 2**30
+
+
+def _weight_bytes(model: str) -> int | None:
+    """Size of the checkpoint's safetensors files (a local directory, or the
+    Hub cache), None if they cannot be found without a download."""
+    path = Path(model)
+    if not path.is_dir():
+        try:
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(model, local_files_only=True))
+        except Exception:  # noqa: BLE001 - not in the local cache
+            return None
+    files = list(path.glob("*.safetensors"))
+    return sum(f.stat().st_size for f in files) if files else None
+
+
+def _gpu_memory() -> tuple[int, int]:
+    """(free, total) bytes of the GPU the engine will use, from NVML: a CUDA
+    context in this process would hold memory the engine subprocess needs."""
+    from vllm.platforms import current_platform
+    from vllm.utils.import_utils import import_pynvml
+
+    pynvml = import_pynvml()
+    pynvml.nvmlInit()
+    try:
+        index = current_platform.device_id_to_physical_device_id(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(index))
+        return int(info.free), int(info.total)
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def _gpu_memory_utilization(model: str) -> float:
+    """The weights plus HEADROOM as a fraction of this GPU (at least the
+    former fixed 0.6): a bf16 checkpoint (12.7 GiB) does not fit in 0.6 of a
+    20 GB GPU. Skips when that much memory is not free."""
+    free, total = _gpu_memory()
+    weights = _weight_bytes(model)
+    if weights is None:
+        return 0.6
+    need = weights + HEADROOM
+    if need > free:
+        pytest.skip(
+            f"{model} needs ~{need / 2**30:.1f} GiB, {free / 2**30:.1f} GiB free"
+        )
+    return min(0.95, max(0.6, need / total))
 
 
 def test_default_aux_layers():
@@ -57,8 +108,8 @@ _SCRIPT = textwrap.dedent(
     aux_layers = tuple(json.loads(sys.argv[3]))
     llm = LLM(model_dir, trust_remote_code=True, enforce_eager=True,
               max_model_len=2048, enable_prefix_caching=False,
-              gpu_memory_utilization=0.6, mamba_ssm_cache_dtype="float32",
-              moe_backend="triton")
+              gpu_memory_utilization=float(sys.argv[4]),
+              mamba_ssm_cache_dtype="float32", moe_backend="triton")
     model = (llm.llm_engine.engine_core.engine_core.model_executor
              .driver_worker.worker.model_runner.model)
     inner = model.model
@@ -100,8 +151,9 @@ def _run(tmp_path, geo_fuse: bool) -> dict:
     script = tmp_path / "run.py"
     script.write_text(_SCRIPT)
     env = dict(os.environ, OLALA_GEO_FUSE="1" if geo_fuse else "0")
+    util = _gpu_memory_utilization(MODEL)
     subprocess.run(
-        [sys.executable, str(script), MODEL, str(out), json.dumps(AUX)],
+        [sys.executable, str(script), MODEL, str(out), json.dumps(AUX), str(util)],
         check=True,
         env=env,
         cwd=tmp_path,
