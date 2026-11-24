@@ -417,13 +417,13 @@ def test_factor_verify_matches_sequential_decode(lanes, k, nsplit, softcap):
     path (factor_decode_write on the column-slot chain, factor_decode_attention on the request's row with
     seq_len = context + t + 1). Same KV splits, so attention outputs and factor planes are bit-identical.
     Contexts and splits cross block boundaries; the blocks are tpa_factor.block_align()'s 16 tokens on
-    sm_80 / sm_120 and 26 elsewhere."""
+    sm_80 / sm_120 / SM70 and 26 elsewhere."""
     from vllm.model_executor.layers.mamba.olala import tpa_factor as tf
     from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 
     if not tf.factor_cache_enabled():
         pytest.skip("factor kernel unavailable (JIT build failed)")
-    BS = tf.SPEC_BLOCK_ALIGN if gpu_family() in (GpuFamily.SM80, GpuFamily.SM120) else 2 * tf.TILE
+    BS = tf.SPEC_BLOCK_ALIGN if gpu_family() in (GpuFamily.SM80, GpuFamily.SM120, GpuFamily.SM70) else 2 * tf.TILE
     torch.manual_seed(100 * lanes + k + int(softcap))
     bf = torch.bfloat16
     dev = "cuda"

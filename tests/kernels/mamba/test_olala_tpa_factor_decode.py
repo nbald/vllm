@@ -92,11 +92,11 @@ def test_factor_decode_matches_dense(seq_lens, block_size, nsplit, softcap):
 )
 @pytest.mark.parametrize("softcap", [0.0, 150.0])
 def test_factor_decode_16_token_blocks(seq_lens, block_size, nsplit, softcap):
-    """The mma.sync kernel (sm_80 / sm_120) resolves every token through the block table, so it takes the
-    16-token blocks of OLALA_TPA_FACTOR_SPEC (tpa_factor.block_align): KV splits are multiples of 13 tokens
-    and straddle the blocks."""
+    """The mma.sync kernel (sm_80 / sm_120) and the Volta kernel (SM70) resolve every token through the block
+    table, so they take the 16-token blocks of OLALA_TPA_FACTOR_SPEC (tpa_factor.block_align): KV splits are
+    multiples of 13 tokens and straddle the blocks."""
     from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
 
-    if gpu_family() not in (GpuFamily.SM80, GpuFamily.SM120):
+    if gpu_family() not in (GpuFamily.SM80, GpuFamily.SM120, GpuFamily.SM70):
         pytest.skip("13-token blocks only on this GPU (tpa_factor.block_align)")
     test_factor_decode_matches_dense(seq_lens, block_size, nsplit, softcap)

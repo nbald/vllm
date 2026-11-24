@@ -5,7 +5,7 @@ CPU only: the switch is opt-in (off: the factor builder still refuses a speculat
 config and the page rule is unchanged); on, verify rows are decode rows split exactly
 as the Olala token-shift builder splits them, FULL graphs are allowed for uniform
 verify batches, each verify token gets one virtual single-token decode row, and the
-16-token factor block applies on sm_80 / sm_120 only and makes the K3 light page exact
+16-token factor block applies on sm_80 / sm_120 / SM70 only and makes the K3 light page exact
 (capacity design, section 4.2)."""
 
 import math
@@ -130,12 +130,12 @@ def test_no_speculation_is_unchanged(factor_spec, value):
 
 @pytest.mark.parametrize(
     "family,align",
-    [(GpuFamily.SM80, 16), (GpuFamily.SM120, 16), (GpuFamily.SM90, 13), (GpuFamily.SM100, 13),
-     (GpuFamily.UNSUPPORTED, 13)],
+    [(GpuFamily.SM80, 16), (GpuFamily.SM120, 16), (GpuFamily.SM70, 16), (GpuFamily.SM90, 13),
+     (GpuFamily.SM100, 13), (GpuFamily.UNSUPPORTED, 13)],
 )
 def test_16_token_blocks_on_mma_sync_only(factor_spec, family, align):
-    """Hopper / sm_100 (TMA tiles) and every other family (Volta's kernel included)
-    keep 13-token blocks."""
+    """Hopper / sm_100 (TMA tiles) and every other family keep 13-token blocks; the
+    mma.sync and Volta kernels take 16-token blocks."""
     factor_spec("1", family)
     assert tf.block_align() == align
     assert tf.OlalaTPAFactorBackend.get_supported_kernel_block_sizes() == [MultipleOf(align)]

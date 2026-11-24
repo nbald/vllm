@@ -76,7 +76,7 @@ def _min_split_tokens() -> int:
 
 
 SPLIT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
-SPEC_BLOCK_ALIGN = 16  # factor block granularity under OLALA_TPA_FACTOR_SPEC on sm_80 / sm_120
+SPEC_BLOCK_ALIGN = 16  # factor block granularity under OLALA_TPA_FACTOR_SPEC on sm_80 / sm_120 / SM70
 
 
 @lru_cache(maxsize=1)
@@ -92,13 +92,13 @@ def factor_spec_enabled() -> bool:
 def block_align() -> int:
     """Block-size granularity of the factor cache.
 
-    The Hopper and sm_100 kernels stream 13-token TMA tiles, and so does the
-    Volta kernel's launch contract. The mma.sync kernel (sm_80 / sm_120)
-    resolves every token through the block table, so under
-    OLALA_TPA_FACTOR_SPEC it takes 16-token blocks: next to a drafter's
-    16-token backend, lcm(13, 16) = 208 would otherwise force 416-token
-    attention blocks (2.56 MB pages, the Mamba pages padded by 57 %)."""
-    if factor_spec_enabled() and gpu_family() in (GpuFamily.SM80, GpuFamily.SM120):
+    The Hopper and sm_100 kernels stream 13-token TMA tiles. The mma.sync
+    kernel (sm_80 / sm_120) and the Volta kernel (SM70) resolve every token
+    through the block table, so under OLALA_TPA_FACTOR_SPEC they take 16-token
+    blocks: next to a drafter's 16-token backend, lcm(13, 16) = 208 would
+    otherwise force 416-token attention blocks (2.56 MB pages, the Mamba pages
+    padded by 57 %)."""
+    if factor_spec_enabled() and gpu_family() in (GpuFamily.SM80, GpuFamily.SM120, GpuFamily.SM70):
         return SPEC_BLOCK_ALIGN
     return TILE
 
