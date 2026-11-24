@@ -307,7 +307,9 @@ void tpa_factor_decode_sm80_launch(torch::Tensor q, torch::Tensor kplane, torch:
                                    double sm_scale, double softcap, int64_t block_size) {
   const int B = q.size(0), SPLIT = part_o.size(1), hqp = part_o.size(2);
   TORCH_CHECK(kplane.dim() == 3 && kplane.size(2) == ROWP && kplane.stride(2) == 1 && kplane.stride(1) == ROWP && q.is_contiguous());
-  TORCH_CHECK(vplane.stride(0) == kplane.stride(0) && vplane.stride(1) == ROWP && kplane.size(1) == block_size && block_size % SPLIT_TILE == 0);
+  // Any block size: load_tile resolves every token's row through the block table. The 13-token granularity is
+  // the Hopper / sm_100 kernels' (TMA tiles); OLALA_TPA_FACTOR_SPEC uses 16-token blocks here (tpa_factor.block_align).
+  TORCH_CHECK(vplane.stride(0) == kplane.stride(0) && vplane.stride(1) == ROWP && kplane.size(1) == block_size && block_size > 0);
   TORCH_CHECK(block_table.dtype() == torch::kInt32 && seq_lens.dtype() == torch::kInt32 && tok_per_split.dtype() == torch::kInt32);
   TORCH_CHECK(hqp >= HQ && part_o.size(3) == D && part_o.is_contiguous() && part_m.is_contiguous() && part_l.is_contiguous());
   TORCH_CHECK((kplane.stride(0) * 2) % 16 == 0 && reinterpret_cast<uintptr_t>(kplane.data_ptr()) % 16 == 0 &&

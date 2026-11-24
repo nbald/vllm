@@ -28,8 +28,9 @@ vllm serve /path/to/target \
   `--attention-backend`, which also changes the target's kernels.
 - Watermarking is not supported, as for the other candidate-head drafters.
 - With an Olala target, the TPA-factorized KV cache (`OLALA_TPA_FACTOR`, on by
-  default) has no multi-token verify path. A speculative config turns it off,
-  with a log line, and uses the dense paged KV cache; `OLALA_TPA_FACTOR=1` set
+  default) has a multi-token verify path only with `OLALA_TPA_FACTOR_SPEC=1`
+  (opt-in). Without it, a speculative config turns the factor cache off, with a
+  log line, and uses the dense paged KV cache; `OLALA_TPA_FACTOR=1` set
   explicitly is refused at startup.
 
 ## Checkpoint format

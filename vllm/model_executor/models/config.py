@@ -1257,13 +1257,22 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
             vllm_config.cache_config.enable_prefix_caching = False
             logger.info("Olala: prefix caching disabled (not supported).")
 
-        # The TPA-factorized KV cache (OLALA_TPA_FACTOR, on by default) has no
-        # multi-token verify path: its metadata builder refuses a speculative
-        # config, which surfaces only at KV-cache init, minutes into startup.
-        # Use the dense paged KV cache instead, or refuse an explicit request
-        # now. The switch is read from the environment by every process, so set
-        # it before the engine core starts.
-        if vllm_config.speculative_config is not None:
+        # The TPA-factorized KV cache (OLALA_TPA_FACTOR, on by default) has a
+        # multi-token verify path only under OLALA_TPA_FACTOR_SPEC=1 (opt-in;
+        # tpa_factor.factor_spec_enabled reads the same switch). Without it the
+        # factor metadata builder refuses a speculative config, which surfaces
+        # only at KV-cache init, minutes into startup: use the dense paged KV
+        # cache instead, or refuse an explicit request now. The switch is read
+        # from the environment by every process, so set it before the engine
+        # core starts.
+        spec_factor = os.environ.get("OLALA_TPA_FACTOR_SPEC", "0") == "1"
+        if vllm_config.speculative_config is not None and spec_factor:
+            if os.environ.get("OLALA_TPA_FACTOR", "1") != "0":
+                logger.info(
+                    "Olala: speculative decoding keeps the TPA-factorized KV "
+                    "cache (OLALA_TPA_FACTOR_SPEC=1)."
+                )
+        elif vllm_config.speculative_config is not None:
             factor = os.environ.get("OLALA_TPA_FACTOR")
             if factor is None:
                 os.environ["OLALA_TPA_FACTOR"] = "0"
@@ -1273,8 +1282,9 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
                 )
             elif factor != "0":
                 raise ValueError(
-                    "The TPA-factorized KV cache does not support speculative "
-                    "decoding; unset OLALA_TPA_FACTOR or set it to 0."
+                    "The TPA-factorized KV cache supports speculative decoding "
+                    "only with OLALA_TPA_FACTOR_SPEC=1; set it, or unset "
+                    "OLALA_TPA_FACTOR or set it to 0."
                 )
 
         # Chunked prefill (continuation chunks run in the packed varlen call

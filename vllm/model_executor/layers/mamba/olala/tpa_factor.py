@@ -76,6 +76,31 @@ def _min_split_tokens() -> int:
 
 
 SPLIT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+SPEC_BLOCK_ALIGN = 16  # factor block granularity under OLALA_TPA_FACTOR_SPEC on sm_80 / sm_120
+
+
+@lru_cache(maxsize=1)
+def factor_spec_enabled() -> bool:
+    """OLALA_TPA_FACTOR_SPEC=1 (opt-in): keep the factor cache under speculative
+    decoding. Verify rows write their factor rows with factor_decode_write_spec
+    (column-slot or light-column token shift) and attend through the decode
+    kernel, one virtual single-token row per verify position. Off: the factor
+    cache refuses a speculative config (use OLALA_TPA_FACTOR=0)."""
+    return os.environ.get("OLALA_TPA_FACTOR_SPEC", "0") == "1"
+
+
+def block_align() -> int:
+    """Block-size granularity of the factor cache.
+
+    The Hopper and sm_100 kernels stream 13-token TMA tiles, and so does the
+    Volta kernel's launch contract. The mma.sync kernel (sm_80 / sm_120)
+    resolves every token through the block table, so under
+    OLALA_TPA_FACTOR_SPEC it takes 16-token blocks: next to a drafter's
+    16-token backend, lcm(13, 16) = 208 would otherwise force 416-token
+    attention blocks (2.56 MB pages, the Mamba pages padded by 57 %)."""
+    if factor_spec_enabled() and gpu_family() in (GpuFamily.SM80, GpuFamily.SM120):
+        return SPEC_BLOCK_ALIGN
+    return TILE
 
 
 @lru_cache(maxsize=1)
@@ -116,7 +141,7 @@ def factor_cache_enabled() -> bool:
 
 
 def _factor_block_size(vllm_config: VllmConfig) -> int:
-    """Smallest multiple of TILE whose page is at least the Mamba page.
+    """Smallest multiple of block_align() whose page is at least the Mamba page.
 
     The hybrid allocator needs one page size for every group; the Mamba page
     (fixed by the SSM state, possibly already padded by the platform's
@@ -139,14 +164,17 @@ def _factor_block_size(vllm_config: VllmConfig) -> int:
         mamba_page = max(mamba_page, raw)
     except Exception:  # noqa: BLE001 - fall back to the cache config
         pass
+    align = block_align()
     if mamba_page == 0:
-        return -(-cache.block_size // TILE) * TILE
+        return -(-cache.block_size // align) * align
     rows_needed = -(-mamba_page // row_bytes)
-    return -(-rows_needed // TILE) * TILE
+    return -(-rows_needed // align) * align
 
 
 @dataclass
 class OlalaTPAFactorMetadata:
+    # Decode rows come first; under OLALA_TPA_FACTOR_SPEC they are verify rows
+    # of up to 1 + k tokens.
     num_decodes: int
     num_prefills: int
     num_decode_tokens: int
@@ -162,6 +190,31 @@ class OlalaTPAFactorMetadata:
     has_initial_state_p_cpu: list[bool] | None = None
     positions_p_cpu: list[int] | None = None  # first position of each prefill request
     tok_per_split: dict[int, torch.Tensor] | None = None  # per nsplit, device int32 (1,)
+    query_start_loc: torch.Tensor | None = None  # (num_reqs + 1,) device; OLALA_TPA_FACTOR_SPEC only
+    verify_rows: tuple[torch.Tensor, torch.Tensor] | None = None  # virtual_decode_rows() cache
+
+    def virtual_decode_rows(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(block_table, seq_lens) of one single-token decode row per decode token.
+
+        Token ``t`` of verify request ``r`` attends to its own factor row and
+        the ones before: request ``r``'s block-table row, seq_len
+        ``seq_lens[r] - qlen[r] + t + 1``. Tokens past the last request (FULL
+        CUDA-graph padding) read request 0's first row (seq_len 1). Device ops
+        of fixed shapes from the persistent query_start_loc, seq_lens and block
+        table, so a captured verify step rebuilds them on replay."""
+        if self.verify_rows is None:
+            nd, ndt = self.num_decodes, self.num_decode_tokens
+            qsl = self.query_start_loc[: nd + 1].long()
+            tok = torch.arange(ndt, device=qsl.device)
+            req = torch.searchsorted(qsl[1:], tok, right=True).clamp_(max=max(nd - 1, 0))
+            start = qsl[req]
+            qlen = qsl[req + 1] - start
+            sl = self.seq_lens[req].long() - qlen + (tok - start) + 1
+            valid = tok < qsl[nd]
+            sl = torch.where(valid, sl, torch.ones_like(sl)).clamp_(min=1).to(torch.int32)
+            req = torch.where(valid, req, torch.zeros_like(req))
+            self.verify_rows = (self.block_table.index_select(0, req), sl)
+        return self.verify_rows
 
     def split_size(self, nsplit: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Device (tok_per_split, num_active_splits) for a static split count."""
@@ -197,7 +250,7 @@ class OlalaTPAFactorBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec=None,
     ) -> list[int | MultipleOf]:
-        return [MultipleOf(TILE)]
+        return [MultipleOf(block_align())]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -226,12 +279,24 @@ class OlalaTPAFactorMetadataBuilder(AttentionMetadataBuilder[OlalaTPAFactorMetad
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        if vllm_config.speculative_config is not None:
+        self.spec = vllm_config.speculative_config is not None
+        if self.spec and not factor_spec_enabled():
             raise NotImplementedError(
-                "The TPA-factorized KV cache does not support speculative decoding; "
-                "set OLALA_TPA_FACTOR=0 to use the dense paged KV cache."
+                "The TPA-factorized KV cache does not support speculative decoding "
+                "unless OLALA_TPA_FACTOR_SPEC=1; set OLALA_TPA_FACTOR=0 to use the "
+                "dense paged KV cache."
             )
-        self._init_reorder_batch_threshold(1)
+        # OLALA_TPA_FACTOR_SPEC: verify rows (up to 1 + k tokens) are decode rows,
+        # split exactly as the Olala state builders split them.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=self.spec)
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        if vllm_config.speculative_config is not None and factor_spec_enabled():
+            # FULL graphs for uniform verify batches (the virtual decode rows are
+            # rebuilt in-graph), as the Olala state builders.
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def build(
         self,
@@ -240,7 +305,14 @@ class OlalaTPAFactorMetadataBuilder(AttentionMetadataBuilder[OlalaTPAFactorMetad
         fast_build: bool = False,
     ) -> OlalaTPAFactorMetadata:
         m = common_attn_metadata
-        nd, np_, ndt, npt = split_decodes_and_prefills(m, decode_threshold=1)
+        if self.spec:
+            nd, np_, ndt, npt = split_decodes_and_prefills(
+                m,
+                decode_threshold=self.reorder_batch_threshold,
+                treat_short_extends_as_decodes=(m.is_prefilling is None),
+            )
+        else:
+            nd, np_, ndt, npt = split_decodes_and_prefills(m, decode_threshold=1)
         qsl_p = seq_p = init_p = pos_p = None
         if np_ > 0:
             qsl_cpu = m.query_start_loc_cpu[nd:]
@@ -275,6 +347,7 @@ class OlalaTPAFactorMetadataBuilder(AttentionMetadataBuilder[OlalaTPAFactorMetad
             seq_lens_p_cpu=seq_p,
             has_initial_state_p_cpu=init_p,
             positions_p_cpu=pos_p,
+            query_start_loc=m.query_start_loc if self.spec else None,
         )
 
 
@@ -634,6 +707,184 @@ def factor_decode_write(
 
 
 # --------------------------------------------------------------------------
+# Verify row writer (OLALA_TPA_FACTOR_SPEC): one program per (request, kv head)
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _factor_raw(n, h, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n, R: tl.constexpr, D: tl.constexpr):
+    """Raw (pre-shift) K / V of token n, kv head h: the rounding points of _factor_decode_write_kernel."""
+    offs = tl.arange(0, D)
+    k = tl.zeros([D], dtype=tl.float32)
+    v = tl.zeros([D], dtype=tl.float32)
+    for r in range(R):
+        ak_r = tl.load(ak_ptr + n * sa_n + h * R + r).to(tl.float32)
+        av_r = tl.load(av_ptr + n * sa_n + h * R + r).to(tl.float32)
+        k += ak_r * tl.load(bk_ptr + n * sb_n + r * D + offs).to(tl.float32)
+        v += av_r * tl.load(bv_ptr + n * sb_n + r * D + offs).to(tl.float32)
+    k = (k.to(tl.bfloat16).to(tl.float32) / R).to(tl.bfloat16).to(tl.float32)
+    v = (v.to(tl.bfloat16).to(tl.float32) / R).to(tl.bfloat16).to(tl.float32)
+    return k, v
+
+
+@triton.jit
+def _factor_row_write(n, h, k, kp, ak_prev, av_prev, ak_cur, av_cur, a_k, a_v, pos,
+                      bk_ptr, bv_ptr, sb_n, cslots_ptr, kplane_ptr, vplane_ptr, BS, bstride,
+                      q_ptr, sq_n, qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr,
+                      HKV: tl.constexpr, GQ: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
+                      ROWP_: tl.constexpr, OFF_C_: tl.constexpr, OFF_D_: tl.constexpr):
+    """Factor row ``[B' | C | D]`` and normalized, scaled q of token n / kv head h from its raw K,
+    the previous raw K ``kp`` and the shift gates: the arithmetic of _factor_decode_write_kernel
+    (same rounding points)."""
+    offs = tl.arange(0, D)
+    offr = tl.arange(0, R)
+    ks = (a_k * kp + (1.0 - a_k) * k).to(tl.bfloat16).to(tl.float32)
+    inv = 1.0 / tl.sqrt(tl.sum(ks * ks, axis=0) / D + eps)
+    cslot = tl.load(cslots_ptr + n)
+    valid = cslot >= 0
+    cs = tl.maximum(cslot, 0).to(tl.int64)
+    crow = (cs // BS) * bstride + (cs % BS) * ROWP_
+    ck = ak_cur * ((1.0 - a_k) * inv / R)
+    dk = ak_prev * (a_k * inv / R)
+    cv = av_cur * ((1.0 - a_v) / R)
+    dv = av_prev * (a_v / R)
+    m_r = valid & (offr >= 0)
+    tl.store(kplane_ptr + crow + OFF_C_ + h * R + offr, ck.to(kplane_ptr.dtype.element_ty), mask=m_r)
+    tl.store(kplane_ptr + crow + OFF_D_ + h * R + offr, dk.to(kplane_ptr.dtype.element_ty), mask=m_r)
+    tl.store(vplane_ptr + crow + OFF_C_ + h * R + offr, cv.to(vplane_ptr.dtype.element_ty), mask=m_r)
+    tl.store(vplane_ptr + crow + OFF_D_ + h * R + offr, dv.to(vplane_ptr.dtype.element_ty), mask=m_r)
+    kw = (1.0 + tl.load(kw_ptr + offs).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    if h < R:
+        b = tl.load(bk_ptr + n * sb_n + h * D + offs).to(tl.float32)
+        tl.store(kplane_ptr + crow + h * D + offs, (b * kw).to(kplane_ptr.dtype.element_ty), mask=valid & (offs >= 0))
+    elif h < 2 * R:
+        hr = h - R
+        b = tl.load(bv_ptr + n * sb_n + hr * D + offs)
+        tl.store(vplane_ptr + crow + hr * D + offs, b.to(vplane_ptr.dtype.element_ty), mask=valid & (offs >= 0))
+    qw = (1.0 + tl.load(qw_ptr + offs).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    p1 = tl.maximum(pos.to(tl.float32) + 1.0, 1.0)
+    if wsize > 0:
+        p1 = tl.minimum(p1, wsize)
+    log_pos = tl.log(p1).to(tl.bfloat16).to(tl.float32)
+    for j in range(GQ):
+        hq = h * GQ + j
+        q = tl.load(q_ptr + n * sq_n + hq * D + offs).to(tl.float32)
+        inv_q = 1.0 / tl.sqrt(tl.sum(q * q, axis=0) / D + eps)
+        qn = (q * inv_q).to(tl.bfloat16).to(tl.float32)
+        qn = (qn * qw).to(tl.bfloat16).to(tl.float32)
+        sc = tl.load(scaler_ptr + hq).to(tl.bfloat16).to(tl.float32)
+        scale = (sc * log_pos).to(tl.bfloat16).to(tl.float32)
+        tl.store(qo_ptr + n * (HKV * GQ * D) + hq * D + offs, (qn * scale).to(tl.bfloat16))
+
+
+@triton.jit
+def _factor_decode_write_spec_kernel(
+    q_ptr, sq_n, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n, alk_ptr, alv_ptr, sal_n,
+    pos_ptr, qsl_ptr, cols_ptr, scol, ncols, acc_ptr, lanes, N, cslots_ptr,
+    kpool_ptr, vpool_ptr, sp_n, sp_h, sp_c, akpool_ptr, avpool_ptr, sap_n, sap_h, sap_c, P,
+    qw_ptr, kw_ptr, eps, scaler_ptr, wsize, kplane_ptr, vplane_ptr, BS, bstride, qo_ptr,
+    HKV: tl.constexpr, GQ: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
+    ROWP_: tl.constexpr, OFF_C_: tl.constexpr, OFF_D_: tl.constexpr, LIGHT: tl.constexpr,
+):
+    """factor_decode_write for verify rows (column-slot protocol, olala_spec_utils; the protocol of
+    tpa_decode_qkv_spec): one program per (request, kv head) walks the request's positions in order.
+    Position 0 shifts against the token-shift column of the accepted state, position t > 0 against
+    position t - 1; position t's raw K/V and A go to column t (LIGHT: in-page column t of the slot)
+    and its factor row to its cache slot. Program ``lanes`` passes the CUDA-graph padding rows past
+    the last request through unshifted, without pool writes (their cache slots are -1)."""
+    r = tl.program_id(0)
+    h = tl.program_id(1)
+    offs = tl.arange(0, D)
+    offr = tl.arange(0, R)
+    if r < lanes:
+        start = tl.load(qsl_ptr + r)
+        qlen = tl.minimum(tl.load(qsl_ptr + r + 1) - start, ncols)
+        c0 = tl.maximum(tl.load(acc_ptr + r) - 1, 0)
+        if LIGHT:
+            c0 = tl.minimum(c0, ncols - 1)
+            irow = tl.minimum(tl.maximum(tl.load(cols_ptr + r * scol), 0), P - 1).to(tl.int64)
+            ioff = irow * sp_n + c0.to(tl.int64) * sp_c
+            iaoff = irow * sap_n + c0.to(tl.int64) * sap_c
+        else:
+            irow = tl.minimum(tl.maximum(tl.load(cols_ptr + r * scol + c0), 0), P - 1).to(tl.int64)
+            ioff = irow * sp_n
+            iaoff = irow * sap_n
+        kprev = tl.load(kpool_ptr + ioff + h * sp_h + offs).to(tl.float32)
+        akp = tl.load(akpool_ptr + iaoff + h * sap_h + offr).to(tl.float32)
+        avp = tl.load(avpool_ptr + iaoff + h * sap_h + offr).to(tl.float32)
+        for t in range(qlen):
+            n = start + t
+            k, v = _factor_raw(n, h, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n, R, D)
+            a_k = tl.sigmoid(tl.load(alk_ptr + n * sal_n + h).to(tl.float32))
+            a_v = tl.sigmoid(tl.load(alv_ptr + n * sal_n + h).to(tl.float32))
+            pos = tl.load(pos_ptr + n)
+            a_k = tl.where(pos == 0, 0.0, a_k)
+            a_v = tl.where(pos == 0, 0.0, a_v)
+            ak_cur = tl.load(ak_ptr + n * sa_n + h * R + offr).to(tl.float32)
+            av_cur = tl.load(av_ptr + n * sa_n + h * R + offr).to(tl.float32)
+            ak_prev = tl.where(pos == 0, 0.0, akp)
+            av_prev = tl.where(pos == 0, 0.0, avp)
+            if LIGHT:
+                doff = irow * sp_n + t * sp_c
+                daoff = irow * sap_n + t * sap_c
+            else:
+                drow = tl.minimum(tl.maximum(tl.load(cols_ptr + r * scol + t), 0), P - 1).to(tl.int64)
+                doff = drow * sp_n
+                daoff = drow * sap_n
+            tl.store(kpool_ptr + doff + h * sp_h + offs, k.to(kpool_ptr.dtype.element_ty))
+            tl.store(vpool_ptr + doff + h * sp_h + offs, v.to(vpool_ptr.dtype.element_ty))
+            tl.store(akpool_ptr + daoff + h * sap_h + offr, ak_cur.to(akpool_ptr.dtype.element_ty))
+            tl.store(avpool_ptr + daoff + h * sap_h + offr, av_cur.to(avpool_ptr.dtype.element_ty))
+            _factor_row_write(n, h, k, kprev, ak_prev, av_prev, ak_cur, av_cur, a_k, a_v, pos,
+                              bk_ptr, bv_ptr, sb_n, cslots_ptr, kplane_ptr, vplane_ptr, BS, bstride,
+                              q_ptr, sq_n, qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr,
+                              HKV, GQ, R, D, ROWP_, OFF_C_, OFF_D_)
+            # the pools keep bf16: the next position shifts against the stored values
+            kprev = k.to(kpool_ptr.dtype.element_ty).to(tl.float32)
+            akp = ak_cur.to(akpool_ptr.dtype.element_ty).to(tl.float32)
+            avp = av_cur.to(avpool_ptr.dtype.element_ty).to(tl.float32)
+    else:
+        for n in range(tl.load(qsl_ptr + lanes), N):
+            k, v = _factor_raw(n, h, ak_ptr, av_ptr, sa_n, bk_ptr, bv_ptr, sb_n, R, D)
+            zero_r = tl.zeros([R], dtype=tl.float32)
+            pos = tl.load(pos_ptr + n)
+            _factor_row_write(n, h, k, k, zero_r, zero_r, zero_r, zero_r, 0.0, 0.0, pos,
+                              bk_ptr, bv_ptr, sb_n, cslots_ptr, kplane_ptr, vplane_ptr, BS, bstride,
+                              q_ptr, sq_n, qw_ptr, kw_ptr, eps, scaler_ptr, wsize, qo_ptr,
+                              HKV, GQ, R, D, ROWP_, OFF_C_, OFF_D_)
+
+
+def factor_decode_write_spec(
+    q_all, A_k, A_v, B_k, B_v, alpha_k, alpha_v, positions, qsl, cols, num_accepted, cache_slots,
+    k_pool, v_pool, ak_pool, av_pool, q_w, k_w, eps, scaler, wsize, kplane, vplane, gq,
+) -> torch.Tensor:
+    """factor_decode_write for a verify batch (decode rows only, ragged per request): ``qsl``
+    (lanes + 1,) decode-token offsets, ``cols`` (lanes, 1 + k) token-shift pool columns,
+    ``num_accepted`` (lanes,) previous acceptance, ``cache_slots`` (N,) factor-row slots (-1:
+    padding). With light columns (4-D pools (slots, 1 + k, kv, .)) ``cols`` holds the slot in
+    column 0. Returns the (N, HQ * D) normalized, scaled q of every row."""
+    n = q_all.shape[0]
+    q_out = torch.empty(n, HQ * HEAD_DIM, dtype=q_all.dtype, device=q_all.device)
+    lanes = cols.shape[0]
+    light = k_pool.dim() == 4
+    ncols = k_pool.shape[1] if light else cols.shape[1]
+    sp_h, sp_c = (k_pool.stride(2), k_pool.stride(1)) if light else (k_pool.stride(1), 0)
+    sap_h, sap_c = (ak_pool.stride(2), ak_pool.stride(1)) if light else (ak_pool.stride(1), 0)
+    assert v_pool.stride() == k_pool.stride() and av_pool.stride() == ak_pool.stride()
+    _factor_decode_write_spec_kernel[(lanes + 1, HKV)](
+        q_all, q_all.stride(0), A_k, A_v, A_k.stride(0), B_k, B_v, B_k.stride(0),
+        alpha_k, alpha_v, alpha_k.stride(0),
+        positions, qsl, cols, cols.stride(0), ncols, num_accepted, lanes, n, cache_slots,
+        k_pool, v_pool, k_pool.stride(0), sp_h, sp_c, ak_pool, av_pool, ak_pool.stride(0), sap_h, sap_c,
+        k_pool.shape[0],
+        q_w, k_w, eps, scaler, float(wsize), kplane, vplane, kplane.shape[1], kplane.stride(0), q_out,
+        HKV=HKV, GQ=gq, R=RANK, D=HEAD_DIM, ROWP_=ROWP, OFF_C_=OFF_C, OFF_D_=OFF_D, LIGHT=light,
+        num_warps=2,
+    )
+    return q_out
+
+
+# --------------------------------------------------------------------------
 # Decode attention: JIT CUDA kernel + split combine
 # --------------------------------------------------------------------------
 
@@ -789,6 +1040,19 @@ def num_splits_for_batch(batch: int) -> int:
         return next((n for b, n in reversed(table) if b <= batch), table[0][1])
     want = max(1, min(128, _target_ctas() // batch))
     return 1 << (want.bit_length() - 1)
+
+
+SPEC_MIN_SPLITS = 8  # OLALA_TPA_FACTOR_SPEC: floor of the KV split count of the verify rows
+
+
+def num_splits_for_verify(num_requests: int) -> int:
+    """KV splits of the virtual decode rows of a verify step (OLALA_TPA_FACTOR_SPEC): sized for the verify
+    requests, as a decode of them would be, not for their 1 + K rows (the rows of a request walk the same
+    context, and split_size cuts every row by the batch's longest one, so a count sized for the rows leaves that
+    request's few CTAs walking most of a long context alone), with a floor of SPEC_MIN_SPLITS for the same reason
+    at large batches. Splits past a row's context stay empty (cheap). Static for a FULL graph: the request count
+    of a uniform verify batch is its padded token count over 1 + K."""
+    return max(num_splits_for_batch(num_requests), SPEC_MIN_SPLITS)
 
 
 def factor_decode_attention(

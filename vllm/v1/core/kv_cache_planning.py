@@ -397,6 +397,16 @@ def unify_kv_cache_spec_page_size(
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):
+                # Opt-in (VLLM_UNIFY_FLOOR_SCALE=1): scale the block by the whole
+                # page ratio first, then pad the remainder. Padding a much smaller
+                # page as is (e.g. a 4-KV-head drafter next to a target page that
+                # is not an exact multiple) wastes most of every block; the larger
+                # block must still split into the backend's kernel blocks.
+                ratio = max_page_size // layer_page_size
+                if ratio > 1 and os.environ.get("VLLM_UNIFY_FLOOR_SCALE", "0") == "1":
+                    layer_spec = replace(
+                        layer_spec, block_size=layer_spec.block_size * ratio
+                    )
                 new_spec = replace(layer_spec, page_size_padded=max_page_size)
             else:
                 raise NotImplementedError(
