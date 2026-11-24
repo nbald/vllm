@@ -105,9 +105,9 @@ def _mid_rows_gpu() -> bool:
 
 def _mid_rows_cfg(M: int, N: int, K: int) -> dict | None:
     """Triton W8A16 GEMM tiles for a draft linear of M rows on an sm_86-class GPU, or None (the generic W8A16
-    dispatch). From a config search on the drafter's shapes (RTX 3080, M = 48-256, scratch/spec_state/tools/
-    tune_w8a16_drafter.py): per draft step at 192 rows (32 requests) 1.19 -> 0.88 ms against 0.84 ms for bf16;
-    at 48 / 96 rows 0.61 -> 0.42 / 0.88 -> 0.59 ms against 0.50 / 0.72 ms."""
+    dispatch). From a config search on the drafter's shapes (RTX 3080, M = 48-256): per draft step at 192 rows
+    (32 requests) 1.19 -> 0.88 ms against 0.84 ms for bf16; at 48 / 96 rows 0.61 -> 0.42 / 0.88 -> 0.59 ms against
+    0.50 / 0.72 ms."""
     if not (_MID_ROWS[0] <= M <= _MID_ROWS[1]) or K % 128 or not _mid_rows_gpu():
         return None
     if K >= 3072:  # narrow, long-K weights (down 1536 x 4096, fc 1536 x 7680): more column tiles
