@@ -72,6 +72,8 @@ _FUSED_OFF = frozenset(g for g in os.environ.get("OLALA_DSPINE_FUSED_OFF", "").s
 
 def _group(name: str) -> bool:
     return HAND_FUSED and name not in _FUSED_OFF
+
+
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
 CUDA_NORM = os.environ.get("OLALA_DSPINE_CUDA_NORM", "0") == "1"
 # OLALA_DSPINE_INT8 unset: on for these compute-capability majors (V100, A100 / RTX 30-40, RTX 50),
@@ -576,7 +578,9 @@ def hand_context_kv(inner: nn.Module, context_states, context_positions, context
     if inner._fused_kv_scale is not None:
         from vllm.model_executor.layers.quantization.utils.w8a16_utils import w8a16_int8_linear
 
-        all_kv = w8a16_int8_linear(normed, inner._fused_kv_weight, inner._fused_kv_scale)
+        # the drafter's own INT8 dispatch when install_int8 set one, as DFlash's path
+        int8_linear = getattr(inner, "_fused_kv_int8_linear", w8a16_int8_linear)
+        all_kv = int8_linear(normed, inner._fused_kv_weight, inner._fused_kv_scale)
     else:
         all_kv = F.linear(normed, inner._fused_kv_weight, inner._fused_kv_bias)
     ctx_kv_store(
