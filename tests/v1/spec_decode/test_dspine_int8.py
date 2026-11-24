@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OLALA_DSPINE_INT8 (qwen3_dspine_fast.py): per-channel RTN of the drafter's
-bf16 linears and their W8A16 apply (the target's ModelOptW8A16LinearMethod).
+bf16 linears and their W8A16 apply (the target's ModelOptW8A16LinearMethod),
+and the default (on for SM70 / the SM80 family / SM120).
 
 The quantizer is checked on CPU (symmetric per-row scales, the rounding bound,
 exact zeros). On a GPU the INT8 linear method matches ``x @ (scale * q).T`` on
@@ -16,7 +17,40 @@ from torch import nn
 from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
     ModelOptW8A16LinearMethod,
 )
-from vllm.model_executor.models.qwen3_dspine_fast import _INT8_NAME, quantize_int8_rtn
+from vllm.model_executor.models.qwen3_dspine_fast import (
+    _INT8_NAME,
+    int8_enabled,
+    quantize_int8_rtn,
+)
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+
+
+def _gpu(monkeypatch, cap):
+    monkeypatch.setattr(
+        current_platform, "get_device_capability",
+        lambda device_id=0: None if cap is None else DeviceCapability(*cap),
+        raising=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "cap,value,on",
+    [
+        ((7, 0), None, True), ((8, 0), None, True), ((8, 6), None, True), ((8, 9), None, True),
+        ((12, 0), None, True), ((9, 0), None, False), ((10, 0), None, False), (None, None, False),
+        ((12, 0), "0", False), ((8, 6), "0", False), ((9, 0), "1", True), ((12, 0), "1", True),
+    ],
+)
+def test_default_on_measured_gpus(monkeypatch, cap, value, on):
+    """CPU: OLALA_DSPINE_INT8 unset is on for SM70 / the SM80 family / SM120 only;
+    0 and 1 override it on any GPU."""
+    _gpu(monkeypatch, cap)
+    if value is None:
+        monkeypatch.delenv("OLALA_DSPINE_INT8", raising=False)
+    else:
+        monkeypatch.setenv("OLALA_DSPINE_INT8", value)
+    assert int8_enabled() is on
 
 
 def test_rtn_is_symmetric_per_channel():

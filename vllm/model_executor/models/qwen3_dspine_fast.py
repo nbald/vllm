@@ -19,7 +19,9 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
 - ``OLALA_DSPINE_CUDA_NORM=1``: the drafter's RMSNorms call vLLM's CUDA
   ``rms_norm`` / ``fused_add_rms_norm`` kernels instead of the native chain
   (~8 kernels each, opaque to the compile above). The target is untouched.
-- ``OLALA_DSPINE_INT8=1``: the drafter's decoder linears (qkv, o, gate_up,
+- ``OLALA_DSPINE_INT8`` (on by default on the GPUs where it was measured:
+  SM70, the SM80 family, SM120; ``0`` turns it off, ``1`` forces it on
+  elsewhere): the drafter's decoder linears (qkv, o, gate_up,
   down) and its context projection ``fc`` are quantized at load time to INT8
   with one fp32 scale per output channel (symmetric RTN of the bf16 weights,
   as the Q8 target) and run through the target's W8A16 linear method
@@ -48,7 +50,22 @@ FUSED = FUSED_MODE in ("1", "2")
 COMPILE_LAYERS = FUSED_MODE == "2"
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
 CUDA_NORM = os.environ.get("OLALA_DSPINE_CUDA_NORM", "0") == "1"
-INT8 = os.environ.get("OLALA_DSPINE_INT8", "0") == "1"
+# OLALA_DSPINE_INT8 unset: on for these compute-capability majors (V100, A100 / RTX 30-40, RTX 50),
+# where offline acceptance and served throughput were measured against the bf16 drafter.
+_INT8_DEFAULT_MAJORS = (7, 8, 12)
+
+
+def int8_enabled() -> bool:
+    """OLALA_DSPINE_INT8: ``1`` on, ``0`` off, unset = on for _INT8_DEFAULT_MAJORS."""
+    raw = os.environ.get("OLALA_DSPINE_INT8", "")
+    if raw in ("0", "1"):
+        return raw == "1"
+    from vllm.platforms import current_platform
+
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap.major in _INT8_DEFAULT_MAJORS
+
+
 # The linears OLALA_DSPINE_INT8 quantizes: decoder projections and the context projection.
 _INT8_NAME = re.compile(r"(^|\.)layers\.\d+\.(self_attn\.(qkv|o)_proj|mlp\.(gate_up|down)_proj)$|(^|\.)fc$")
 
@@ -353,7 +370,7 @@ def apply_fast_path(model: nn.Module) -> None:
     Called after every load_weights; idempotent."""
     if FUSED:
         refresh_fused_weights(model.model.injection)
-    if INT8:
+    if int8_enabled():
         install_int8(model)
     if GEMV:
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
