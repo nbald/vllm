@@ -28,10 +28,13 @@ vllm serve /path/to/target \
   `--attention-backend`, which also changes the target's kernels.
 - Watermarking is not supported, as for the other candidate-head drafters.
 - With an Olala target, the TPA-factorized KV cache (`OLALA_TPA_FACTOR`, on by
-  default) has a multi-token verify path only with `OLALA_TPA_FACTOR_SPEC=1`
-  (opt-in). Without it, a speculative config turns the factor cache off, with a
-  log line, and uses the dense paged KV cache; `OLALA_TPA_FACTOR=1` set
-  explicitly is refused at startup.
+  default) keeps its verify path, F1 (`OLALA_TPA_FACTOR_SPEC`), on by default
+  on the GPUs where it was measured: SM70 (V100), the SM80 family (Ampere / Ada)
+  and SM120 (consumer Blackwell), with a log line. Its accuracy is that of the
+  factor cache (the verify adds no loss of its own) and it doubles the KV
+  capacity. Elsewhere, or with `OLALA_TPA_FACTOR_SPEC=0`, a speculative config
+  turns the factor cache off, with a log line, and uses the dense paged KV
+  cache; `OLALA_TPA_FACTOR=1` set explicitly is then refused at startup.
 
 ## Checkpoint format
 
