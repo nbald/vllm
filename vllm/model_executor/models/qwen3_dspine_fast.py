@@ -29,7 +29,11 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   injection and transition weights, the codebook and the norms stay bf16
   (they are read directly by the fused functions). Halves the bytes of those
   linears per draft step (about 0.15 ms on a V100); weight reloads after the
-  quantization are not supported.
+  quantization are not supported. On sm_86-class GPUs (GeForce / workstation
+  Ampere and Ada) the draft steps of 33-256 rows (6 to 42 requests at K = 5)
+  take the Triton W8A16 GEMM with tiles tuned for them (_mid_rows_cfg): there
+  the generic W8A16 dispatch, tuned on an RTX 5090, ran 1.2-1.4x the bf16
+  drafter's linears.
 
 The fused functions keep the eager casts and order of operations; they are
 not bit-identical to it (different GEMM splits and fusion), so they are
@@ -44,6 +48,11 @@ import re
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
+    ModelOptW8A16LinearMethod,
+)
+from vllm.utils.torch_utils import direct_register_custom_op
 
 FUSED_MODE = os.environ.get("OLALA_DSPINE_FUSED", "0")
 FUSED = FUSED_MODE in ("1", "2")
@@ -68,6 +77,91 @@ def int8_enabled() -> bool:
 
 # The linears OLALA_DSPINE_INT8 quantizes: decoder projections and the context projection.
 _INT8_NAME = re.compile(r"(^|\.)layers\.\d+\.(self_attn\.(qkv|o)_proj|mlp\.(gate_up|down)_proj)$|(^|\.)fc$")
+
+# Rows of a drafter INT8 linear that take the Triton W8A16 GEMM with _mid_rows_cfg's tiles on sm_86-class GPUs: 6 per
+# request at K = 5, so 6 to 42 requests; the range of the config search. Outside it the target's dispatch stays (the
+# tiles lost to it at 384 rows for the long-K weights).
+_MID_ROWS = (33, 256)
+
+
+def _mid_rows_gpu() -> bool:
+    """GeForce / workstation Ampere and Ada (sm_86 - sm_89): bf16 MMA with fp32 accumulation at half rate and
+    ~100 KB of shared memory per SM, so from a few dozen rows the draft linears are compute bound and the generic
+    W8A16 dispatch (tuned on an RTX 5090: the skinny decode kernels up to 64 / 128 rows, dequantize + cuBLAS for
+    narrow weights) lost to bf16 cuBLAS. Not sm_80 (A100: full-rate tensor cores, HBM) and not a V100 through
+    volta-forever (it reports 8.0): neither was measured."""
+    from vllm.model_executor.layers.mamba.olala.arch import (
+        GpuFamily,
+        capability,
+        gpu_family,
+    )
+
+    return (
+        gpu_family() is GpuFamily.SM80
+        and capability()[1] >= 6
+        and not os.environ.get("VOLTA_FOREVER")
+    )
+
+
+def _mid_rows_cfg(M: int, N: int, K: int) -> dict | None:
+    """Triton W8A16 GEMM tiles for a draft linear of M rows on an sm_86-class GPU, or None (the generic W8A16
+    dispatch). From a config search on the drafter's shapes (RTX 3080, M = 48-256, scratch/spec_state/tools/
+    tune_w8a16_drafter.py): per draft step at 192 rows (32 requests) 1.19 -> 0.88 ms against 0.84 ms for bf16;
+    at 48 / 96 rows 0.61 -> 0.42 / 0.88 -> 0.59 ms against 0.50 / 0.72 ms."""
+    if not (_MID_ROWS[0] <= M <= _MID_ROWS[1]) or K % 128 or not _mid_rows_gpu():
+        return None
+    if K >= 3072:  # narrow, long-K weights (down 1536 x 4096, fc 1536 x 7680): more column tiles
+        if M <= 64:
+            return dict(BM=64, BN=32, BK=128, num_warps=4, num_stages=4)
+        if M <= 128:
+            return dict(BM=64, BN=64, BK=128, num_warps=8, num_stages=3)
+        return dict(BM=32, BN=64, BK=128, num_warps=4, num_stages=3)
+    if N >= 4096:  # wide (gate_up 8192, the fused context K/V 5120)
+        if M <= 64:
+            return dict(BM=64, BN=128, BK=128, num_warps=8, num_stages=3)
+        if M <= 128:
+            return dict(BM=32, BN=128, BK=64, num_warps=4, num_stages=3)
+        return dict(BM=64, BN=128, BK=64, num_warps=4, num_stages=3)
+    if M <= 64:  # qkv 2560, o 1536
+        return dict(BM=32, BN=64, BK=128, num_warps=4, num_stages=3)
+    if M <= 128:
+        return dict(BM=64, BN=64, BK=128, num_warps=8, num_stages=3)
+    if N >= 2560:  # qkv
+        return dict(BM=64, BN=128, BK=64, num_warps=4, num_stages=3)
+    return dict(BM=32, BN=64, BK=64, num_warps=4, num_stages=3)
+
+
+def _draft_int8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """``x @ (scale * weight).T`` for the drafter's INT8 linears: the Triton W8A16 GEMM with _mid_rows_cfg's tiles
+    where it gives some, the target's W8A16 dispatch (w8a16_utils.int8_mm) everywhere else."""
+    from vllm.model_executor.layers.quantization.utils import w8a16_utils as wu
+
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    w = wu.Int8Weight(weight, scale)
+    cfg = _mid_rows_cfg(x2.shape[0], w.n, w.k) if scale.dim() == 1 and x.dtype == torch.bfloat16 else None
+    if cfg is not None:
+        y = wu.w8a16_gemm(x2 if x2.stride(-1) == 1 else x2.contiguous(), w, cfg=cfg)
+    else:
+        y = wu.int8_mm(x2, w)
+    return y.view(*shape[:-1], w.n)
+
+
+def _draft_int8_linear_fake(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(*x.shape[:-1], weight.shape[0])
+
+
+# Opaque to torch.compile (OLALA_DSPINE_FUSED=2 compiles the draft layers): the row count is dispatched at run time.
+direct_register_custom_op(
+    op_name="dspine_int8_linear",
+    op_func=_draft_int8_linear,
+    mutates_args=[],
+    fake_impl=_draft_int8_linear_fake,
+)
+
+
+def draft_int8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return torch.ops.vllm.dspine_int8_linear(x, weight, scale)
 
 _TINY = torch.finfo(torch.float32).tiny
 
@@ -314,14 +408,21 @@ def quantize_int8_rtn(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return q.contiguous(), scale.contiguous()
 
 
+class DraftW8A16LinearMethod(ModelOptW8A16LinearMethod):
+    """The target's W8A16 linear method with the drafter's row-count dispatch (draft_int8_linear)."""
+
+    def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if layer.weight_scale.dim() != 1:  # per-group scales: the target's dispatch
+            return super().apply(layer, x, bias)
+        y = draft_int8_linear(x, layer.weight, layer.weight_scale)
+        return y if bias is None else y + bias
+
+
 def install_int8(model: nn.Module) -> int:
     """Quantize the drafter linears of _INT8_NAME in place (idempotent) and
     rebuild the fused context K/V projection from the INT8 rows. Returns the
     number of linears quantized by this call."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-    from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
-        ModelOptW8A16LinearMethod,
-    )
 
     n = 0
     for name, module in model.named_modules():
@@ -337,9 +438,10 @@ def install_int8(model: nn.Module) -> int:
             q, scale = quantize_int8_rtn(weight.data)
             module.weight = nn.Parameter(q, requires_grad=False)
             module.weight_scale = nn.Parameter(scale, requires_grad=False)
-            # The target's W8A16 linear method: its apply, and its post-load step (the SM70
-            # family's fp16 tensor-core copy where that edition exists).
-            method = ModelOptW8A16LinearMethod()
+            # The target's W8A16 linear method: its post-load step (the SM70 family's fp16
+            # tensor-core copy where that edition exists); its apply, except for the row counts
+            # draft_int8_linear dispatches itself.
+            method = DraftW8A16LinearMethod()
             method.process_weights_after_loading(module)
             module.quant_method = method
             n += 1
@@ -349,6 +451,7 @@ def install_int8(model: nn.Module) -> int:
         inner._fused_kv_weight = torch.cat([a.qkv_proj.weight[a.q_size :] for a in attn], 0)
         inner._fused_kv_scale = torch.cat([a.qkv_proj.weight_scale[a.q_size :] for a in attn], 0)
         inner._fused_kv_bias = None
+        inner._fused_kv_int8_linear = draft_int8_linear
         _register_volta_tc(inner._fused_kv_weight, "dspine.fused_kv")
     return n
 
