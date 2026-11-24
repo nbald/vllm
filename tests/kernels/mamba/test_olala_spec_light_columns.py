@@ -16,12 +16,15 @@ like the pages of the hybrid allocator.
 
 import pytest
 import torch
+from vllm.model_executor.layers.mamba.olala import state as st
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import tpa_decode_qkv_spec
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import mamba3_verify_cuda
 
-requires_sm80 = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="needs an sm_80+ GPU",
+# The Mamba-3 light-column commit: the Volta edition of the verify kernel (SM70, natively or through
+# volta-forever, which reports sm_80) implements the column-slot protocol only and refuses light pools.
+requires_light_verify = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0) or st._sm70(),
+    reason="light-column Mamba-3 verify: tensor-core edition only (column slots on SM70)",
 )
 
 H, D, S, R, NA = 48, 64, 128, 4, 32
@@ -59,7 +62,7 @@ def _step_inputs(qlens, k):
     )
 
 
-@requires_sm80
+@requires_light_verify
 @pytest.mark.parametrize("lanes,k,steps", [(1, 3, 5), (6, 3, 6), (37, 7, 4), (3, 5, 6)])
 def test_mamba3_light_matches_column_slots(lanes, k, steps):
     torch.manual_seed(lanes * 100 + k)
@@ -148,7 +151,7 @@ def test_mamba3_light_matches_column_slots(lanes, k, steps):
     assert torch.equal(v_l[s0, 0], v_c[c0])
 
 
-@requires_sm80
+@requires_light_verify
 def test_mamba3_light_invalid_slot_and_padding_lane():
     """A lane without a valid slot gets zero outputs and writes nothing; a
     zero-length lane is skipped."""
