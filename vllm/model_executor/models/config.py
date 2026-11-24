@@ -1358,6 +1358,45 @@ def _olala_graphs_cap() -> str:
         return "4096"
 
 
+def _olala_spec_decode_sizes(vllm_config: "VllmConfig", limit: int) -> list[int]:
+    """Exact uniform decode sizes n * (1 + K) for every draft length K the scheduler can pick, up to `limit` tokens.
+
+    The model runner captures a FULL decode graph only for a capture size that is a whole number of requests at the
+    step's query length, and a decode step pads up to the next such size. vLLM's default list adds these sizes; the
+    Olala lists below replace it, so without them a K = 2 step of 4 requests (12 tokens) pads to the 18-token graph
+    and a K = 5 step of 5 requests (30 tokens) to the 36-token one. A padded step costs more than its extra rows:
+    V100 at K = 2 and 4 requests, 26.4 ms against 13.2 ms for the unpadded K = 1 step (draft 6.5 ms against 2.1).
+
+    Static K: n = 1 .. max_num_seqs at 1 + K. Dynamic K: the same for num_speculative_tokens (the DFlash drafter drafts
+    its full block whatever the scheduled length), plus every tier of the batch-size schedule up to the widest batch
+    it serves (K = 0 tiers included, at one token per request). OLALA_SPEC_GRAPHS_MAX_REQS caps n (default 32);
+    larger batches keep the coarse ladder. Empty without speculative decoding.
+    """
+    spec = vllm_config.speculative_config
+    num_spec = int(getattr(spec, "num_speculative_tokens", 0) or 0) if spec is not None else 0
+    if num_spec <= 0:
+        return []
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    max_reqs = min(max_num_seqs, int(os.environ.get("OLALA_SPEC_GRAPHS_MAX_REQS", "32")))
+    widest = {num_spec: max_num_seqs}  # draft length -> widest batch that uses it
+    if spec.uses_dynamic_speculative_decoding():
+        from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+
+        try:
+            dense = build_dynamic_sd_schedule_lookup(
+                spec.num_speculative_tokens_per_batch_size,
+                vllm_max_batch_size=max_num_seqs,
+                vllm_num_speculative_tokens=num_spec,
+            )
+        except ValueError:  # validated elsewhere; an invalid schedule keeps the static sizes
+            dense = []
+        for batch_size, k in enumerate(dense[1:], start=1):
+            widest[k] = max(widest.get(k, 0), batch_size)
+    return sorted(
+        {n * (k + 1) for k, reqs in widest.items() for n in range(1, min(reqs, max_reqs) + 1) if n * (k + 1) <= limit}
+    )
+
+
 def _olala_prefill_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
     """Piecewise CUDA graphs up to the chunked-prefill budget.
 
@@ -1365,7 +1404,8 @@ def _olala_prefill_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
     (norms, MoE, geodesic, residuals) cost more host time than GPU time. Capturing them for
     prefill-sized batches is +22% prefill throughput at 2048-token chunks on H100. vLLM's default
     stops at 512 tokens; Olala keeps those sizes and adds a coarse ladder up to the token budget
-    (padding <= ~25% up to 8k, a size every 4k above), unless the user set capture sizes.
+    (padding <= ~25% up to 8k, a size every 4k above), unless the user set capture sizes. Under speculative
+    decoding the list also takes the exact decode sizes (_olala_spec_decode_sizes), which vLLM adds only to its own list.
     OLALA_PREFILL_GRAPHS=0 disables, OLALA_PREFILL_GRAPHS_MAX caps the ladder (default 32768 on >= 80 GB GPUs,
     4096 below). B300, budget 32k:
     8k prefill-only 179k -> 208k tok/s vs a 4k cap (8k/1k mixed c=128 / 256 unchanged), +2.9 GiB of graphs.
@@ -1383,6 +1423,7 @@ def _olala_prefill_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
     sizes += [n for n in (640, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192) if n < budget]
     sizes += list(range(12288, budget, 4096))  # above 8k: a size every 4k (a mixed step pads <= 33%)
     sizes.append(budget)
+    sizes += _olala_spec_decode_sizes(vllm_config, budget)
     cc.cudagraph_capture_sizes = sorted(set(sizes))
     cc.max_cudagraph_capture_size = budget
     logger.info("Olala: piecewise CUDA graphs up to %d tokens (prefill chunks).", budget)
@@ -1395,7 +1436,8 @@ def _olala_decode_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
     graph: the opaque Mamba / DiffTPA ops and the layers between them launch
     eagerly. On B300 with 1024 concurrent 1k/1k requests that is 8.6k tok/s, vs
     20.9k with graphs up to 1024 (+28 s capture, +0.8 GiB). Skipped when the
-    user set capture sizes; OLALA_DECODE_GRAPHS_MAX caps it (default 2048).
+    user set capture sizes; OLALA_DECODE_GRAPHS_MAX caps it (default 2048). Under speculative decoding the
+    list is set here, vLLM's grid up to the ceiling plus the exact decode sizes (_olala_spec_decode_sizes).
     """
     cc = vllm_config.compilation_config
     sc = vllm_config.scheduler_config
@@ -1408,6 +1450,11 @@ def _olala_decode_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
     if target <= 512:
         return
     cc.max_cudagraph_capture_size = target
+    spec_sizes = _olala_spec_decode_sizes(vllm_config, target)
+    if spec_sizes:
+        # vLLM's grid up to the ceiling, plus the exact decode sizes (it skips its own once the ceiling is set).
+        sizes = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, target + 1, 16)) + [target]
+        cc.cudagraph_capture_sizes = sorted(set(sizes + spec_sizes))
     logger.info(
         "Olala: full decode CUDA graphs up to %d requests (max_num_seqs).", target
     )
