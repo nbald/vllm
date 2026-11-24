@@ -60,12 +60,30 @@ from torch import nn
 from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
     ModelOptW8A16LinearMethod,
 )
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 FUSED_MODE = os.environ.get("OLALA_DSPINE_FUSED", "0")
 FUSED = FUSED_MODE in ("1", "2", "3")
 COMPILE_LAYERS = FUSED_MODE in ("2", "3")
 HAND_FUSED = FUSED_MODE == "3"
+_KNOWN_FUSED_MODES = ("0", "1", "2", "3")
+
+
+def check_fused_mode(mode: str) -> bool:
+    """False, with a one-line warning, for an OLALA_DSPINE_FUSED value this engine
+    does not know: the drafter then runs level 0 (the eager draft step)."""
+    if mode in _KNOWN_FUSED_MODES:
+        return True
+    logger.warning(
+        "OLALA_DSPINE_FUSED=%r is not a known level (0, 1, 2, 3): the DSpine drafter runs level 0.", mode
+    )
+    return False
+
+
+check_fused_mode(FUSED_MODE)
 # Debug / attribution: OLALA_DSPINE_FUSED_OFF=qk,ctx,prep,inject,delta,transitions turns groups of level 3 off
 # (compile: the draft layers' torch.compile of levels 2 and 3).
 _FUSED_OFF = frozenset(g for g in os.environ.get("OLALA_DSPINE_FUSED_OFF", "").split(",") if g)

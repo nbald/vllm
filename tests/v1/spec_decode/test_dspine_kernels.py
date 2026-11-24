@@ -232,3 +232,17 @@ def test_row_cap_default():
 
     assert fp.HAND_MAX_ROWS == int(__import__("os").environ.get("OLALA_DSPINE_FUSED_MAX_ROWS", "64"))
     assert fp._rows_ok(fp.HAND_MAX_ROWS) and not fp._rows_ok(fp.HAND_MAX_ROWS + 1)
+
+
+def test_unknown_fused_mode_warns(monkeypatch):
+    """CPU: an OLALA_DSPINE_FUSED value the engine does not know is reported, not
+    silently run as level 0."""
+    from vllm.model_executor.models import qwen3_dspine_fast as fp
+
+    seen = []
+    monkeypatch.setattr(fp.logger, "warning", lambda msg, *args: seen.append(msg % args))
+    for mode in ("0", "1", "2", "3"):
+        assert fp.check_fused_mode(mode)
+    assert not seen
+    assert not fp.check_fused_mode("4")
+    assert len(seen) == 1 and "'4'" in seen[0] and "level 0" in seen[0]
