@@ -34,6 +34,15 @@ def _vllm_config(speculative: bool) -> SimpleNamespace:
     )
 
 
+@pytest.fixture(autouse=True)
+def _split_env(monkeypatch):
+    # The hook also sets the split prefill defaults on measured GPUs: keep them
+    # out of the other tests' environment.
+    for var in ("OLALA_SPLIT_PREFILL", "OLALA_SPLIT_PREFILL_MAX_DECODES"):
+        monkeypatch.setenv(var, "")
+        monkeypatch.delenv(var)
+
+
 def _unset(monkeypatch):
     # setenv first so that teardown restores the original state even though
     # the hook writes os.environ directly.

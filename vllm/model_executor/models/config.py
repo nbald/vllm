@@ -1306,6 +1306,59 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
                 scheduler_config.max_num_batched_tokens,
             )
 
+        OlalaForCausalLMConfig._split_prefill_default(vllm_config)
+
+    @staticmethod
+    def _split_prefill_default(vllm_config: "VllmConfig") -> None:
+        """OLALA_SPLIT_PREFILL on by default on the GPUs where it was measured.
+
+        A step that carries prefill tokens runs the PIECEWISE graphs, where the
+        Mamba-3 and DiffTPA mixers run eagerly for every decode row; the split
+        policy (vllm/v1/core/sched/olala_split.py) keeps decode steps in the
+        FULL graphs. On SM120 and the SM80 family, unset switches default to
+        OLALA_SPLIT_PREFILL=1 with OLALA_SPLIT_PREFILL_MAX_DECODES=0 (no cap)
+        without a speculative config and 16 with one. Explicit values win.
+        Other GPUs, V100s through volta-forever included, are unchanged. The
+        scheduler reads the switches from the environment, so they are set
+        here, before the engine core starts."""
+        split = os.environ.get("OLALA_SPLIT_PREFILL")
+        max_decodes = os.environ.get("OLALA_SPLIT_PREFILL_MAX_DECODES")
+        if split is not None and (split != "1" or max_decodes is not None):
+            return
+        if not _split_default_device():
+            return
+        cap = "16" if vllm_config.speculative_config is not None else "0"
+        if split is None:
+            os.environ["OLALA_SPLIT_PREFILL"] = "1"
+        if max_decodes is None:
+            os.environ["OLALA_SPLIT_PREFILL_MAX_DECODES"] = cap
+        logger.info(
+            "Olala: split prefill on by default on this GPU "
+            "(OLALA_SPLIT_PREFILL=1, OLALA_SPLIT_PREFILL_MAX_DECODES=%s; "
+            "OLALA_SPLIT_PREFILL=0 to mix prefill and decode steps).",
+            os.environ["OLALA_SPLIT_PREFILL_MAX_DECODES"],
+        )
+
+
+# Compute capability majors where the split prefill policy is on by default:
+# SM80 family (Ampere / Ada; measured on an RTX 3080) and SM120 (RTX 5090).
+_SPLIT_DEFAULT_MAJORS = (8, 12)
+
+
+def _split_default_device() -> bool:
+    """Whether this process's GPU takes OLALA_SPLIT_PREFILL by default. A V100
+    through volta-forever (VOLTA_FOREVER, exported by its launcher) can report
+    8.0 to CUDA programs: it is not."""
+    if os.environ.get("VOLTA_FOREVER"):
+        return False
+    from vllm.platforms import current_platform
+
+    try:
+        cap = current_platform.get_device_capability()
+    except Exception:  # no GPU visible
+        return False
+    return cap is not None and cap.major in _SPLIT_DEFAULT_MAJORS
+
 
 def _olala_graphs_cap() -> str:
     """Default prefill graph cap: 32768 tokens on >= 80 GB GPUs, 4096 below (the graphs up to a 32k budget take
