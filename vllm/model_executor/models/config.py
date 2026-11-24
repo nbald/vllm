@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import os
+import sys
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -1228,14 +1229,31 @@ def _f1_default_device() -> bool:
     return cap is not None and cap.major in _F1_DEFAULT_MAJORS
 
 
-# Raised at config time (OlalaForCausalLMConfig) and, as a backstop, by the
-# Mamba-3 mixer when it is built.
+# Raised by the Mamba-3 mixer when it is built, as a backstop: with a
+# speculative config, OlalaForCausalLMConfig turns ReplaySSM off first.
 OLALA_REPLAY_SPEC_ERROR = (
     "ReplaySSM (OLALA_REPLAY_SSM={value}) does not support speculative "
     "decoding: the verify step reads and writes the full fp32 Mamba-3 state at "
     "every draft position. For speculative decoding set OLALA_REPLAY_SSM=0 "
     "(with the default --mamba-ssm-cache-dtype auto or float32: fp32 state); "
     "to keep ReplaySSM, remove --speculative-config."
+)
+
+# Logged once by OlalaForCausalLMConfig when a speculative config turns
+# ReplaySSM off (the changes, comma-separated).
+OLALA_REPLAY_SPEC_FALLBACK = (
+    "Olala: ReplaySSM has no multi-token verify, so speculative decoding uses "
+    "the fp32 Mamba-3 state (%s). The measured speculative gains are against "
+    "direct serving with ReplaySSM and include this."
+)
+
+# Raised at config time for an explicit non-fp32 SSM state under a
+# speculative config.
+OLALA_SPEC_SSM_DTYPE_ERROR = (
+    "Olala speculative decoding needs the fp32 Mamba-3 state (the verify step "
+    "reads and writes it at every draft position): --mamba-ssm-cache-dtype "
+    "{dtype} is not supported with --speculative-config. Leave it at auto or "
+    "set it to float32."
 )
 
 
@@ -1253,8 +1271,56 @@ def _replay_ssm_value() -> str | None:
         return None
 
 
+def _volta_state16_requested() -> bool:
+    """OLALA_VOLTA_STATE16 asks for the 16-bit SM70 state (olala.state.
+    volta_state16's reading, without its SM70 check): that switch sets the SSM
+    dtype itself and needs --mamba-ssm-cache-dtype auto."""
+    v = os.environ.get("OLALA_VOLTA_STATE16", "0").strip().lower()
+    return v not in ("", "0", "off", "no", "false")
+
+
 class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
     """Reconcile Olala's HF config with vLLM's hybrid-model assumptions."""
+
+    @staticmethod
+    def _spec_fp32_state(vllm_config: "VllmConfig") -> None:
+        """Under a speculative config, the fp32 Mamba-3 state that the verify
+        step reads and writes at every draft position. ReplaySSM has no
+        multi-token verify: it is turned off (OLALA_REPLAY_SSM=0, read by every
+        process, so set here, before the engine core starts) with one warning,
+        and --mamba-ssm-cache-dtype auto, which means a bf16 anchor under
+        ReplaySSM, becomes float32. An explicit non-fp32 SSM dtype is refused.
+        OLALA_VOLTA_STATE16 keeps its own dtype rule (the Mamba-3 mixer refuses
+        it with a speculative config).
+
+        If olala/spec-anchor (the ReplaySSM-anchored speculative state) is ever
+        merged, its anchored_layout() is where ReplaySSM would be kept under a
+        drafter instead of this fallback."""
+        cache_config = vllm_config.cache_config
+        dtype = getattr(cache_config, "mamba_ssm_cache_dtype", "auto")
+        if dtype not in ("auto", "float32"):
+            raise ValueError(OLALA_SPEC_SSM_DTYPE_ERROR.format(dtype=dtype))
+        changes = []
+        replay = _replay_ssm_value()
+        if replay is not None:
+            os.environ["OLALA_REPLAY_SSM"] = "0"
+            # replay_config() is cached per process: drop a value read before
+            # this hook, if the state module was already imported here.
+            state = sys.modules.get("vllm.model_executor.layers.mamba.olala.state")
+            if state is not None:
+                state.replay_config.cache_clear()
+            changes.append(f"OLALA_REPLAY_SSM={replay} -> 0")
+        if dtype == "auto" and not _volta_state16_requested():
+            cache_config.mamba_ssm_cache_dtype = "float32"
+            if replay is not None:
+                changes.append("--mamba-ssm-cache-dtype auto -> float32")
+            else:
+                logger.info(
+                    "Olala: speculative decoding uses the fp32 Mamba-3 state "
+                    "(--mamba-ssm-cache-dtype auto -> float32)."
+                )
+        if changes:
+            logger.warning(OLALA_REPLAY_SPEC_FALLBACK, ", ".join(changes))
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -1313,12 +1379,8 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
         # process, so they are set here, before the engine core starts. Runs
         # without a speculative config are unchanged.
         if vllm_config.speculative_config is not None:
-            # ReplaySSM has no multi-token verify: refuse it here, in the API
-            # server, rather than when the engine core builds the first Mamba-3
-            # layer (~30 s into startup, behind an engine-core traceback).
-            replay = _replay_ssm_value()
-            if replay is not None:
-                raise ValueError(OLALA_REPLAY_SPEC_ERROR.format(value=replay))
+            # First the verify's fp32 Mamba-3 state (ReplaySSM falls back to it).
+            OlalaForCausalLMConfig._spec_fp32_state(vllm_config)
             spec_factor = os.environ.get("OLALA_TPA_FACTOR_SPEC")
             factor = os.environ.get("OLALA_TPA_FACTOR")
             if spec_factor is None and factor != "0" and _f1_default_device():
