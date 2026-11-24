@@ -202,6 +202,18 @@ def _score_transitions(
     anchor_token_ids: torch.Tensor,
     final_layer_idx: int,
 ) -> torch.Tensor:
+    if fast_path.hand_transitions_ok(lm_head, candidate_ids):
+        # OLALA_DSPINE_FUSED=3: the candidate side in three fused fp32 launches
+        return fast_path.hand_score_transitions(
+            injection,
+            norm,
+            lm_head,
+            transfer_codebook,
+            candidate_ids,
+            final_pre_injection,
+            anchor_token_ids,
+            final_layer_idx,
+        )
     top_k = candidate_ids.shape[-1]
     predecessor_ids = torch.cat(
         (
@@ -320,31 +332,71 @@ class DSpineQwen3Model(DFlashQwen3Model):
         positions: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if input_embeds is None:
-            input_embeds = self.embed_input_ids(input_ids)
+        if input_embeds is None and fast_path.hand_prep_ok(self):
+            # OLALA_DSPINE_FUSED=3: embeddings and anchor features in one launch
+            input_embeds, anchor_features = fast_path.hand_prep(self, input_ids)
+        else:
+            if input_embeds is None:
+                input_embeds = self.embed_input_ids(input_ids)
+            anchor_features = self.injection.token_features(
+                self.transfer_codebook, input_ids[:: self.injection.block_size]
+            )
         hidden_states = input_embeds
         residual = None
-        anchor_features = self.injection.token_features(
-            self.transfer_codebook, input_ids[:: self.injection.block_size]
-        )
         final_pre_injection = hidden_states
+        hand_inject = fast_path.hand_inject_ok(hidden_states)
+        delta_inject = (
+            hand_inject
+            and os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") != "1"
+            and fast_path._group("delta")
+            and fast_path.delta_inject_ok()
+        )
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
-            pre_injection = (
-                hidden_states if residual is None else hidden_states + residual
-            )
+            if hand_inject:
+                # OLALA_DSPINE_FUSED=3: the residual add and the injection around the GEMVs. Before
+                # the last layer the row-wise path returns (delta, pre), and the next layer's input
+                # norm adds them in place; the last layer's pre is the transition scoring's input.
+                last = layer_idx == len(self.layers) - 1
+                as_delta = delta_inject and not last
+                hidden_states, pre_injection = fast_path.hand_inject(
+                    self.injection, layer_idx, hidden_states, residual, anchor_features,
+                    as_delta=as_delta,
+                )
+                if last:
+                    final_pre_injection = pre_injection
+                residual = pre_injection if as_delta else None
+                continue
+            else:
+                pre_injection = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                hidden_states = self.injection(
+                    layer_idx, pre_injection, anchor_features=anchor_features
+                )
             if layer_idx == len(self.layers) - 1:
                 final_pre_injection = pre_injection
-            hidden_states = self.injection(
-                layer_idx, pre_injection, anchor_features=anchor_features
-            )
             residual = None
         hidden_states = self.norm(hidden_states)
         return hidden_states, final_pre_injection
+
+    def precompute_and_store_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> None:
+        # OLALA_DSPINE_FUSED=3: projection, then norm + rotary + every layer's cache write in one launch
+        if not fast_path.hand_context_kv(
+            self, context_states, context_positions, context_slot_mapping
+        ):
+            super().precompute_and_store_context_kv(
+                context_states, context_positions, context_slot_mapping
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)

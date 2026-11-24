@@ -11,6 +11,12 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   the transition scoring each run as one ``torch.compile``'d function of
   tensors (the weights are arguments, so one graph serves every layer and
   batch size) instead of ~50 eager elementwise kernels per layer.
+  ``OLALA_DSPINE_FUSED=3`` is level 2 plus the hand-fused kernels of
+  qwen3_dspine_kernels.py (one launch per chain): q/k RMSNorm + rotary in
+  every draft layer; the residual add and the adjacent injection around the
+  drafter's GEMVs (four row-wise launches); the context K/V norm, rotary and every layer's cache
+  write after the fused projection; the input embeddings and the anchor
+  features; the transition scoring's candidate side (three fp32 launches).
   ``OLALA_DSPINE_FUSED=2`` also compiles every draft decoder layer: with custom
   ops off, RMSNorm, rotary and SiluAndMul are native torch chains that only a
   compile fuses.
@@ -29,7 +35,11 @@ reference (tests/v1/spec_decode/test_dspine_fast.py).
   injection and transition weights, the codebook and the norms stay bf16
   (they are read directly by the fused functions). Halves the bytes of those
   linears per draft step (about 0.15 ms on a V100); weight reloads after the
-  quantization are not supported.
+  quantization are not supported. On sm_86-class GPUs (GeForce / workstation
+  Ampere and Ada) the draft steps of 33-256 rows (6 to 42 requests at K = 5)
+  take the Triton W8A16 GEMM with tiles tuned for them (_mid_rows_cfg): there
+  the generic W8A16 dispatch, tuned on an RTX 5090, ran 1.2-1.4x the bf16
+  drafter's linears.
 
 The fused functions keep the eager casts and order of operations; they are
 not bit-identical to it (different GEMM splits and fusion), so they are
@@ -40,14 +50,30 @@ token, and accepted lengths matched the eager drafter on the validation set.
 import math
 import os
 import re
+import types
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
+    ModelOptW8A16LinearMethod,
+)
+from vllm.utils.torch_utils import direct_register_custom_op
+
 FUSED_MODE = os.environ.get("OLALA_DSPINE_FUSED", "0")
-FUSED = FUSED_MODE in ("1", "2")
-COMPILE_LAYERS = FUSED_MODE == "2"
+FUSED = FUSED_MODE in ("1", "2", "3")
+COMPILE_LAYERS = FUSED_MODE in ("2", "3")
+HAND_FUSED = FUSED_MODE == "3"
+# Debug / attribution: OLALA_DSPINE_FUSED_OFF=qk,ctx,prep,inject,delta,transitions turns groups of level 3 off
+# (compile: the draft layers' torch.compile of levels 2 and 3).
+_FUSED_OFF = frozenset(g for g in os.environ.get("OLALA_DSPINE_FUSED_OFF", "").split(",") if g)
+
+
+def _group(name: str) -> bool:
+    return HAND_FUSED and name not in _FUSED_OFF
+
+
 GEMV = os.environ.get("OLALA_DSPINE_GEMV", "0") == "1"
 CUDA_NORM = os.environ.get("OLALA_DSPINE_CUDA_NORM", "0") == "1"
 # OLALA_DSPINE_INT8 unset: on for these compute-capability majors (V100, A100 / RTX 30-40, RTX 50),
@@ -68,6 +94,91 @@ def int8_enabled() -> bool:
 
 # The linears OLALA_DSPINE_INT8 quantizes: decoder projections and the context projection.
 _INT8_NAME = re.compile(r"(^|\.)layers\.\d+\.(self_attn\.(qkv|o)_proj|mlp\.(gate_up|down)_proj)$|(^|\.)fc$")
+
+# Rows of a drafter INT8 linear that take the Triton W8A16 GEMM with _mid_rows_cfg's tiles on sm_86-class GPUs: 6 per
+# request at K = 5, so 6 to 42 requests; the range of the config search. Outside it the target's dispatch stays (the
+# tiles lost to it at 384 rows for the long-K weights).
+_MID_ROWS = (33, 256)
+
+
+def _mid_rows_gpu() -> bool:
+    """GeForce / workstation Ampere and Ada (sm_86 - sm_89): bf16 MMA with fp32 accumulation at half rate and
+    ~100 KB of shared memory per SM, so from a few dozen rows the draft linears are compute bound and the generic
+    W8A16 dispatch (tuned on an RTX 5090: the skinny decode kernels up to 64 / 128 rows, dequantize + cuBLAS for
+    narrow weights) lost to bf16 cuBLAS. Not sm_80 (A100: full-rate tensor cores, HBM) and not a V100 through
+    volta-forever (it reports 8.0): neither was measured."""
+    from vllm.model_executor.layers.mamba.olala.arch import (
+        GpuFamily,
+        capability,
+        gpu_family,
+    )
+
+    return (
+        gpu_family() is GpuFamily.SM80
+        and capability()[1] >= 6
+        and not os.environ.get("VOLTA_FOREVER")
+    )
+
+
+def _mid_rows_cfg(M: int, N: int, K: int) -> dict | None:
+    """Triton W8A16 GEMM tiles for a draft linear of M rows on an sm_86-class GPU, or None (the generic W8A16
+    dispatch). From a config search on the drafter's shapes (RTX 3080, M = 48-256, scratch/spec_state/tools/
+    tune_w8a16_drafter.py): per draft step at 192 rows (32 requests) 1.19 -> 0.88 ms against 0.84 ms for bf16;
+    at 48 / 96 rows 0.61 -> 0.42 / 0.88 -> 0.59 ms against 0.50 / 0.72 ms."""
+    if not (_MID_ROWS[0] <= M <= _MID_ROWS[1]) or K % 128 or not _mid_rows_gpu():
+        return None
+    if K >= 3072:  # narrow, long-K weights (down 1536 x 4096, fc 1536 x 7680): more column tiles
+        if M <= 64:
+            return dict(BM=64, BN=32, BK=128, num_warps=4, num_stages=4)
+        if M <= 128:
+            return dict(BM=64, BN=64, BK=128, num_warps=8, num_stages=3)
+        return dict(BM=32, BN=64, BK=128, num_warps=4, num_stages=3)
+    if N >= 4096:  # wide (gate_up 8192, the fused context K/V 5120)
+        if M <= 64:
+            return dict(BM=64, BN=128, BK=128, num_warps=8, num_stages=3)
+        if M <= 128:
+            return dict(BM=32, BN=128, BK=64, num_warps=4, num_stages=3)
+        return dict(BM=64, BN=128, BK=64, num_warps=4, num_stages=3)
+    if M <= 64:  # qkv 2560, o 1536
+        return dict(BM=32, BN=64, BK=128, num_warps=4, num_stages=3)
+    if M <= 128:
+        return dict(BM=64, BN=64, BK=128, num_warps=8, num_stages=3)
+    if N >= 2560:  # qkv
+        return dict(BM=64, BN=128, BK=64, num_warps=4, num_stages=3)
+    return dict(BM=32, BN=64, BK=64, num_warps=4, num_stages=3)
+
+
+def _draft_int8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """``x @ (scale * weight).T`` for the drafter's INT8 linears: the Triton W8A16 GEMM with _mid_rows_cfg's tiles
+    where it gives some, the target's W8A16 dispatch (w8a16_utils.int8_mm) everywhere else."""
+    from vllm.model_executor.layers.quantization.utils import w8a16_utils as wu
+
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    w = wu.Int8Weight(weight, scale)
+    cfg = _mid_rows_cfg(x2.shape[0], w.n, w.k) if scale.dim() == 1 and x.dtype == torch.bfloat16 else None
+    if cfg is not None:
+        y = wu.w8a16_gemm(x2 if x2.stride(-1) == 1 else x2.contiguous(), w, cfg=cfg)
+    else:
+        y = wu.int8_mm(x2, w)
+    return y.view(*shape[:-1], w.n)
+
+
+def _draft_int8_linear_fake(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(*x.shape[:-1], weight.shape[0])
+
+
+# Opaque to torch.compile (OLALA_DSPINE_FUSED=2 compiles the draft layers): the row count is dispatched at run time.
+direct_register_custom_op(
+    op_name="dspine_int8_linear",
+    op_func=_draft_int8_linear,
+    mutates_args=[],
+    fake_impl=_draft_int8_linear_fake,
+)
+
+
+def draft_int8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return torch.ops.vllm.dspine_int8_linear(x, weight, scale)
 
 _TINY = torch.finfo(torch.float32).tiny
 
@@ -314,14 +425,21 @@ def quantize_int8_rtn(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return q.contiguous(), scale.contiguous()
 
 
+class DraftW8A16LinearMethod(ModelOptW8A16LinearMethod):
+    """The target's W8A16 linear method with the drafter's row-count dispatch (draft_int8_linear)."""
+
+    def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if layer.weight_scale.dim() != 1:  # per-group scales: the target's dispatch
+            return super().apply(layer, x, bias)
+        y = draft_int8_linear(x, layer.weight, layer.weight_scale)
+        return y if bias is None else y + bias
+
+
 def install_int8(model: nn.Module) -> int:
     """Quantize the drafter linears of _INT8_NAME in place (idempotent) and
     rebuild the fused context K/V projection from the INT8 rows. Returns the
     number of linears quantized by this call."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-    from vllm.model_executor.layers.quantization.modelopt_w8a16 import (
-        ModelOptW8A16LinearMethod,
-    )
 
     n = 0
     for name, module in model.named_modules():
@@ -337,18 +455,20 @@ def install_int8(model: nn.Module) -> int:
             q, scale = quantize_int8_rtn(weight.data)
             module.weight = nn.Parameter(q, requires_grad=False)
             module.weight_scale = nn.Parameter(scale, requires_grad=False)
-            # The target's W8A16 linear method: its apply, and its post-load step (the SM70
-            # family's fp16 tensor-core copy where that edition exists).
-            method = ModelOptW8A16LinearMethod()
+            # The target's W8A16 linear method: its post-load step (the SM70 family's fp16
+            # tensor-core copy where that edition exists); its apply, except for the row counts
+            # draft_int8_linear dispatches itself.
+            method = DraftW8A16LinearMethod()
             method.process_weights_after_loading(module)
             module.quant_method = method
             n += 1
     inner = model.model
     attn = [layer.self_attn for layer in inner.layers]
-    if all(isinstance(a.qkv_proj.quant_method, ModelOptW8A16LinearMethod) for a in attn):
+    if attn and all(isinstance(a.qkv_proj.quant_method, ModelOptW8A16LinearMethod) for a in attn):
         inner._fused_kv_weight = torch.cat([a.qkv_proj.weight[a.q_size :] for a in attn], 0)
         inner._fused_kv_scale = torch.cat([a.qkv_proj.weight_scale[a.q_size :] for a in attn], 0)
         inner._fused_kv_bias = None
+        inner._fused_kv_int8_linear = draft_int8_linear
         _register_volta_tc(inner._fused_kv_weight, "dspine.fused_kv")
     return n
 
@@ -363,6 +483,182 @@ def _register_volta_tc(weight: torch.Tensor, name: str) -> None:
         return
     if (tc := volta_tc()) is not None:
         tc.register_int8(weight, 1, name)
+
+
+def _fused_attention_forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    """DFlashQwen3Attention.forward with the q/k RMSNorms and the rotary in one
+    kernel (qwen3_dspine_kernels.qk_norm_rope)."""
+    from vllm.model_executor.models.qwen3_dspine_kernels import qk_norm_rope
+
+    qkv, _ = self.qkv_proj(hidden_states)
+    q, k = qk_norm_rope(
+        qkv, positions, self.rotary_emb.cos_sin_cache, self.q_norm.weight, self.k_norm.weight,
+        self.q_norm.variance_epsilon, self.num_heads, self.num_kv_heads, self.head_dim,
+    )
+    v = qkv[:, self.q_size + self.kv_size :]
+    if self.v_scale is not None:
+        v = v * self.v_scale
+    attn_output = self.attn(q, k, v)
+    output, _ = self.o_proj(attn_output)
+    return output
+
+
+def hand_inject_ok(hidden_states: torch.Tensor) -> bool:
+    """OLALA_DSPINE_FUSED=3: the residual add and the injection through
+    qwen3_dspine_kernels.inject_rows (the drafter's GEMVs plus four row-wise
+    launches)."""
+    return _group("inject") and hidden_states.dim() == 2
+
+
+def delta_inject_ok() -> bool:
+    """The delta form of the injection, except on the SM70 family. On a V100 (through
+    volta-forever, the drafter's GEMVs on volta_tc's fp16 path from 9 rows) the delta
+    form together with the fused q/k path lowered served greedy acceptance (K3, 1-8
+    requests: 2.689 against 2.783 at level 2), while either alone stays at level 2
+    (2.781 without the delta form); the explicit update kernel is kept there."""
+    from vllm.model_executor.models.qwen3_dspine_kernels import _has_bf16_mma
+
+    return _has_bf16_mma()
+
+
+def hand_inject(
+    injection: nn.Module,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    anchor_features: torch.Tensor,
+    as_delta: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(injected, pre_injection) of one layer, or (delta, pre_injection) with
+    ``as_delta`` (injected = pre + delta, added by the next RMSNorm).
+    OLALA_DSPINE_FUSED_INJECT=1 takes the
+    experimental three-launch FMA-tile kernels (qwen3_dspine_kernels.inject) for
+    at most 64 rows: slower than the GEMV path on an RTX 5090 (91 against 15 us
+    per layer)."""
+    from vllm.model_executor.models import qwen3_dspine_kernels as k
+
+    if getattr(injection, "fused_pred_msg_weight", None) is None:
+        refresh_fused_weights(injection)
+    args = (
+        hidden_states, residual, anchor_features, injection.readouts[layer_idx].weight,
+        injection.receiver_gate.weight, injection.fused_pred_msg_weight,
+        injection.writes[layer_idx].weight, injection.gate_bias, injection.block_size,
+        injection.transfer_dim, injection.eps,
+    )
+    if os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") == "1" and hidden_states.shape[0] <= k.INJECT_MAX_ROWS:
+        return k.inject(*args)
+    return k.inject_rows(*args, _linear, as_delta=as_delta)
+
+
+def hand_context_kv(inner: nn.Module, context_states, context_positions, context_slot_mapping) -> bool:
+    """DFlash's precompute_and_store_context_kv through qwen3_dspine_kernels.ctx_kv_store
+    (OLALA_DSPINE_FUSED=3): False, and nothing done, when the case is not covered
+    (dummy runs, no fused K/V weight, a V scale, another cache layout)."""
+    if not _group("ctx") or context_slot_mapping is None or not hasattr(inner, "_num_attn_layers"):
+        return False
+    if getattr(inner, "_fused_kv_weight", None) is None or getattr(inner.layers[0].self_attn, "v_scale", None) is not None:
+        return False
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.models.qwen3_dspine_kernels import ctx_kv_store, ctx_kv_store_ok
+
+    L = inner._num_attn_layers
+    slots = list(context_slot_mapping) if isinstance(context_slot_mapping, (list, tuple)) else [context_slot_mapping] * L
+    caches = [a.kv_cache for a in inner._attn_layers]
+    if (
+        any(m is None for m in slots)
+        or not all(isinstance(c, torch.Tensor) for c in caches)
+        or not ctx_kv_store_ok(caches, inner._head_dim)
+        or not inner._rope_is_neox
+        or inner._rope_head_size != inner._head_dim
+        or inner._rope_cos_sin_cache.shape[-1] != inner._head_dim
+    ):
+        return False
+    normed = torch.empty_like(context_states)
+    ops.rms_norm(normed, context_states, inner._hidden_norm_weight, inner._rms_norm_eps)
+    if inner._fused_kv_scale is not None:
+        from vllm.model_executor.layers.quantization.utils.w8a16_utils import w8a16_int8_linear
+
+        # the drafter's own INT8 dispatch when install_int8 set one, as DFlash's path
+        int8_linear = getattr(inner, "_fused_kv_int8_linear", w8a16_int8_linear)
+        all_kv = int8_linear(normed, inner._fused_kv_weight, inner._fused_kv_scale)
+    else:
+        all_kv = F.linear(normed, inner._fused_kv_weight, inner._fused_kv_bias)
+    ctx_kv_store(
+        all_kv, context_positions, inner._rope_cos_sin_cache, inner._k_norm_weights, inner._rms_norm_eps,
+        slots, caches, inner._num_kv_heads, inner._head_dim,
+    )
+    return True
+
+
+def hand_prep_ok(inner: nn.Module) -> bool:
+    w = getattr(getattr(inner, "embed_tokens", None), "weight", None)
+    cb = getattr(inner, "transfer_codebook", None)
+    return (
+        _group("prep") and isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16
+        and w.is_contiguous() and isinstance(cb, torch.Tensor) and cb.is_contiguous()
+    )
+
+
+def hand_prep(inner: nn.Module, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(input_embeds, anchor_features) of DSpineQwen3Model.forward through
+    qwen3_dspine_kernels.prep_inputs."""
+    from vllm.model_executor.models.qwen3_dspine_kernels import prep_inputs
+
+    use_mask = inner.has_separate_mask_embedding and inner.mask_token_id is not None
+    return prep_inputs(
+        input_ids, inner.embed_tokens.weight, inner.mask_embedding if use_mask else None,
+        inner.mask_token_id if use_mask else None, inner.transfer_codebook,
+        inner.injection.block_size, inner.injection.transfer_dim,
+    )
+
+
+def hand_transitions_ok(lm_head: nn.Module, candidate_ids: torch.Tensor) -> bool:
+    """OLALA_DSPINE_FUSED=3 transition scoring: one tensor-parallel rank, a bf16 or
+    per-channel INT8 head, a power-of-two top-k, at most TRANSITION_MAX_ROWS
+    candidate rows (larger batches keep transitions_fn's cuBLAS GEMMs)."""
+    if not _group("transitions") or getattr(lm_head, "tp_size", 1) != 1 or candidate_ids.dim() != 3:
+        return False
+    from vllm.model_executor.models.qwen3_dspine_kernels import TRANSITION_MAX_ROWS
+
+    w = lm_head.weight
+    k = candidate_ids.shape[-1]
+    scale_ok = w.dtype == torch.bfloat16 or (
+        w.dtype == torch.int8 and getattr(lm_head, "weight_scale", None) is not None
+        and lm_head.weight_scale.dim() == 1
+    )
+    return scale_ok and k & (k - 1) == 0 and candidate_ids.numel() <= TRANSITION_MAX_ROWS
+
+
+def hand_score_transitions(injection, norm, lm_head, transfer_codebook, candidate_ids, final_pre_injection,
+                           anchor_token_ids, final_layer_idx):
+    from vllm.model_executor.models.qwen3_dspine_kernels import score_transitions
+
+    w = lm_head.weight
+    return score_transitions(
+        final_pre_injection, candidate_ids, anchor_token_ids, injection.readouts[final_layer_idx].weight,
+        injection.receiver_gate.weight, injection.predecessor_gate.weight, injection.message.weight,
+        injection.writes[final_layer_idx].weight, injection.gate_bias, norm.weight, w,
+        None if w.is_floating_point() else lm_head.weight_scale, transfer_codebook, injection.transfer_dim,
+        injection.eps, norm.variance_epsilon, _linear,
+    )
+
+
+def _hand_fuse_attention(attn: nn.Module) -> bool:
+    """Install _fused_attention_forward on one drafter attention module; False
+    when its configuration is not covered (partial or GPT-J rotary, norms
+    without weights)."""
+    rope = attn.rotary_emb
+    if (
+        getattr(rope, "rotary_dim", None) != attn.head_dim
+        or not getattr(rope, "is_neox_style", False)
+        or getattr(attn.q_norm, "weight", None) is None
+        or getattr(attn.k_norm, "weight", None) is None
+        or attn.q_norm.variance_epsilon != attn.k_norm.variance_epsilon
+        or attn.head_dim % 2
+    ):
+        return False
+    attn.forward = types.MethodType(_fused_attention_forward, attn)
+    return True
 
 
 def apply_fast_path(model: nn.Module) -> None:
@@ -396,7 +692,11 @@ def apply_fast_path(model: nn.Module) -> None:
         for module in model.model.modules():
             if type(module) is RMSNorm:
                 bind_cuda_rms_norm(module)
-    if COMPILE_LAYERS:
+    if _group("qk"):
+        for layer in model.model.layers:
+            if not getattr(layer.self_attn, "dspine_hand_fused", False):
+                layer.self_attn.dspine_hand_fused = _hand_fuse_attention(layer.self_attn)
+    if COMPILE_LAYERS and "compile" not in _FUSED_OFF:
         for layer in model.model.layers:
             if not getattr(layer, "dspine_compiled", False):
                 layer.forward = torch.compile(layer.forward, dynamic=True)

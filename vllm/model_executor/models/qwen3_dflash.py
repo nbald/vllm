@@ -602,7 +602,9 @@ class DFlashQwen3Model(nn.Module):
                     w8a16_int8_linear,
                 )
 
-                all_kv_flat = w8a16_int8_linear(
+                # DSpine's INT8 drafter brings its own row-count dispatch
+                int8_linear = getattr(self, "_fused_kv_int8_linear", w8a16_int8_linear)
+                all_kv_flat = int8_linear(
                     normed_context_states, self._fused_kv_weight, self._fused_kv_scale
                 )
             else:
