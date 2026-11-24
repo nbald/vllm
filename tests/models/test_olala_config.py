@@ -9,7 +9,8 @@ every process) and keeps the factor cache. Elsewhere, or with
 OLALA_TPA_FACTOR_SPEC=0, the hook turns the cache off (OLALA_TPA_FACTOR=0)
 unless the user asked for it explicitly, which is refused at config time
 instead of at KV-cache init. Without a speculative config nothing changes.
-CPU only.
+ReplaySSM (OLALA_REPLAY_SSM) has no multi-token verify: a speculative config
+with it is refused at config time too. CPU only.
 """
 
 import os
@@ -34,7 +35,7 @@ def _gpu(monkeypatch, cap):
 def _clean(monkeypatch):
     # setenv first so that teardown restores the original state even though
     # the hook writes os.environ directly.
-    for var in ("OLALA_TPA_FACTOR_SPEC", "OLALA_TPA_FACTOR"):
+    for var in ("OLALA_TPA_FACTOR_SPEC", "OLALA_TPA_FACTOR", "OLALA_REPLAY_SSM"):
         monkeypatch.setenv(var, "")
         monkeypatch.delenv(var)
     _gpu(monkeypatch, (9, 0))  # a GPU without the F1 default unless a test says otherwise
@@ -129,3 +130,30 @@ def test_no_spec_leaves_switches_alone(monkeypatch, cap, value):
     _run(speculative=False)
     assert os.environ.get("OLALA_TPA_FACTOR") == value
     assert os.environ.get("OLALA_TPA_FACTOR_SPEC") is None
+
+
+@pytest.mark.parametrize("value", ["1", "on", "8", "16"])
+def test_spec_refuses_replay_ssm_at_config_time(monkeypatch, value):
+    _gpu(monkeypatch, (12, 0))
+    monkeypatch.setenv("OLALA_REPLAY_SSM", value)
+    with pytest.raises(ValueError, match="OLALA_REPLAY_SSM=0") as err:
+        _run()
+    assert f"OLALA_REPLAY_SSM={value})" in str(err.value)
+    assert "--speculative-config" in str(err.value)
+    # refused before the F1 switches are touched
+    assert os.environ.get("OLALA_TPA_FACTOR_SPEC") is None
+    assert os.environ.get("OLALA_TPA_FACTOR") is None
+
+
+@pytest.mark.parametrize("value", ["0", ""])
+def test_spec_accepts_replay_ssm_off(monkeypatch, value):
+    _gpu(monkeypatch, (12, 0))
+    monkeypatch.setenv("OLALA_REPLAY_SSM", value)
+    _run()
+    assert os.environ.get("OLALA_TPA_FACTOR_SPEC") == "1"
+
+
+def test_no_spec_keeps_replay_ssm(monkeypatch):
+    monkeypatch.setenv("OLALA_REPLAY_SSM", "1")
+    _run(speculative=False)
+    assert os.environ["OLALA_REPLAY_SSM"] == "1"

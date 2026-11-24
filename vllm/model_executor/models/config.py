@@ -1228,6 +1228,31 @@ def _f1_default_device() -> bool:
     return cap is not None and cap.major in _F1_DEFAULT_MAJORS
 
 
+# Raised at config time (OlalaForCausalLMConfig) and, as a backstop, by the
+# Mamba-3 mixer when it is built.
+OLALA_REPLAY_SPEC_ERROR = (
+    "ReplaySSM (OLALA_REPLAY_SSM={value}) does not support speculative "
+    "decoding: the verify step reads and writes the full fp32 Mamba-3 state at "
+    "every draft position. For speculative decoding set OLALA_REPLAY_SSM=0 "
+    "(with the default --mamba-ssm-cache-dtype auto or float32: fp32 state); "
+    "to keep ReplaySSM, remove --speculative-config."
+)
+
+
+def _replay_ssm_value() -> str | None:
+    """The OLALA_REPLAY_SSM value if it turns ReplaySSM on, else None. Same
+    reading as olala.state.replay_config, without importing the mixers into
+    the API server; a malformed value is left to replay_config to refuse."""
+    raw = os.environ.get("OLALA_REPLAY_SSM", "0")
+    v = raw.strip().lower() or "0"
+    if v in ("on", "true", "yes"):
+        return raw
+    try:
+        return raw if int(v) > 0 else None
+    except ValueError:
+        return None
+
+
 class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
     """Reconcile Olala's HF config with vLLM's hybrid-model assumptions."""
 
@@ -1288,6 +1313,12 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
         # process, so they are set here, before the engine core starts. Runs
         # without a speculative config are unchanged.
         if vllm_config.speculative_config is not None:
+            # ReplaySSM has no multi-token verify: refuse it here, in the API
+            # server, rather than when the engine core builds the first Mamba-3
+            # layer (~30 s into startup, behind an engine-core traceback).
+            replay = _replay_ssm_value()
+            if replay is not None:
+                raise ValueError(OLALA_REPLAY_SPEC_ERROR.format(value=replay))
             spec_factor = os.environ.get("OLALA_TPA_FACTOR_SPEC")
             factor = os.environ.get("OLALA_TPA_FACTOR")
             if spec_factor is None and factor != "0" and _f1_default_device():
