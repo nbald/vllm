@@ -349,6 +349,7 @@ class DSpineQwen3Model(DFlashQwen3Model):
             hand_inject
             and os.environ.get("OLALA_DSPINE_FUSED_INJECT", "0") != "1"
             and fast_path._group("delta")
+            and fast_path.delta_inject_ok()
         )
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(

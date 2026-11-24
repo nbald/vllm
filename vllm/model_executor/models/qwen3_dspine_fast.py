@@ -65,7 +65,8 @@ FUSED_MODE = os.environ.get("OLALA_DSPINE_FUSED", "0")
 FUSED = FUSED_MODE in ("1", "2", "3")
 COMPILE_LAYERS = FUSED_MODE in ("2", "3")
 HAND_FUSED = FUSED_MODE == "3"
-# Debug / attribution: OLALA_DSPINE_FUSED_OFF=qk,ctx,prep,inject,delta,transitions turns groups of level 3 off.
+# Debug / attribution: OLALA_DSPINE_FUSED_OFF=qk,ctx,prep,inject,delta,transitions turns groups of level 3 off
+# (compile: the draft layers' torch.compile of levels 2 and 3).
 _FUSED_OFF = frozenset(g for g in os.environ.get("OLALA_DSPINE_FUSED_OFF", "").split(",") if g)
 
 
@@ -507,6 +508,17 @@ def hand_inject_ok(hidden_states: torch.Tensor) -> bool:
     return _group("inject") and hidden_states.dim() == 2
 
 
+def delta_inject_ok() -> bool:
+    """The delta form of the injection, except on the SM70 family. On a V100 (through
+    volta-forever, the drafter's GEMVs on volta_tc's fp16 path from 9 rows) the delta
+    form together with the fused q/k path lowered served greedy acceptance (K3, 1-8
+    requests: 2.689 against 2.783 at level 2), while either alone stays at level 2
+    (2.781 without the delta form); the explicit update kernel is kept there."""
+    from vllm.model_executor.models.qwen3_dspine_kernels import _has_bf16_mma
+
+    return _has_bf16_mma()
+
+
 def hand_inject(
     injection: nn.Module,
     layer_idx: int,
@@ -680,7 +692,7 @@ def apply_fast_path(model: nn.Module) -> None:
         for layer in model.model.layers:
             if not getattr(layer.self_attn, "dspine_hand_fused", False):
                 layer.self_attn.dspine_hand_fused = _hand_fuse_attention(layer.self_attn)
-    if COMPILE_LAYERS:
+    if COMPILE_LAYERS and "compile" not in _FUSED_OFF:
         for layer in model.model.layers:
             if not getattr(layer, "dspine_compiled", False):
                 layer.forward = torch.compile(layer.forward, dynamic=True)
