@@ -509,6 +509,8 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
         self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
+        # Per-row scales of an INT8 fused K/V weight (OLALA_DSPINE_INT8, qwen3_dspine_fast.py).
+        self._fused_kv_scale: torch.Tensor | None = None
         self._context_q_sizes = [a.q_size for a in layers_attn]
 
         if all(
@@ -595,9 +597,18 @@ class DFlashQwen3Model(nn.Module):
             self._rms_norm_eps,
         )
         if self._fused_kv_weight is not None:
-            all_kv_flat = F.linear(
-                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-            )
+            if self._fused_kv_scale is not None:
+                from vllm.model_executor.layers.quantization.utils.w8a16_utils import (
+                    w8a16_int8_linear,
+                )
+
+                all_kv_flat = w8a16_int8_linear(
+                    normed_context_states, self._fused_kv_weight, self._fused_kv_scale
+                )
+            else:
+                all_kv_flat = F.linear(
+                    normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+                )
             all_kv = all_kv_flat.view(num_ctx, num_layers, 2, num_kv_heads, head_dim)
         else:
             layer_kv = []
