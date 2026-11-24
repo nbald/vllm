@@ -165,9 +165,10 @@ The decode CUDA graphs need every request count's size, n × (1 + K). The Olala 
 graph: 26.4 ms per step against 20.0 ms.
 
 ```bash
-# On a V100 node, through run-node.sh (CUDA_VISIBLE_DEVICES, caches, the VF proxy cache) and volta-forever 0.1.5.
-OLALA_GPU=0 OLALA_VF=0.1.5 /srv/cache/olala/run-node.sh env \
-  VLLM_USE_V2_MODEL_RUNNER=1 VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1 VF_JIT_LINEINFO=1 \
+# Through volta-forever 0.1.5 (https://github.com/nbald/volta-forever: install.sh, then its vLLM guide for the
+# CUDA 13 toolkit and the persistent caches). VF_PROXY_CACHE is a directory you own, with mode 0700.
+VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1 VF_JIT_LINEINFO=1 VF_PROXY_CACHE=$HOME/.cache/vf-proxy \
+  VLLM_USE_V2_MODEL_RUNNER=1 \
   OLALA_MAMBA3_VERIFY=cuda OLALA_SPLIT_PREFILL=1 OLALA_SPLIT_PREFILL_MAX_DECODES=16 OLALA_PREFILL_NOSYNC=1 \
   OLALA_TS_FOLD=1 OLALA_SPEC_LIGHT=1 VLLM_KV_CACHE_GROUP_SIZE=7 OLALA_TPA_MIXED_FUSED=1 \
   OLALA_TPA_FACTOR=1 OLALA_TPA_FACTOR_SPEC=1 \
@@ -181,15 +182,15 @@ OLALA_GPU=0 OLALA_VF=0.1.5 /srv/cache/olala/run-node.sh env \
       "num_speculative_tokens_per_batch_size": [[1, 2, 2], [3, 6, 0], [7, 16, 2]]}'
 ```
 
-Output tokens/s against the direct server (max-num-seqs 128), same run, 512-token outputs, one round. These were
-measured through volta-forever 0.1.3 with its later fixes; the snippet takes the 0.1.5 release.
+Output tokens/s against the direct server (max-num-seqs 128), same run, 512-token outputs, one round, through the
+volta-forever 0.1.5 release:
 
 | c | 1 | 2 | 4 | 8 | 16 |
 |---|---|---|---|---|---|
-| sampled | ×1.206 | ×1.036 | ×0.988 | ×1.064 | ×1.242 |
-| greedy | ×1.271 | ×1.084 | ×0.993 | ×1.116 | ×1.311 |
+| sampled | ×1.207 | ×1.042 | ×0.997 | ×1.062 | ×1.240 |
+| greedy | ×1.274 | ×1.091 | ×1.001 | ×1.123 | ×1.315 |
 
-Why this schedule, on the same stack:
+Why this schedule (measured through volta-forever 0.1.3 with its later fixes):
 - **Static K = 2:** ×0.91 sampled / ×0.97 greedy at c = 4, even with the exact graph sizes. Verifying 12 tokens costs
   more on this MoE target than the drafts return.
 - **c = 32:** every static K loses (×0.92-0.94 sampled).
