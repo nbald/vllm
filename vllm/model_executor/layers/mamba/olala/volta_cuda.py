@@ -5,7 +5,12 @@ kernels' bits: the geodesic norm (csrc/geodesic_volta.cu) and the weight-only la
 (csrc/moe_small_volta.cu). Each reproduces its Triton kernels' per-output arithmetic (the same fp32 chains, the same
 reduction tree as the Triton layout, the same rounding instructions) with another work decomposition, so they are
 on by default on the SM70 family; OLALA_GEODESIC_CUDA=0 / OLALA_VOLTA_MOE_CUDA=0 keep the Triton kernels (part of
-the compile-cache key like every OLALA_* switch)."""
+the compile-cache key like every OLALA_* switch).
+
+The multi-row MoE (csrc/moe_rows_volta.cu, moe_rows) is not a bit-for-bit edition: for up to 32 tokens it computes the
+whole weight-only MoE (input projections and routing, routed and shared experts, output projections) in three launches
+with its own summation orders, deterministic but rounding-level different from the small path. Opt-in:
+OLALA_VOLTA_MOE_ROWS=1, from 3 to 8 tokens with INT8 routed experts (Q8)."""
 
 import os
 from functools import lru_cache
@@ -164,4 +169,77 @@ def moe_small(hidden, x_in, router_logits, router_logits_lo, e_score_bias, w13, 
             meta, hT, h, part, sT, rT, out, M, routed_scale)
     if bufs is not None:
         bufs.update(ids=ids, tw=tw, meta=meta, h=h, part=part, sT=sT, rT=rT, mbp=mbp)
+    return out
+
+
+# -- multi-row MoE (csrc/moe_rows_volta.cu) ------------------------------------------------------------------------
+# From 3 to 8 tokens, INT8 per-row routed experts (Q8). The kernels take 1 to 32 tokens; at 2 tokens the small path is
+# 6 % faster; in the server's decode graphs (nsys, Q8, MoE per layer) the rows path saves 17 % at 4 tokens and 12 % at 8
+# but nothing at 16 (210.6 against 211.3 us, where the graphed layer benchmark gives 15 %: its unrolled kernels run
+# with warm instruction caches there), and from 17 tokens its 32-row tile loses to the CUDA small path. The kernels also
+# take INT4 affine experts (Q4A2, tested), which the dispatch leaves to the small path: no clear gain (+17 % at 4
+# tokens, 1-3 % at 6-8, slower at 2 and 16). The 1-token path is untouched.
+MOE_ROWS_MIN_TOKENS, MOE_ROWS_MAX_TOKENS = 3, 8
+_ROWS_BUFS: dict = {}
+
+
+def moe_rows_enabled() -> bool:
+    """OLALA_VOLTA_MOE_ROWS=1 on the SM70 family told sm_80+ (read at each call: tests flip it)."""
+    return os.environ.get("OLALA_VOLTA_MOE_ROWS", "0") == "1" and gpu_family() is GpuFamily.SM70 and has_bf16_mma()
+
+
+@lru_cache(maxsize=1)
+def _rows_ext():
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+    return load_extension(f"olala_moe_rows_volta_sm{sm_arch()}", "moe_rows_volta.cu", ["-O3", "-std=c++20", gencode()])
+
+
+def moe_rows_buffers(device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The workspace (sized for 32 tokens) and the counters of the rows path, one pair per device. The counters are
+    zeroed once and every kernel resets those it completes, so layers and graphs share them on one stream. Built by
+    the first call, which the layer makes in its profiling run (before CUDA graph capture: graphs bake addresses)."""
+    dev = torch.device(device)
+    key = dev.index if dev.index is not None else torch.cuda.current_device()
+    if key not in _ROWS_BUFS:
+        e = _rows_ext()
+        ws = torch.empty(e.workspace_floats(32), dtype=torch.float32, device=dev)
+        ctr = torch.zeros(e.counter_ints(), dtype=torch.int32, device=dev)
+        _ROWS_BUFS[key] = (ws, ctr)
+    return _ROWS_BUFS[key]
+
+
+def moe_rows_ok(M: int, hidden, router, fc1, bias, w13, w2, shared_up, shared_down, fc2, top_k: int) -> bool:
+    """The rows path takes MOE_ROWS_MIN_TOKENS..MOE_ROWS_MAX_TOKENS tokens of the model's shapes: bf16 hidden rows (unit
+    column stride, 16-byte aligned rows), the bf16 router rows [hi ; lo] (bf16x2), INT8 per-row routed experts (Q8),
+    fc1_latent, shared expert and fc2_latent, fp32 correction bias."""
+    if not (MOE_ROWS_MIN_TOKENS <= M <= MOE_ROWS_MAX_TOKENS) or top_k != 6 or not moe_rows_enabled():
+        return False
+    if not (_int8_row(w13, 768, 384, 256) and _int8_row(w2, 384, 768, 256)):
+        return False
+    if not (_int8_row(fc1, 384, 1536) and _int8_row(shared_up, 1536, 1536) and _int8_row(shared_down, 1536, 1536)
+            and _int8_row(fc2, 1536, 384)):
+        return False
+    if (hidden.dtype != torch.bfloat16 or tuple(hidden.shape) != (M, 1536) or hidden.stride(1) != 1
+            or hidden.stride(0) % 8):
+        return False
+    if router.dtype != torch.bfloat16 or tuple(router.shape) != (512, 1536) or not router.is_contiguous():
+        return False
+    if bias.dtype != torch.float32 or not bias.is_contiguous() or bias.numel() != 256:
+        return False
+    return _aligned(hidden, router, bias, fc1.weight, w13.weight, w2.weight, shared_up.weight, shared_down.weight,
+                    fc2.weight)
+
+
+def moe_rows(hidden, router, fc1, bias, w13, w2, shared_up, shared_down, fc2, routed_scale: float) -> torch.Tensor:
+    """The MoE output [M, 1536] bf16 of 1..32 tokens through the rows path (moe_rows_ok's inputs; the kernels take any
+    count up to 32, the dispatch uses MOE_ROWS_MIN_TOKENS..MOE_ROWS_MAX_TOKENS)."""
+    logger.info_once("Olala Volta: weight-only MoE from %d to %d tokens in three launches (OLALA_VOLTA_MOE_ROWS=1)",
+                     MOE_ROWS_MIN_TOKENS, MOE_ROWS_MAX_TOKENS)
+    M = hidden.shape[0]
+    ws, ctr = moe_rows_buffers(hidden.device)
+    out = torch.empty(M, 1536, dtype=torch.bfloat16, device=hidden.device)
+    _rows_ext().moe_rows(hidden, router, fc1.weight, fc1.scale, shared_up.weight, shared_up.scale, bias, w13.weight,
+                         w13.scale, w2.weight, w2.scale, shared_down.weight, shared_down.scale, fc2.weight, fc2.scale,
+                         ws, ctr, out, M, routed_scale, 7, 0)
     return out

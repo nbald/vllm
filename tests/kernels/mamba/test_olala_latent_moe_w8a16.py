@@ -271,3 +271,109 @@ def test_split_router_logits(m, run):
     ref = run(hidden, latent, hi + lo, *rest, TOPK, 2.45)
     out = run(hidden, latent, hi, *rest, TOPK, 2.45, router_logits_lo=lo)
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+# -- Volta multi-row MoE (volta_cuda.moe_rows: up to 32 tokens in three launches, dispatched from 3 to 8) ---------
+
+
+def _rows_setup(m: int, group, seed: int):
+    """A layer as the rows path reads it: INT8 per-row fc1_latent, shared expert and fc2_latent, the router as bf16
+    hi + lo rows (bf16x2), routed experts INT8 per row (group 0) or INT4 affine; bf16 hidden rows."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rn(*s):
+        return torch.randn(*s, device="cuda", generator=g)
+
+    w13, dq13 = _make_expert(rn(E, N1, D1) * D1**-0.5, group)
+    w2, dq2 = _make_expert(rn(E, D1, N1) * N1**-0.5, group)
+    su, dqsu = _make(rn(S, H) * H**-0.5, 0)
+    sd, dqsd = _make(rn(H, S) * S**-0.5, 0)
+    fc2, dqf2 = _make(rn(H, D1) * D1**-0.5, 0)
+    fc1, dqf1 = _make(rn(D1, H) * H**-0.5, 0)
+    router = rn(E, H) * 0.03
+    hi = router.bfloat16()
+    rhl = torch.cat([hi, (router - hi.float()).bfloat16()]).contiguous()
+    bias = rn(E) * 0.05
+    hidden = rn(m, H).bfloat16()
+    dq = (dqf1, dq13, dq2, dqsu, dqsd, dqf2, hi.float() + rhl[E:].float())
+    return (hidden, rhl, fc1, bias, w13, w2, su, sd, fc2), dq
+
+
+def _rows_reference(hidden, bias, dq, scale=2.45):
+    """fp32 over the dequantized weights with torch's routing of the fp32 logits; bf16 roundings where the kernels
+    round (latent, relu^2 outputs, routed latent, output)."""
+    f1, w13, w2, su, sd, f2, router = dq
+    h = hidden.float()
+    sc = torch.sigmoid(h @ router.T)
+    ids = torch.topk(sc + bias, TOPK, dim=-1).indices
+    tw = sc.gather(1, ids)
+    tw = tw / tw.sum(-1, keepdim=True)
+    lat = (h @ f1.T).bfloat16().float()
+    routed = torch.zeros(h.shape[0], D1, device=h.device)
+    for i in range(h.shape[0]):
+        for k in range(TOPK):
+            e = int(ids[i, k])
+            routed[i] += tw[i, k] * (_relu2(lat[i] @ w13[e].T).float() @ w2[e].T)
+    routed = (routed * scale).bfloat16().float()
+    s = _relu2(h @ su.T).float()
+    return (routed @ f2.T + s @ sd.T).bfloat16()
+
+
+def _rows_base(args, scale=2.45):
+    """The current small path on the same layer: the entry launch (INT8 fc1 + bf16 router rows) and
+    olala_moe_small_int8_volta."""
+    from vllm.model_executor.layers.quantization.utils.w8a16_utils import Segment, int8_decode_linear
+
+    hidden, rhl, fc1, bias, w13, w2, su, sd, fc2 = args
+    m = hidden.shape[0]
+    y = torch.empty(m, D1 + 2 * E, dtype=torch.float32, device=hidden.device)
+    int8_decode_linear(hidden, [Segment(fc1.weight, fc1.scale), Segment(rhl, col0=D1)], out=y)
+    return olala_moe_small_int8_volta(hidden, y[:, :D1], y[:, D1:D1 + E], bias, w13, w2, su, sd, fc2, TOPK, scale,
+                                      router_logits_lo=y[:, D1 + E:])
+
+
+def _rel(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+@pytest.mark.parametrize("m", [2, 3, 4, 5, 8, 12, 16, 17, 24, 32])
+@pytest.mark.parametrize("group", [0, INT4])
+def test_volta_rows_path_matches_reference(m, group):
+    """The rows path (Volta multi-row MoE: entry with routing, experts by slice, exit) within the current small path's
+    error of the fp32 reference, deterministic, its counters back to zero; a 2 % routed-scale error must not pass
+    the same check (control)."""
+    from vllm.model_executor.layers.mamba.olala import volta_cuda
+
+    args, dq = _rows_setup(m, group, seed=100 + m)
+    hidden, rhl, fc1, bias, w13, w2, su, sd, fc2 = args
+    ref = _rows_reference(hidden, bias, dq)
+    base = _rows_base(args)
+    out = volta_cuda.moe_rows(*args, 2.45)
+    again = volta_cuda.moe_rows(*args, 2.45)
+    rel, rel_base = _rel(out, ref), _rel(base, ref)
+    torch.testing.assert_close(out.float(), ref.float(), atol=3e-2, rtol=3e-2)
+    assert rel <= 1.5 * rel_base + 1e-3, (rel, rel_base)
+    assert torch.equal(out, again)
+    _, ctr = volta_cuda.moe_rows_buffers(hidden.device)
+    assert int(ctr.abs().sum()) == 0
+    wrong = volta_cuda.moe_rows(*args, 2.45 * 1.02)
+    assert _rel(wrong, ref) > 1.5 * rel_base + 1e-3
+
+
+@pytest.mark.parametrize("m", [1, 2, 3, 8, 9, 16, 32])
+def test_volta_rows_path_gate(m, monkeypatch):
+    """moe_rows_ok: 3..8 tokens of the model's layouts with INT8 routed experts, and only with OLALA_VOLTA_MOE_ROWS=1
+    on the SM70 family; INT4 affine experts stay on the small path."""
+    from vllm.model_executor.layers.mamba.olala import volta_cuda
+    from vllm.model_executor.layers.mamba.olala.arch import GpuFamily, gpu_family
+
+    args, _ = _rows_setup(m, 0, seed=7)
+    args4, _ = _rows_setup(m, INT4, seed=7)
+    monkeypatch.delenv("OLALA_VOLTA_MOE_ROWS", raising=False)
+    assert not volta_cuda.moe_rows_ok(m, *args, TOPK)
+    monkeypatch.setenv("OLALA_VOLTA_MOE_ROWS", "1")
+    volta = gpu_family() is GpuFamily.SM70
+    assert volta_cuda.moe_rows_ok(m, *args, TOPK) == (volta and 3 <= m <= 8)
+    assert not volta_cuda.moe_rows_ok(m, *args4, TOPK)
+    hidden, rhl, *rest = args
+    assert not volta_cuda.moe_rows_ok(m, hidden.float(), rhl, *rest, TOPK)  # fp32 rows
