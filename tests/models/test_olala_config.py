@@ -38,8 +38,10 @@ def _gpu(monkeypatch, cap):
 def _clean(monkeypatch):
     # setenv first so that teardown restores the original state even though
     # the hook writes os.environ directly.
+    # The hook also sets the split prefill defaults on measured GPUs.
     for var in ("OLALA_TPA_FACTOR_SPEC", "OLALA_TPA_FACTOR", "OLALA_REPLAY_SSM",
-                "OLALA_VOLTA_STATE16"):
+                "OLALA_VOLTA_STATE16", "OLALA_SPLIT_PREFILL",
+                "OLALA_SPLIT_PREFILL_MAX_DECODES"):
         monkeypatch.setenv(var, "")
         monkeypatch.delenv(var)
     _gpu(monkeypatch, (9, 0))  # a GPU without the F1 default unless a test says otherwise
