@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OlalaForCausalLMConfig: the split prefill policy's defaults.
 
-On SM120 and the SM80 family, unset switches default to OLALA_SPLIT_PREFILL=1
+On SM120, unset switches default to OLALA_SPLIT_PREFILL=1
 with OLALA_SPLIT_PREFILL_MAX_DECODES=0 (no cap) without a speculative config
 and 16 with one. The hook writes them to the environment, which the scheduler
-reads in the engine core. Explicit values win; other GPUs, and V100s through
-volta-forever (VOLTA_FOREVER), are unchanged. CPU only.
+reads in the engine core. Explicit values win; other GPUs (the SM80 family
+included), and V100s through volta-forever (VOLTA_FOREVER), are unchanged.
+CPU only.
 """
 
 import os
@@ -67,7 +68,7 @@ def _run(speculative):
     OlalaForCausalLMConfig.verify_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("cap", [(12, 0), (8, 6), (8, 0)])
+@pytest.mark.parametrize("cap", [(12, 0), (12, 1)])
 @pytest.mark.parametrize("speculative, max_decodes", [(False, "0"), (True, "16")])
 def test_split_on_by_default_on_measured_gpus(monkeypatch, infos, cap, speculative,
                                               max_decodes):
@@ -78,7 +79,7 @@ def test_split_on_by_default_on_measured_gpus(monkeypatch, infos, cap, speculati
     assert sum("split prefill" in line for line in infos) == 1
 
 
-@pytest.mark.parametrize("cap", [(9, 0), (10, 0), (7, 0), None])
+@pytest.mark.parametrize("cap", [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (7, 0), None])
 @pytest.mark.parametrize("speculative", [False, True])
 def test_other_gpus_unchanged(monkeypatch, infos, cap, speculative):
     _gpu(monkeypatch, cap)
@@ -88,8 +89,9 @@ def test_other_gpus_unchanged(monkeypatch, infos, cap, speculative):
 
 
 def test_volta_forever_unchanged(monkeypatch):
-    # A V100 through volta-forever reports 8.0 to CUDA programs.
-    _gpu(monkeypatch, (8, 0))
+    # A V100 through volta-forever reports 8.0 to CUDA programs; told 12.0 here
+    # so that only the volta-forever test can turn the default off.
+    _gpu(monkeypatch, (12, 0))
     monkeypatch.setenv("VOLTA_FOREVER", "1")
     _run(False)
     assert SPLIT not in os.environ and CAP not in os.environ
@@ -107,7 +109,7 @@ def test_explicit_off_wins(monkeypatch, infos, speculative):
 
 @pytest.mark.parametrize("speculative", [False, True])
 def test_explicit_cap_wins(monkeypatch, speculative):
-    _gpu(monkeypatch, (8, 6))
+    _gpu(monkeypatch, (12, 0))
     monkeypatch.setenv(CAP, "8")
     _run(speculative)
     assert os.environ[SPLIT] == "1"
@@ -133,8 +135,9 @@ def test_serve_spec_setting_unchanged(monkeypatch, infos):
     assert not any("split prefill" in line for line in infos)
 
 
-def test_explicit_on_elsewhere_unchanged(monkeypatch):
-    _gpu(monkeypatch, (9, 0))
+@pytest.mark.parametrize("cap", [(8, 6), (9, 0)])
+def test_explicit_on_elsewhere_unchanged(monkeypatch, cap):
+    _gpu(monkeypatch, cap)
     monkeypatch.setenv(SPLIT, "1")
     _run(True)
     assert os.environ[SPLIT] == "1"

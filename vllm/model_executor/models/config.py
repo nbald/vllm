@@ -1448,10 +1448,12 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
         A step that carries prefill tokens runs the PIECEWISE graphs, where the
         Mamba-3 and DiffTPA mixers run eagerly for every decode row; the split
         policy (vllm/v1/core/sched/olala_split.py) keeps decode steps in the
-        FULL graphs. On SM120 and the SM80 family, unset switches default to
+        FULL graphs. On SM120, unset switches default to
         OLALA_SPLIT_PREFILL=1 with OLALA_SPLIT_PREFILL_MAX_DECODES=0 (no cap)
         without a speculative config and 16 with one. Explicit values win.
-        Other GPUs, V100s through volta-forever included, are unchanged. The
+        Other GPUs are unchanged: on an RTX 3080 (sm_86), whose KV cache bounds a
+        1k-token batch from 32 requests, the split was neutral up to 32 requests
+        and doubled the median TTFT at 128. V100s through volta-forever too. The
         scheduler reads the switches from the environment, so they are set
         here, before the engine core starts."""
         split = os.environ.get("OLALA_SPLIT_PREFILL")
@@ -1474,8 +1476,8 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
 
 
 # Compute capability majors where the split prefill policy is on by default:
-# SM80 family (Ampere / Ada; measured on an RTX 3080) and SM120 (RTX 5090).
-_SPLIT_DEFAULT_MAJORS = (8, 12)
+# SM120 (RTX 5090). The SM80 family keeps it opt-in (RTX 3080: no gain).
+_SPLIT_DEFAULT_MAJORS = (12,)
 
 
 def _split_default_device() -> bool:
