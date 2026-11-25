@@ -152,7 +152,7 @@ Up to 16 streams, the speculative server uses:
 - `num_speculative_tokens = 2`, with `num_speculative_tokens_per_batch_size` `[[1, 2, 2], [3, 6, 0], [7, 16, 2]]`:
   K = 2 at 1-2 and 7-16 requests, no drafts at 3-6;
 - `--max-num-seqs 16`;
-- the INT8 drafter, F1 and the speculative switches of `spec/serve_spec.sh` (`OLALA_DSPINE_FUSED=3`, the split
+- the INT8 drafter, F1 and the switches of the benchmarked speculative configuration (`OLALA_DSPINE_FUSED=3`, the split
   prefill steps, the compact state layout, `TRITON_ATTN` for the drafter): all defaults with a DSpine drafter;
 - `OLALA_VOLTA_MOE_ROWS=1`, the multi-row MoE, as the V100 spec option (+6-7 % at one request, neutral elsewhere): a
   default with a DSpine drafter on the SM70 family.
