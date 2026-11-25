@@ -30,6 +30,11 @@ vllm serve /path/to/target \
   `"attention_backend"` in the speculative config. Prefer it over the global
   `--attention-backend`, which also changes the target's kernels.
 - Watermarking is not supported, as for the other candidate-head drafters.
+- With an Olala target, the Olala config sets the switches of the measured
+  speculative runs by default (split prefill steps, the compact state layout,
+  the fused mixed verify, the drafter's fast path and shared head, and
+  `TRITON_ATTN` for the drafter; see the README): `vllm serve` with the
+  speculative config above reproduces them. Explicit values win.
 - With an Olala target, the TPA-factorized KV cache (`OLALA_TPA_FACTOR`, on by
   default) keeps its verify path, F1 (`OLALA_TPA_FACTOR_SPEC`), on by default
   for compute capability majors 7, 8 and 12, with a log line. It was measured
@@ -92,9 +97,10 @@ projection are supported; other settings are rejected at load time.
 
 ## Fast draft path
 
-The eager draft step is several hundred small kernels. Three opt-in flags,
-read at import, make it cheaper; they leave the target untouched and keep the
-target's output distribution (every draft token is verified):
+The eager draft step is several hundred small kernels. Three flags, read at
+import, make it cheaper (opt-in in general, on by default with an Olala
+target); they leave the target untouched and keep the target's output
+distribution (every draft token is verified):
 
 | Variable | Effect |
 |---|---|
