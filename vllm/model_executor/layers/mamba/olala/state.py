@@ -83,7 +83,7 @@ def volta_state16() -> str | None:
     rounded to nearest even; ``bf16sr`` / ``bf16``: bf16, stochastic / nearest even; unset or ``0``: off. After 3.4k
     decode steps of real inputs, the state's relative error to an fp32 state (median over the 29 layers, worst layer)
     is 0.33 % (0.56 %) for fp16sr, 2.2 % (4.8 %) for fp16, 1.5 % (3.1 %) for bf16sr and 15 % (52 %) for bf16: rounding
-    to nearest loses slow decays and small updates the same way at every step (agents/perf128/STATE16.md). The
+    to nearest loses slow decays and small updates the same way at every step. The
     decode step and the prefill state pass compute in fp32 and round only what they store
     (``mamba3_step_volta16_kernel`` in csrc/mamba3_step.cu, ``_ssd_state_pass_pool``): half the state traffic of the
     fp32 state, which is the Mamba step's floor at high concurrency. Read only on the SM70 family
