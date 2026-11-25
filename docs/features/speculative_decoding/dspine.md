@@ -182,13 +182,18 @@ VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1 VF_JIT_LINEINFO=1 VF_PROXY_CACHE=$HOME/.ca
       "num_speculative_tokens_per_batch_size": [[1, 2, 2], [3, 6, 0], [7, 16, 2]]}'
 ```
 
-Output tokens/s against the direct server (max-num-seqs 128), same run, 512-token outputs, one round, through the
-volta-forever 0.1.5 release:
+Output tokens/s against the direct server (max-num-seqs 128), same run, mixed real prompts (median ~600 tokens, up
+to 43k), 512-token outputs, one round, through the volta-forever 0.1.5 release:
 
 | c | 1 | 2 | 4 | 8 | 16 |
 |---|---|---|---|---|---|
 | sampled | ×1.207 | ×1.042 | ×0.997 | ×1.062 | ×1.240 |
 | greedy | ×1.274 | ×1.091 | ×1.001 | ×1.123 | ×1.315 |
+
+On uniform ~1k-token prompts with 256-token outputs (against a direct server at vLLM's defaults), spec gains only
+at one or two streams: ×1.29 greedy and ×1.09 sampled at c = 1, ×1.12 / ×1.06 at c = 2 (Q8). At c = 8-16 it gives
+×0.81-1.00 over the bf16, Q8 and Q4 checkpoints. Use the speculative server for interactive, low-concurrency, or long
+and mixed-prompt traffic, and the direct server for batches of short requests above about 2-4 streams.
 
 Why this schedule (measured through volta-forever 0.1.3 with its later fixes):
 - **Static K = 2:** ×0.91 sampled / ×0.97 greedy at c = 4, even with the exact graph sizes. Verifying 12 tokens costs
