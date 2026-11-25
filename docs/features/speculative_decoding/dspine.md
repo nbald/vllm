@@ -152,8 +152,10 @@ Up to 16 streams, the speculative server uses:
 - `num_speculative_tokens = 2`, with `num_speculative_tokens_per_batch_size` `[[1, 2, 2], [3, 6, 0], [7, 16, 2]]`:
   K = 2 at 1-2 and 7-16 requests, no drafts at 3-6;
 - `--max-num-seqs 16`;
-- the INT8 drafter (default), `OLALA_DSPINE_FUSED=3`, and F1 (default under spec on SM70);
-- `OLALA_VOLTA_MOE_ROWS=1`, the multi-row MoE, as the V100 spec option: +6-7 % at one request, neutral elsewhere.
+- the INT8 drafter, F1 and the speculative switches of `spec/serve_spec.sh` (`OLALA_DSPINE_FUSED=3`, the split
+  prefill steps, the compact state layout, `TRITON_ATTN` for the drafter): all defaults with a DSpine drafter;
+- `OLALA_VOLTA_MOE_ROWS=1`, the multi-row MoE, as the V100 spec option (+6-7 % at one request, neutral elsewhere): a
+  default with a DSpine drafter on the SM70 family.
 
 The decode CUDA graphs need every request count's size, n × (1 + K). The Olala capture list adds them for up to
 32 requests (`OLALA_SPEC_GRAPHS_MAX_REQS`). Without them, K = 2 at 4 requests pads its 12 tokens to the 18-token
@@ -163,17 +165,11 @@ graph: 26.4 ms per step against 20.0 ms.
 # Through volta-forever 0.1.5 (https://github.com/nbald/volta-forever: install.sh, then its vLLM guide for the
 # CUDA 13 toolkit and the persistent caches). VF_PROXY_CACHE is a directory you own, with mode 0700.
 VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1 VF_JIT_LINEINFO=1 VF_PROXY_CACHE=$HOME/.cache/vf-proxy \
-  VLLM_USE_V2_MODEL_RUNNER=1 \
-  OLALA_MAMBA3_VERIFY=cuda OLALA_SPLIT_PREFILL=1 OLALA_SPLIT_PREFILL_MAX_DECODES=16 OLALA_PREFILL_NOSYNC=1 \
-  OLALA_TS_FOLD=1 OLALA_SPEC_LIGHT=1 VLLM_KV_CACHE_GROUP_SIZE=7 OLALA_TPA_MIXED_FUSED=1 \
-  OLALA_TPA_FACTOR=1 OLALA_TPA_FACTOR_SPEC=1 \
-  OLALA_DSPINE_SHARED_HEAD=1 OLALA_DSPINE_FUSED=3 OLALA_DSPINE_GEMV=1 OLALA_DSPINE_CUDA_NORM=1 \
-  OLALA_VOLTA_MOE_ROWS=1 \
   vf python3 -m vllm.entrypoints.cli.main serve /path/to/Olala-v1.0-mini-7A1B-Q8 \
     --trust-remote-code --served-model-name olala --reasoning-parser olala \
     --max-model-len 65536 --max-num-seqs 16 \
     --speculative-config '{"method": "dflash", "model": "/path/to/Olala-v1.0-mini-7A1B-Telegraphe",
-      "num_speculative_tokens": 2, "attention_backend": "TRITON_ATTN",
+      "num_speculative_tokens": 2,
       "num_speculative_tokens_per_batch_size": [[1, 2, 2], [3, 6, 0], [7, 16, 2]]}'
 ```
 
