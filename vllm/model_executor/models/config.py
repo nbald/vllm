@@ -1445,8 +1445,8 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
 
     @staticmethod
     def _dspine_spec_defaults(vllm_config: "VllmConfig") -> None:
-        """With a DSpine drafter, the switches of every measured speculative
-        run (spec/serve_spec.sh) by default.
+        """With a DSpine drafter, the switches of the benchmarked speculative
+        configuration by default.
 
         Each unset variable of _DSPINE_SPEC_DEFAULTS takes its value; on the
         SM70 family also OLALA_VOLTA_MOE_ROWS=1 (the V100 speculative option),
@@ -1463,7 +1463,7 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
         if "DSpineDraftModel" not in (getattr(draft, "architectures", None) or []):
             return
         defaults = list(_DSPINE_SPEC_DEFAULTS)
-        # serve_spec.sh's rule: the hand-fused draft kernels where the engine has
+        # The benchmarked rule: the hand-fused draft kernels where the engine has
         # them (olala/dspine-fuse), the compiled draft layers otherwise.
         fused = "3" if importlib.util.find_spec(
             "vllm.model_executor.models.qwen3_dspine_kernels") is not None else "2"
@@ -1519,8 +1519,8 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
         )
 
 
-# With a DSpine drafter, the values spec/serve_spec.sh exported in every measured
-# speculative run (OLALA_DSPINE_FUSED is added by _dspine_spec_defaults).
+# With a DSpine drafter, the values of the benchmarked speculative configuration
+# (OLALA_DSPINE_FUSED is added by _dspine_spec_defaults).
 _DSPINE_SPEC_DEFAULTS = (
     ("OLALA_SPLIT_PREFILL", "1"),
     ("OLALA_SPLIT_PREFILL_MAX_DECODES", "16"),

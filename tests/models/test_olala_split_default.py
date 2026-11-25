@@ -125,8 +125,8 @@ def test_explicit_on_takes_the_default_cap(monkeypatch, speculative, max_decodes
     assert os.environ[CAP] == max_decodes
 
 
-def test_serve_spec_setting_unchanged(monkeypatch, infos):
-    # spec/serve_spec.sh's explicit setting.
+def test_benchmarked_spec_setting_unchanged(monkeypatch, infos):
+    # The benchmarked speculative configuration, set explicitly.
     _gpu(monkeypatch, (12, 0))
     monkeypatch.setenv(SPLIT, "1")
     monkeypatch.setenv(CAP, "16")
