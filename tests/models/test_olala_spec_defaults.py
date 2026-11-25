@@ -3,8 +3,8 @@
 """OlalaForCausalLMConfig: the defaults of a DSpine drafter.
 
 With a DSpine drafter (speculative method dflash, draft architecture
-DSpineDraftModel), each unset switch takes the value spec/serve_spec.sh exported
-in every measured speculative run, on every GPU; OLALA_DSPINE_FUSED is 3 where
+DSpineDraftModel), each unset switch takes its value in the benchmarked
+speculative configuration, on every GPU; OLALA_DSPINE_FUSED is 3 where
 the engine has the hand-fused kernels (2 otherwise); the SM70 family (V100s,
 through volta-forever too) also takes OLALA_VOLTA_MOE_ROWS=1; an unset drafter
 attention backend becomes TRITON_ATTN. Explicit values win. Without a DSpine
@@ -23,13 +23,13 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-SERVE_SPEC = {
+BENCHMARKED = {
     "OLALA_SPLIT_PREFILL": "1", "OLALA_SPLIT_PREFILL_MAX_DECODES": "16", "OLALA_PREFILL_NOSYNC": "1",
     "OLALA_TS_FOLD": "1", "OLALA_SPEC_LIGHT": "1", "VLLM_KV_CACHE_GROUP_SIZE": "7", "OLALA_TPA_MIXED_FUSED": "1",
     "OLALA_DSPINE_SHARED_HEAD": "1", "OLALA_DSPINE_GEMV": "1", "OLALA_DSPINE_CUDA_NORM": "1",
     "OLALA_MAMBA3_VERIFY": "cuda",
 }
-DEFAULTED = (*SERVE_SPEC, "OLALA_DSPINE_FUSED", "OLALA_VOLTA_MOE_ROWS")
+DEFAULTED = (*BENCHMARKED, "OLALA_DSPINE_FUSED", "OLALA_VOLTA_MOE_ROWS")
 # also cleaned: the other switches the hook writes (the factor cache, ReplaySSM) and the volta-forever marker
 ALL = (*DEFAULTED, "OLALA_TPA_FACTOR", "OLALA_TPA_FACTOR_SPEC", "OLALA_REPLAY_SSM", "VOLTA_FOREVER")
 FUSED = "3" if importlib.util.find_spec("vllm.model_executor.models.qwen3_dspine_kernels") else "2"
@@ -88,11 +88,11 @@ def _run(spec):
 
 
 @pytest.mark.parametrize("cap", [(12, 0), (8, 6), (8, 0), (9, 0), (10, 0)])
-def test_dspine_drafter_takes_serve_spec_values(monkeypatch, infos, cap):
+def test_dspine_drafter_takes_benchmarked_values(monkeypatch, infos, cap):
     _gpu(monkeypatch, cap)
     spec = _spec()
     _run(spec)
-    for name, value in SERVE_SPEC.items():
+    for name, value in BENCHMARKED.items():
         assert os.environ[name] == value, name
     assert os.environ["OLALA_DSPINE_FUSED"] == FUSED
     assert "OLALA_VOLTA_MOE_ROWS" not in os.environ
@@ -112,12 +112,12 @@ def test_sm70_family_also_takes_moe_rows(monkeypatch, cap, volta_forever):
     assert os.environ["OLALA_SPLIT_PREFILL_MAX_DECODES"] == "16"
 
 
-@pytest.mark.parametrize("name", [*SERVE_SPEC, "OLALA_DSPINE_FUSED"])
+@pytest.mark.parametrize("name", [*BENCHMARKED, "OLALA_DSPINE_FUSED"])
 def test_explicit_value_wins(monkeypatch, name):
     monkeypatch.setenv(name, "0")
     _run(_spec())
     assert os.environ[name] == "0"
-    others = {k: v for k, v in SERVE_SPEC.items() if k != name}
+    others = {k: v for k, v in BENCHMARKED.items() if k != name}
     for other, value in others.items():
         assert os.environ[other] == value, other
 
@@ -136,7 +136,7 @@ def test_explicit_attention_backend_wins():
 
 
 def test_all_explicit_logs_nothing(monkeypatch, infos):
-    for name, value in SERVE_SPEC.items():
+    for name, value in BENCHMARKED.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("OLALA_DSPINE_FUSED", FUSED)
     _run(_spec(backend=AttentionBackendEnum.TRITON_ATTN))
