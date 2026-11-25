@@ -859,7 +859,7 @@ __global__ void __launch_bounds__(THREADS, 3) mamba3_step_volta_kernel(const Arg
 //                Volta instruction), i.e. its max in [2^14, 2^15), and its inverse scale 2^(e - 14) (fp32) goes to the
 //                ssm_scale pool (P, H, D). 11 significant bits per element (bf16: 8) for any row magnitude;
 //   state16 = 3 / 4  the same formats with stochastic rounding (below); 4 is OLALA_VOLTA_STATE16's default: unbiased
-//                rounding keeps slow decays and small updates that round-to-nearest stalls on (STATE16.md).
+//                rounding keeps slow decays and small updates that round-to-nearest stalls on.
 // The preamble (angles, bias + rotary on B/C), the token / pool rows, the output and the k / v / angle pool writes are
 // mamba3_step_volta_kernel's.
 __device__ __forceinline__ float2 bf16x2_to_f2(uint32_t w) { return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)); }
@@ -912,7 +912,7 @@ __device__ __forceinline__ uint32_t weyl_v16(uint32_t seed, int i) {
 // so the head's constants (xproj, zproj, outproj, both biases) are read once into shared memory, and the preamble's
 // bias reads come from there; per token, the state words, the token / pool rows and the scalars are loaded at once
 // (all in flight), staged, used, and the next token's are loaded after the stores (three CTAs per SM overlap one
-// another). Measured alternatives (agents/perf128/STATE16.md): agent Q's round-robin items with the constants loaded per
+// another). Measured alternatives: round-robin items with the constants loaded per
 // item, 1.2-1.4x slower at 32-128 sequences; the next token's loads in flight during this one, within 5 % (10 % faster
 // at 8 sequences only).
 struct __align__(16) VStageH {
