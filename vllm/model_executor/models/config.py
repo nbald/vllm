@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib.util
 import json
 import os
 from typing import TYPE_CHECKING
@@ -1306,7 +1307,50 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
                 scheduler_config.max_num_batched_tokens,
             )
 
+        OlalaForCausalLMConfig._dspine_spec_defaults(vllm_config)
         OlalaForCausalLMConfig._split_prefill_default(vllm_config)
+
+    @staticmethod
+    def _dspine_spec_defaults(vllm_config: "VllmConfig") -> None:
+        """With a DSpine drafter, the switches of every measured speculative
+        run (spec/serve_spec.sh) by default.
+
+        Each unset variable of _DSPINE_SPEC_DEFAULTS takes its value; on the
+        SM70 family also OLALA_VOLTA_MOE_ROWS=1 (the V100 speculative option),
+        and the drafter's attention backend becomes TRITON_ATTN when the
+        speculative config leaves it unset. Explicit values win. Without a
+        DSpine drafter nothing changes. The switches are read from the
+        environment by the engine core (scheduler, KV cache planning, model
+        and drafter modules, none imported in the API server before this
+        hook), so they are set here, before it starts."""
+        spec = vllm_config.speculative_config
+        if spec is None or getattr(spec, "method", None) != "dflash":
+            return
+        draft = getattr(spec, "draft_model_config", None)
+        if "DSpineDraftModel" not in (getattr(draft, "architectures", None) or []):
+            return
+        defaults = list(_DSPINE_SPEC_DEFAULTS)
+        # serve_spec.sh's rule: the hand-fused draft kernels where the engine has
+        # them (olala/dspine-fuse), the compiled draft layers otherwise.
+        fused = "3" if importlib.util.find_spec(
+            "vllm.model_executor.models.qwen3_dspine_kernels") is not None else "2"
+        defaults.append(("OLALA_DSPINE_FUSED", fused))
+        if _sm70_family():
+            defaults.append(("OLALA_VOLTA_MOE_ROWS", "1"))
+        applied = []
+        for name, value in defaults:
+            if os.environ.get(name) is None:
+                os.environ[name] = value
+                applied.append(f"{name}={value}")
+        if getattr(spec, "attention_backend", None) is None:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            spec.attention_backend = AttentionBackendEnum.TRITON_ATTN
+            applied.append("drafter attention_backend=TRITON_ATTN")
+        if applied:
+            logger.info(
+                "Olala: DSpine speculative defaults applied: %s.", ", ".join(applied)
+            )
 
     @staticmethod
     def _split_prefill_default(vllm_config: "VllmConfig") -> None:
@@ -1340,6 +1384,38 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
             "OLALA_SPLIT_PREFILL=0 to mix prefill and decode steps).",
             os.environ["OLALA_SPLIT_PREFILL_MAX_DECODES"],
         )
+
+
+# With a DSpine drafter, the values spec/serve_spec.sh exported in every measured
+# speculative run (OLALA_DSPINE_FUSED is added by _dspine_spec_defaults).
+_DSPINE_SPEC_DEFAULTS = (
+    ("OLALA_SPLIT_PREFILL", "1"),
+    ("OLALA_SPLIT_PREFILL_MAX_DECODES", "16"),
+    ("OLALA_PREFILL_NOSYNC", "1"),
+    ("OLALA_TS_FOLD", "1"),
+    ("OLALA_SPEC_LIGHT", "1"),
+    ("VLLM_KV_CACHE_GROUP_SIZE", "7"),
+    ("OLALA_TPA_MIXED_FUSED", "1"),
+    ("OLALA_DSPINE_SHARED_HEAD", "1"),
+    ("OLALA_DSPINE_GEMV", "1"),
+    ("OLALA_DSPINE_CUDA_NORM", "1"),
+    ("OLALA_MAMBA3_VERIFY", "cuda"),
+)
+
+
+def _sm70_family() -> bool:
+    """A V100-class GPU, decided without a CUDA context: volta-forever
+    (VOLTA_FOREVER, exported by its launcher, under which CUDA reports 8.0) or a
+    7.x capability."""
+    if os.environ.get("VOLTA_FOREVER"):
+        return True
+    from vllm.platforms import current_platform
+
+    try:
+        cap = current_platform.get_device_capability()
+    except Exception:  # no GPU visible
+        return False
+    return cap is not None and cap.major == 7
 
 
 # Compute capability majors where the split prefill policy is on by default:
